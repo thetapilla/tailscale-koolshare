@@ -1,18 +1,21 @@
-Tailscale Koolshare 3.0.0
+Tailscale Koolshare
 
 Original Koolshare Tailscale plugin: sadog / Koolshare.
 Reference repository: https://github.com/koolshare/rogsoft
 Reference commit: 1b82ebb805697e8c22f4ceb4bce62cb8de58424a
 
-The native router page layout and icon derive from that plugin. Attribution is
-retained; this repository does not grant additional rights to third-party work.
-The service-control scripts, updater, verification helper, tests and build tools
-in this repository are the 3.0.0 implementation.
+The native router page layout, icon and software-center integration derive from
+that plugin. Attribution is retained; this repository does not grant additional
+rights to third-party work.
 
 Tailscale core: https://github.com/tailscale/tailscale
-License: BSD-3-Clause; see LICENSES/Tailscale-BSD-3-Clause.txt.
-Dependency licenses remain with their respective authors. The official source,
-go.mod/go.sum and pinned build metadata identify the compiled dependencies.
+License: BSD-3-Clause. The license text is provided in
+LICENSES/Tailscale-BSD-3-Clause.txt in the source repository and in
+res/LICENSE.tailscale.txt in the installation package.
+Dependency licenses remain with their respective authors. The upstream source,
+its go.mod/go.sum files and the build metadata identify compiled dependencies.
+Pinned build inputs and feature selections are defined in tools/core_recipe.json
+in the source repository.
 
-UPX is used as a build-time packer. Its official license permits distribution
-of packed executables under the packed program's own license.
+UPX is used as a build-time packer. Its license permits distribution of packed
+executables under the packed program's own license.

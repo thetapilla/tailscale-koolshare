@@ -76,13 +76,13 @@ function init() {
 <table width="760" border="0" cellpadding="5" cellspacing="0" class="FormTitle" id="FormTitle"><tr><td bgcolor="#4D595D" valign="top">
 <div>&nbsp;</div>
 <img id="return_btn" onclick="reload_Soft_Center();" title="返回软件中心" alt="返回软件中心" src="/images/backprev.png" onmouseover="this.src='/images/backprevclick.png'" onmouseout="this.src='/images/backprev.png'" />
-<div class="formfonttitle">Tailscale <span class="ts_badge">插件 <span id="plugin_version">3.0.0</span></span></div>
+<div class="formfonttitle">Tailscale <span class="ts_badge">插件 <span id="plugin_version">正在读取…</span></span></div>
 <div style="margin:10px 5px;" class="splitLine"></div>
-<div class="SimpleNote">通过 Tailscale 安全连接您的路由器和设备。</div>
+<div class="SimpleNote">通过 Tailscale 将路由器加入您的专属网络（Tailnet）。</div>
 <div id="connection_notice" class="SimpleNote ts_notice" role="status" aria-live="polite"></div>
 <div id="tailscale_main" class="ts_box">
 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable">
-<thead><tr><td colspan="2">Tailscale - 状态 / 控制</td></tr></thead>
+<thead><tr><td colspan="2">连接与设置</td></tr></thead>
 <tr><th><label for="tailscale_enable">启用 Tailscale</label></th><td>
 <div class="switch_field" style="display:table-cell;">
 <label for="tailscale_enable"><input id="tailscale_enable" class="switch" type="checkbox" style="display:none;" disabled="disabled" />
@@ -92,41 +92,41 @@ function init() {
 <tr><th>Tailnet 连接</th><td><span id="tailnet_state">正在读取…</span>
 <a id="auth_link" class="ks_btn" style="display:none;margin-left:8px;" target="_blank" rel="noopener noreferrer">登录并授权</a></td></tr>
 <tr id="health_row" style="display:none;"><th>连接提示</th><td><div id="health_messages" class="ts_value"></div></td></tr>
-<tr><th>Tailscale 控制台</th><td><a class="ks_btn" href="https://login.tailscale.com/admin" target="_blank" rel="noopener noreferrer">Admin console</a></td></tr>
+<tr><th>Tailscale 控制台</th><td><a class="ks_btn" href="https://login.tailscale.com/admin" target="_blank" rel="noopener noreferrer">打开管理控制台</a></td></tr>
 <tr><th>连接检查</th><td class="ts_actions">
 <input id="run_status" class="button_gen" type="button" value="连接详情" disabled="disabled" />
 <input id="run_netcheck" class="button_gen" type="button" value="网络检查" disabled="disabled" />
-<input id="run_diagnostics" class="button_gen" type="button" value="诊断日志" disabled="disabled" />
+<input id="run_diagnostics" class="button_gen" type="button" value="生成诊断摘要" disabled="disabled" />
 </td></tr>
-<tr><th>使用网络</th><td>
+<tr><th>直连协议</th><td>
 <label for="tailscale_ipv4_enable">IPv4</label> <input id="tailscale_ipv4_enable" type="checkbox" disabled="disabled" />
 <label for="tailscale_ipv6_enable" style="margin-left:12px;">IPv6</label> <input id="tailscale_ipv6_enable" type="checkbox" disabled="disabled" />
-<div class="ts_help">允许通过对应的 Tailscale 地址访问路由器及局域网。</div></td></tr>
-<tr><th><label for="tailscale_advertise_routes">宣告路由表</label></th><td><input id="tailscale_advertise_routes" type="checkbox" disabled="disabled" />
-<div class="ts_help">向 Tailnet 提供本机的局域网路由。启用后需要在控制台批准路由。</div></td></tr>
-<tr><th><label for="tailscale_accept_routes">接受路由表</label></th><td><input id="tailscale_accept_routes" type="checkbox" disabled="disabled" />
-<div class="ts_help">访问其他设备宣告的网络。各地局域网应使用不同网段；上级路由也宣告本地网段时，请避免重复接受该路由。</div></td></tr>
-<tr><th><label for="tailscale_exit_node">互联网出口</label></th><td><input id="tailscale_exit_node" type="checkbox" disabled="disabled" />
-<div class="ts_help">将此路由器提供为出口节点。需在控制台批准，并在其他设备上选择此出口。</div></td></tr>
+<div class="ts_help">允许 Tailscale 通过所选协议进行直连通信（UDP 41641）。关闭可能影响设备直连。</div></td></tr>
+<tr><th><label for="tailscale_advertise_routes">共享本地局域网</label></th><td><input id="tailscale_advertise_routes" type="checkbox" disabled="disabled" />
+<div class="ts_help">允许 Tailnet 中的其他设备访问本机局域网。启用后，需在管理控制台批准此子网路由。</div></td></tr>
+<tr><th><label for="tailscale_accept_routes">访问远程局域网</label></th><td><input id="tailscale_accept_routes" type="checkbox" disabled="disabled" />
+<div class="ts_help">允许本机和局域网设备访问其他设备共享的子网。各处局域网应使用不同网段，避免路由冲突。</div></td></tr>
+<tr><th><label for="tailscale_exit_node">提供互联网出口</label></th><td><input id="tailscale_exit_node" type="checkbox" disabled="disabled" />
+<div class="ts_help">允许其他设备通过此路由器访问互联网。需先在管理控制台批准，再由其他设备选择此出口节点。</div></td></tr>
 <tr><th><label for="tailscale_watchdog_enable">自动恢复连接</label></th><td><input id="tailscale_watchdog_enable" type="checkbox" disabled="disabled" />
-<div class="ts_help">监测服务异常并尝试恢复；关闭 Tailscale 后不会自动启动。</div>
+<div class="ts_help">检测服务异常，并在满足恢复条件时尝试重启。关闭 Tailscale 后不会自动启动。</div>
 <div id="watchdog_state" class="ts_help"></div>
 <div class="ts_help">状态监测：<span id="monitoring_state">正在读取…</span></div>
-<div class="ts_help">最近恢复：<span id="watchdog_recovery">正在读取…</span></div></td></tr>
+<div class="ts_help">最近恢复尝试：<span id="watchdog_recovery">正在读取…</span></div></td></tr>
 </table></div>
 <div class="apply_gen ts_actions"><input id="apply_settings" class="button_gen" type="button" value="应用设置" disabled="disabled" />
 <span id="settings_notice" class="ts_notice" aria-live="polite"></span></div>
-<div class="SimpleNote ts_help">启用开关立即生效；其余设置点击“应用设置”后生效。应用设置、更新或回退内核会短暂中断 Tailscale 连接。</div>
+<div class="SimpleNote ts_help">点击“应用设置”保存更改；切换启用状态也会保存当前所有设置。应用设置、更新或回退核心可能短暂中断 Tailscale 连接。</div>
 <div id="tailscale_core" class="ts_box ts_section">
 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable">
-<thead><tr><td colspan="2">Tailscale - 内核管理</td></tr></thead>
-<tr><th>当前内核</th><td id="core_current" class="ts_value">正在读取…</td></tr>
-<tr><th>最新可用内核</th><td id="core_latest" class="ts_value">尚未检查</td></tr>
-<tr><th>内核操作</th><td class="ts_actions">
+<thead><tr><td colspan="2">核心管理</td></tr></thead>
+<tr><th>当前核心</th><td id="core_current" class="ts_value">正在读取…</td></tr>
+<tr><th>更新源版本</th><td id="core_latest" class="ts_value">暂无检查结果</td></tr>
+<tr><th>核心操作</th><td class="ts_actions">
 <input id="core_check" class="button_gen" type="button" value="检查更新" disabled="disabled" />
-<input id="core_update" class="button_gen" type="button" value="更新内核" disabled="disabled" />
-<input id="core_rollback" class="button_gen" type="button" value="回退上一内核" disabled="disabled" />
-<div class="ts_help">检查更新后手动安装。更新失败时尝试恢复上一内核。</div>
+<input id="core_update" class="button_gen" type="button" value="更新核心" disabled="disabled" />
+<input id="core_rollback" class="button_gen" type="button" value="回退上一核心" disabled="disabled" />
+<div class="ts_help">先检查更新，再安装更新源提供的核心。保留有上一版本时，可手动回退。</div>
 </td></tr></table></div>
 <div id="task_panel" class="ts_box ts_section" style="display:none;" role="region" aria-label="操作进度">
 <div><span id="job_title"></span><span class="ts_badge">任务 <span id="job_id"></span></span></div>
@@ -140,8 +140,8 @@ function init() {
 </div>
 <div id="tailscale_tcnets" class="ts_box ts_section">
 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable_table">
-<thead><tr><td colspan="4">Tailscale - 网口状态</td></tr>
-<tr><th>接口</th><th>IP 地址</th><th>下行</th><th>上行</th></tr></thead>
+<thead><tr><td colspan="4">Tailscale 网络接口</td></tr>
+<tr><th>接口</th><th>IP 地址</th><th>累计接收（字节）</th><th>累计发送（字节）</th></tr></thead>
 <tbody id="interfaces_body"></tbody></table>
 <div id="interfaces_notice" class="SimpleNote ts_help">正在读取…</div></div>
 <div>&nbsp;</div>

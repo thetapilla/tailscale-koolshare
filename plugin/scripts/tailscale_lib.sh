@@ -71,7 +71,7 @@ ts_job_begin() {
     ts_public_file "$target" && ts_public_file "$WEB/tailscale3_$TS_JOB.json" || return 1
     tmp=$(mktemp "$WEB/.tailscale3.XXXXXX") || return 1
     chmod 644 "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
-    ts_job_write running accepted 'Operation accepted'
+    ts_job_write running accepted '已接收操作请求'
 }
 
 ts_public_file() { [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }; }
@@ -345,11 +345,11 @@ ts_firewall_remove() {
 }
 
 ts_start() {
-    ts_config_read || { ts_job_log 'Invalid boolean configuration'; return 1; }
+    ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
     ts_cron
-    [ "$ENABLE" = 1 ] || { ts_job_log 'Plugin is disabled'; return 0; }
+    [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
     [ -x "$DATA/current/tailscaled" ] && [ -x "$DATA/current/tailscale" ] || {
-        ts_job_log 'No installed core'; return 1;
+        ts_job_log '未找到已安装的核心，请重新安装插件'; return 1;
     }
     local fresh=0 pid tries state want
     [ -s "$STATE" ] || fresh=1
@@ -369,7 +369,7 @@ ts_start() {
             9>&- </dev/null >"$RUN/daemon.pipe" 2>&1 &
         pid=$!
         printf '%s\n' "$pid" >"$RUN/tailscaled.pid"
-        ts_job_log 'Daemon started with preserved state'
+        ts_job_log '已启动服务，正在检查就绪状态'
     fi
     tries=0
     while [ "$tries" -lt 15 ]; do
@@ -377,28 +377,28 @@ ts_start() {
         tries=$((tries + 1))
         sleep 1
     done
-    if [ "$tries" -ge 15 ]; then ts_job_log 'Local service readiness timed out'; return 1; fi
+    if [ "$tries" -ge 15 ]; then ts_job_log '等待本机服务就绪超时，请查看诊断摘要'; return 1; fi
     set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")"
     if [ "$ADVERTISE" = 1 ]; then
-        ts_lan || { ts_job_log 'LAN address or netmask is invalid'; return 1; }
+        ts_lan || { ts_job_log '局域网地址或子网掩码无效，请检查路由器局域网设置'; return 1; }
         set -- "$@" "--advertise-routes=$LAN_CIDR"
     else
         set -- "$@" --advertise-routes=
     fi
     [ "$fresh" = 0 ] || set -- "$@" --accept-dns=false
-    ts_cli "$@" >/dev/null 2>&1 || { ts_job_log 'Could not apply Tailscale preferences'; return 1; }
+    ts_cli "$@" >/dev/null 2>&1 || { ts_job_log '无法应用 Tailscale 设置，请检查本机服务状态'; return 1; }
     want=$(ts_get "$RUN/start-status.json" want_running)
     state=$(ts_get "$RUN/start-status.json" backend_state)
     if [ "$want" != true ] || [ "$state" = NeedsLogin ]; then
         # No --reset: existing identity and unexposed preferences are preserved.
         ts_cli up >/dev/null 2>&1 || :
     fi
-    ts_firewall_apply || { ts_job_log 'Firewall configuration failed'; return 1; }
+    ts_firewall_apply || { ts_job_log '防火墙设置失败，请检查防火墙状态和诊断摘要'; return 1; }
     ts_status_file "$RUN/start-status.json" || return 1
     state=$(ts_get "$RUN/start-status.json" backend_state)
-    case $state in NeedsLogin|NeedsMachineAuth) ts_job_log 'Authentication or device approval required';;
-        Running|Starting|Stopped) ts_job_log 'Service configuration completed';;
-        *) ts_job_log 'Local service reported an unexpected state'; return 1;; esac
+    case $state in NeedsLogin|NeedsMachineAuth) ts_job_log '需要登录或设备授权，请前往插件页面完成授权';;
+        Running|Starting|Stopped) ts_job_log '服务设置已应用';;
+        *) ts_job_log '本机服务状态异常，请查看诊断摘要'; return 1;; esac
 }
 
 ts_stop() {
@@ -413,7 +413,7 @@ ts_stop() {
     fi
     rm -f "$RUN/tailscaled.pid" "$RUN/logger.pid" "$RUN/daemon.pipe" "$SOCKET"
     ts_firewall_remove
-    ts_job_log 'Daemon stopped; identity retained'
+    ts_job_log '服务已停止，连接身份已保留'
 }
 
 ts_restart() { ts_stop && ts_start; }
@@ -501,7 +501,7 @@ ts_address_maintenance() {
     # This completes normal address-dependent setup after login or an address
     # change, independently of automatic service recovery. Reuse the sample.
     ts_firewall_apply "$sample" || return 1
-    ts_job_log 'Applied firewall rules for the current Tailscale addresses'
+    ts_job_log '已根据当前 Tailscale 地址刷新防火墙规则'
 }
 
 ts_watchdog_run() {
@@ -513,7 +513,7 @@ ts_watchdog_run() {
     local sampled=0
     if ts_status_file "$RUN/watchdog-status.json"; then
         sampled=1
-        ts_address_maintenance "$RUN/watchdog-status.json" || ts_job_log 'Address-dependent firewall refresh failed'
+        ts_address_maintenance "$RUN/watchdog-status.json" || ts_job_log '根据当前地址刷新防火墙规则失败，将在后续检查中重试'
     fi
     [ "$WATCHDOG" = 1 ] || return 0
     NOW=$(ts_now)
@@ -567,7 +567,7 @@ ts_watchdog_run() {
     for stamp in $WD_HISTORY "$NOW"; do printf '%s\n' "$stamp" >>"$ledger.new"; done
     chmod 600 "$ledger.new" && mv -f "$ledger.new" "$ledger" || return 1
     WD_FAILURES=0; WD_CONTROL=0; ts_watch_save
-    ts_job_log "Watchdog recovery: $reason"
+    ts_job_log "自动恢复尝试，原因：$reason"
     ts_restart
 }
 
@@ -632,23 +632,23 @@ ts_mutation() {
     if [ -f "$KSROOT/scripts/tailscale_core_lib.sh" ]; then
         . "$KSROOT/scripts/tailscale_core_lib.sh" || return 1
         if ! ts_core_recover; then
-            ts_job_write failed recovery 'Interrupted core transaction requires recovery'
+            ts_job_write failed recovery '上次核心操作尚未恢复，请查看操作日志并生成诊断摘要'
             return 1
         fi
     elif [ -e "$DATA/update.txn" ] || [ -L "$DATA/update.txn" ]; then
-        ts_job_write failed recovery 'Core recovery support is unavailable'
+        ts_job_write failed recovery '核心恢复组件不可用，请检查插件文件是否完整'
         return 1
     fi
     if [ "$has_bits" = 1 ]; then
         if ! ts_config_snapshot; then
-            ts_job_write failed configuration 'Could not snapshot existing settings'
+            ts_job_write failed configuration '无法备份当前设置，未应用更改；请检查存储空间后重试'
             return 1
         fi
         ts_pid_alive && old_running=1
         [ ! -f "$RUN/manual-stop" ] || old_manual=1
         if ! ts_config_bits_apply "$bits"; then
-            ts_config_restore || ts_job_log 'Could not completely restore saved settings'
-            ts_job_write failed configuration 'Could not save configuration; previous settings restored where possible'
+            ts_config_restore || ts_job_log '未能完整恢复原设置，请在插件页面检查并重新应用设置'
+            ts_job_write failed configuration '设置保存失败，已尝试恢复原设置；请检查操作日志和当前设置'
             return 1
         fi
         applied=1
@@ -660,25 +660,25 @@ ts_mutation() {
         web_submit)
             if ts_config_read; then
                 if [ "$ENABLE" = 1 ]; then ts_restart || rc=$?; else : >"$RUN/manual-stop"; ts_stop || rc=$?; fi
-            else ts_job_log 'Configuration values must be 0 or 1'; rc=1; fi;;
+            else ts_job_log '设置值必须为 0 或 1，请在插件页面重新应用设置'; rc=1; fi;;
         start_nat) ts_firewall_apply || rc=$?;;
-        *) ts_job_log 'Unknown operation'; rc=1;;
+        *) ts_job_log '无法识别操作请求，请刷新插件页面后重试'; rc=1;;
     esac
     if [ "$rc" != 0 ] && [ "$applied" = 1 ]; then
         if ts_config_restore; then
-            ts_job_log 'Restored previous configuration after the failed operation'
+            ts_job_log '操作失败后已恢复原设置'
             if [ "$old_running" = 1 ]; then
-                ts_restart || ts_job_log 'Previous settings restored; service recovery requires attention'
+                ts_restart || ts_job_log '原设置已恢复，但服务重启失败；请查看诊断摘要'
             else
-                ts_stop || ts_job_log 'Previous settings restored; service stop requires attention'
+                ts_stop || ts_job_log '原设置已恢复，但服务停止失败；请查看诊断摘要'
             fi
             if [ "$old_manual" = 1 ]; then : >"$RUN/manual-stop"; else rm -f "$RUN/manual-stop"; fi
         else
-            ts_job_log 'Configuration restoration requires attention'
+            ts_job_log '原设置恢复失败，请在插件页面检查并重新应用设置'
         fi
     fi
     [ "$has_bits" = 0 ] || rm -f "$RUN/config.previous"
-    if [ "$rc" = 0 ]; then ts_job_write success complete 'Operation completed'; else ts_job_write failed failed 'Operation failed; see sanitized log'; fi
+    if [ "$rc" = 0 ]; then ts_job_write success complete '操作已完成'; else ts_job_write failed failed '操作失败，请查看下方日志了解原因'; fi
     ts_unlock
     trap - EXIT
     return "$rc"

@@ -8,12 +8,12 @@ KSROOT=${TSKS_ROOT:-/koolshare}
     exit 1
 }
 . "$KSROOT/scripts/tailscale_lib.sh"
-[ ! -L "$KSROOT/tailscale" ] || { printf '%s\n' '内核目录结构异常，保留现状。' >&2; exit 1; }
-ts_init && ts_lock || { printf '%s\n' '另一个操作正在进行，请稍后卸载。' >&2; exit 1; }
+[ ! -L "$KSROOT/tailscale" ] || { printf '%s\n' '核心目录结构异常，无法卸载。请先检查安装目录。' >&2; exit 1; }
+ts_init && ts_lock || { printf '%s\n' '无法准备卸载，或有其他操作正在进行。请检查可用存储，并稍后重试。' >&2; exit 1; }
 trap 'ts_unlock' EXIT
 trap 'exit 1' HUP INT TERM
 if [ -e "$DATA/update.txn" ] || [ -L "$DATA/update.txn" ]; then
-    printf '%s\n' '核心更新恢复尚未完成，请先恢复核心操作再卸载。' >&2
+    printf '%s\n' '上次核心操作尚未恢复。请在插件页面重试核心操作，并查看操作日志后再卸载。' >&2
     exit 1
 fi
 ts_stop || exit 1
@@ -36,4 +36,4 @@ rmdir "$DATA" 2>/dev/null || :
 for key in tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
     dbus remove "$key" || exit 1
 done
-printf '%s\n' "Tailscale 已卸载。连接身份和用户设置保留于 $KSROOT/configs/tailscale。"
+printf '%s\n' "Tailscale 已卸载。已保留连接身份（$KSROOT/configs/tailscale）和软件中心中的插件设置。"

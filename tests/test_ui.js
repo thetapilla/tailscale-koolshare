@@ -131,7 +131,7 @@ test('ACK is not success; one task locks every toggle and action until its match
     h.advance(3000);
     h.finishJob(h.next('tailscale_job'), 'rolled_back');
     h.advance();
-    assert.equal(h.nodes.job_state.textContent, '更新未完成，已恢复上一内核');
+    assert.equal(h.nodes.job_state.textContent, '核心切换未完成，已恢复上一核心');
     assert.equal(h.nodes.apply_settings.disabled, false);
     const log = h.next(); assert.match(log.settings.url, /^\/_temp\/tailscale3_[0-9]{1,15}\.log$/);
     log.finish(null, 'restored'); h.advance();
@@ -242,7 +242,7 @@ test('diagnostics completion preserves unsaved option changes and retries missin
 });
 
 test('a resumed diagnostic still loads settings correctly before it finishes', () => {
-    const h = harness({ tailscale3_pending: JSON.stringify({ id: '179000000000001', title: '诊断日志' }) });
+    const h = harness({ tailscale3_pending: JSON.stringify({ id: '179000000000001', title: '生成诊断摘要' }) });
     h.app.init(); h.finishJob(h.next('tailscale_job'), 'running');
     h.next().finish(null, 'working');
     h.reply(h.next(), [{ tailscale_enable: '1', tailscale_accept_routes: '1', tailscale_watchdog_enable: '1' }]);
@@ -303,4 +303,47 @@ test('queued save snapshots all seven settings without exposing DBus fields to h
     assert.deepEqual(save.body.fields, {});
     assert.deepEqual(save.body.params, ['web_submit', '1111010']);
     assert.ok(h.history.filter(r => r.body).every(r => Object.keys(r.body.fields).length === 0));
+});
+
+
+test('display uses reported versions and formats recovery attempts as local time', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+    const stamp = 1790000000, date = new Date(stamp * 1000);
+    const two = value => String(value).padStart(2, '0');
+    h.reply(h.next('tailscale_fettle'), h.status({ plugin_version: '3.2.1',
+        watchdog: { enabled: true, last_recovery: String(stamp), count_24h: 2 } }));
+    assert.equal(h.nodes.plugin_version.textContent, '3.2.1');
+    assert.equal(h.nodes.watchdog_recovery.textContent,
+        `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}（本地时间）`);
+    assert.match(h.nodes.watchdog_state.textContent, /尝试恢复 2 次/);
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance(5000);
+    h.reply(h.next('tailscale_fettle'), h.status({ plugin_version: '',
+        watchdog: { enabled: false, last_recovery: '<script>bad</script>', count_24h: 0 } }));
+    assert.equal(h.nodes.plugin_version.textContent, '版本未知');
+    assert.equal(h.nodes.watchdog_recovery.textContent, '时间不可用');
+});
+
+test('disabled service is explained without treating an absent daemon as a connection error', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '0' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ enabled: false, backend_state: 'Unavailable',
+        online: null, error: 'local_api_unavailable' }));
+    assert.equal(h.nodes.daemon_state.textContent, '未启用');
+    assert.equal(h.nodes.connection_notice.textContent, '');
+    assert.equal(h.nodes.watchdog_recovery.textContent, '暂无记录');
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance(5000);
+    h.reply(h.next('tailscale_fettle'), h.status({ backend_state: 'Unavailable', error: 'local_api_unavailable' }));
+    assert.equal(h.nodes.daemon_state.textContent, '暂时无法读取');
+    assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+    assert.doesNotMatch(h.nodes.connection_notice.textContent, /local_api_unavailable/);
+});
+
+test('rejected settings explain the next step and keep machine phases out of user messages', () => {
+    const h = harness(); h.boot(); h.click('apply_settings');
+    h.reply(h.next('tailscale_config'), { accepted: false, error: 'invalid_config_snapshot' });
+    assert.match(h.nodes.job_message.textContent, /刷新页面/);
+    assert.doesNotMatch(h.nodes.job_message.textContent, /invalid_config_snapshot/);
+    h.click('core_check'); h.accept(h.next('tailscale_core'));
+    h.finishJob(h.next('tailscale_job'), 'failed', { message: '', phase: 'internal_phase' });
+    assert.match(h.nodes.job_message.textContent, /操作日志/);
+    assert.doesNotMatch(h.nodes.job_message.textContent, /internal_phase/);
 });

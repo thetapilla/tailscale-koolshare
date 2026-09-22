@@ -1,6 +1,25 @@
 #!/bin/sh
-# Status inspection is read-only and does not acquire the lifecycle lock.
+# Connection details use the same bounded job contract as network checks.
 . "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
 ts_init || exit 1
 ts_parse_request "$@"
-ts_reply "$(ts_status_json)"
+ts_lock || { ts_reply '{"accepted":false,"error":"busy"}'; exit 1; }
+result_file=
+trap 'rm -f "$result_file"; ts_unlock' EXIT
+trap 'ts_job_write failed interrupted "连接详情读取已中断，请稍后重试"; exit 1' HUP INT TERM
+ts_job_begin "${ID:-$(date +%s)}" || exit 1
+ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
+ts_job_write running status '正在读取连接详情'
+result_file=$(mktemp "$RUN/status-result.XXXXXX") || {
+    ts_job_write failed status '无法准备连接详情，请检查可用存储后重试'
+    exit 1
+}
+# Sanitize CLI output as it arrives; keep the command result separately because
+# ash pipelines otherwise report only the log writer's exit status.
+if (ts_cli status 2>&1; printf '%s\n' "$?" >"$result_file") | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 &&
+        [ "$(cat "$result_file")" = 0 ]; then
+    ts_job_write success complete '连接详情已读取，请查看下方日志'
+else
+    ts_job_write failed status '连接详情读取失败或超时，请查看日志并检查运行状态'
+    exit 1
+fi

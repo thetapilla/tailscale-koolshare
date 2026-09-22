@@ -38,7 +38,7 @@ check_package() {
 platform() {
     [ -d "$KSROOT" ] && which dbus >/dev/null 2>&1 && which nvram >/dev/null 2>&1 || fail '未找到软件中心'
     if [ "$KSROOT" = /koolshare ]; then [ -x /usr/bin/skipd ] || fail '软件中心服务不可用'; fi
-    uname -r | awk -F. '$1>4 || ($1==4 && $2>=1) {ok=1} END {exit !ok}' || fail '需要 Linux 4.1 或更新的固件'
+    uname -r | awk -F. '$1>4 || ($1==4 && $2>=1) {ok=1} END {exit !ok}' || fail '固件需使用 Linux 4.1 或更新的内核'
     MODEL=$(nvram get odmpid 2>/dev/null)
     [ -n "$MODEL" ] || MODEL=$(nvram get productid 2>/dev/null)
     # Match the software center's model-to-platform mapping.
@@ -51,7 +51,7 @@ platform() {
     esac
     grep -qx "$PLATFORM" "$PKG/.valid" || fail '安装包与固件平台不匹配'
     PAYLOAD=$PKG/payload/$ARCH
-    [ -x "$PAYLOAD/tsks-helper" ] && [ -f "$PAYLOAD/tailscale.combined" ] || fail '安装包缺少本机架构的内核'
+    [ -x "$PAYLOAD/tsks-helper" ] && [ -f "$PAYLOAD/tailscale.combined" ] || fail '安装包缺少本机架构的核心'
     VERIFIED_HELPER=$PAYLOAD/tsks-helper
 }
 
@@ -117,49 +117,49 @@ core_link_ok() {
 }
 
 prepare_core() {
-    [ ! -L "$DATA" ] && [ ! -L "$DATA/cores" ] || fail '内核目录不能使用外部符号链接'
-    "$VERIFIED_HELPER" verify "$PKG/release.json" "$PKG/release.pub" "$ARCH" >"$STAGE/verified.json" || fail '内核签名校验失败'
-    validate_core "$PAYLOAD/tailscale.combined" "$STAGE/verified.json" || fail '内核文件与签名不一致'
-    CORE_VERSION=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" version) || fail '无效内核版本'
-    CORE_BUILD=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" build) || fail '无效内核构建版本'
+    [ ! -L "$DATA" ] && [ ! -L "$DATA/cores" ] || fail '核心目录不能使用外部符号链接'
+    "$VERIFIED_HELPER" verify "$PKG/release.json" "$PKG/release.pub" "$ARCH" >"$STAGE/verified.json" || fail '核心签名校验失败'
+    validate_core "$PAYLOAD/tailscale.combined" "$STAGE/verified.json" || fail '核心文件与签名不一致'
+    CORE_VERSION=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" version) || fail '无效核心版本'
+    CORE_BUILD=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" build) || fail '无效核心构建版本'
     if [ -L "$DATA/current" ]; then
         OLD_CORE=$(readlink "$DATA/current")
-        core_link_ok "$OLD_CORE" && validate_core "$DATA/$OLD_CORE/tailscale.combined" "$DATA/$OLD_CORE/descriptor.json" || fail '已安装内核校验失败，保留现状'
-        [ "$(readlink "$DATA/$OLD_CORE/tailscale")" = tailscale.combined ] && [ "$(readlink "$DATA/$OLD_CORE/tailscaled")" = tailscale.combined ] || fail '已安装内核链接无效'
+        core_link_ok "$OLD_CORE" && validate_core "$DATA/$OLD_CORE/tailscale.combined" "$DATA/$OLD_CORE/descriptor.json" || fail '已安装核心校验失败，保留现状'
+        [ "$(readlink "$DATA/$OLD_CORE/tailscale")" = tailscale.combined ] && [ "$(readlink "$DATA/$OLD_CORE/tailscaled")" = tailscale.combined ] || fail '已安装核心链接无效'
         OLD_KIND=current
         SELECTED=$OLD_CORE
-        say '保留已安装内核；可在插件页面手动检查更新。'
+        say '保留已安装核心；可在插件页面手动检查更新。'
     elif [ -e "$DATA/current" ]; then
-        fail '现有内核目录结构无法安全迁移'
+        fail '现有核心目录结构无法安全迁移'
     elif [ -f "$KSROOT/bin/tailscale.combined" ] && [ ! -L "$KSROOT/bin/tailscale.combined" ]; then
-        elf_ok "$KSROOT/bin/tailscale.combined" "$ARCH" || fail '旧内核架构与平台不匹配'
-        LEGACY_VERSION=$("$VERIFIED_HELPER" version "$KSROOT/bin/tailscale.combined") || fail '无法读取旧内核版本'
+        elf_ok "$KSROOT/bin/tailscale.combined" "$ARCH" || fail '旧核心架构与平台不匹配'
+        LEGACY_VERSION=$("$VERIFIED_HELPER" version "$KSROOT/bin/tailscale.combined") || fail '无法读取旧核心版本'
         LEGACY_SIZE=$(wc -c <"$KSROOT/bin/tailscale.combined" | tr -d ' ')
-        [ "$LEGACY_SIZE" -le 12582912 ] && [ "$LEGACY_SIZE" -gt 64 ] || fail '旧内核大小不受支持'
+        [ "$LEGACY_SIZE" -le 12582912 ] && [ "$LEGACY_SIZE" -gt 64 ] || fail '旧核心大小不受支持'
         LEGACY_SHA=$(sha256sum "$KSROOT/bin/tailscale.combined" | awk '{print $1}')
         SELECTED=cores/$LEGACY_VERSION-legacy-$ARCH
-        mkdir -p "$STAGE/core" || fail '无法准备内核目录'
-        cp -p "$KSROOT/bin/tailscale.combined" "$STAGE/core/tailscale.combined" || fail '无法保留旧内核'
+        mkdir -p "$STAGE/core" || fail '无法准备核心目录'
+        cp -p "$KSROOT/bin/tailscale.combined" "$STAGE/core/tailscale.combined" || fail '无法保留旧核心'
         printf '{"schema":1,"version":"%s","build":"legacy","arch":"%s","origin":"legacy","unpacked_size":%s,"binary_sha256":"%s"}\n' "$LEGACY_VERSION" "$ARCH" "$LEGACY_SIZE" "$LEGACY_SHA" >"$STAGE/core/descriptor.json"
         OLD_KIND=legacy
-        say '保留原 Tailscale 内核及身份；升级插件后可手动更新内核。'
+        say '保留原 Tailscale 核心及身份；升级插件后可手动更新核心。'
     else
         SELECTED=cores/$CORE_VERSION-$CORE_BUILD-$ARCH
-        mkdir -p "$STAGE/core" || fail '无法准备内核目录'
-        cp -p "$PAYLOAD/tailscale.combined" "$STAGE/core/tailscale.combined" && cp "$STAGE/verified.json" "$STAGE/core/descriptor.json" || fail '无法准备内核'
+        mkdir -p "$STAGE/core" || fail '无法准备核心目录'
+        cp -p "$PAYLOAD/tailscale.combined" "$STAGE/core/tailscale.combined" && cp "$STAGE/verified.json" "$STAGE/core/descriptor.json" || fail '无法准备核心'
     fi
     if [ "$OLD_KIND" != current ]; then
-        ln -s tailscale.combined "$STAGE/core/tailscale" && ln -s tailscale.combined "$STAGE/core/tailscaled" || fail '无法创建内核链接'
+        ln -s tailscale.combined "$STAGE/core/tailscale" && ln -s tailscale.combined "$STAGE/core/tailscaled" || fail '无法创建核心链接'
         chmod 755 "$STAGE/core/tailscale.combined"
         if [ -e "$DATA/$SELECTED" ]; then
-            [ ! -L "$DATA/$SELECTED" ] && validate_core "$DATA/$SELECTED/tailscale.combined" "$STAGE/core/descriptor.json" || fail '现有内核版本目录冲突'
+            [ ! -L "$DATA/$SELECTED" ] && validate_core "$DATA/$SELECTED/tailscale.combined" "$STAGE/core/descriptor.json" || fail '现有核心版本目录冲突'
         fi
     fi
 }
 
 prepare_files() {
     local path rel
-    mkdir -p "$STAGE/new" "$STAGE/backup" "$STAGE/dbus" || fail '无法准备安装事务'
+    mkdir -p "$STAGE/new" "$STAGE/backup" "$STAGE/dbus" || fail '无法准备安装暂存文件'
     : >"$STAGE/files"
     for path in "$PKG"/scripts/tailscale_* "$PKG"/init.d/*tailscale.sh "$PKG"/webs/Module_tailscale.asp "$PKG"/res/icon-tailscale.png "$PKG"/res/tailscale3.js; do
         [ -f "$path" ] || fail '安装包缺少插件文件'
@@ -304,7 +304,7 @@ HELPER=$VERIFIED_HELPER
 ts_lock || fail '另一个操作正在运行，请稍后安装'
 LOCKED=1
 # An unfinished core transaction must be recovered before plugin replacement.
-[ ! -e "$DATA/update.txn" ] && [ ! -L "$DATA/update.txn" ] || fail 'recovery_required：上次内核操作尚未恢复，请先完成内核恢复后再安装'
+[ ! -e "$DATA/update.txn" ] && [ ! -L "$DATA/update.txn" ] || fail 'recovery_required：上次核心操作尚未恢复。请在插件页面重试核心操作，并查看操作日志后再安装'
 # All version probes, snapshots and replacements share the lifecycle lock.
 space_preflight
 prepare_core
@@ -315,7 +315,7 @@ if [ -f "$STATE" ]; then cp -p "$STATE" "$STAGE/state" && : >"$STAGE/state.prese
 TOUCHED=1
 mkdir -p "$DATA/cores" "$KSROOT/bin" "$KSROOT/scripts" "$KSROOT/init.d" "$KSROOT/webs" "$KSROOT/res" || fail '无法创建插件目录'
 if [ "$OLD_KIND" != current ] && [ ! -e "$DATA/$SELECTED" ]; then
-    mv "$STAGE/core" "$DATA/$SELECTED" || fail '无法安装内核'
+    mv "$STAGE/core" "$DATA/$SELECTED" || fail '无法安装核心'
     NEW_CORE=$SELECTED
 fi
 while IFS= read -r rel; do
@@ -323,10 +323,10 @@ while IFS= read -r rel; do
     if [ -e "$STAGE/new/$rel" ] || [ -L "$STAGE/new/$rel" ]; then
         mv -f "$STAGE/new/$rel" "$KSROOT/$rel" || fail '无法替换插件文件'
     elif [ "$rel" = bin/tailscale.combined ]; then
-        rm -f "$KSROOT/$rel" || fail '无法迁移旧内核文件'
+        rm -f "$KSROOT/$rel" || fail '无法迁移旧核心文件'
     fi
 done <"$STAGE/files"
-"$VERIFIED_HELPER" atomic-link "$SELECTED" "$DATA/current" || fail '无法切换内核链接'
+"$VERIFIED_HELPER" atomic-link "$SELECTED" "$DATA/current" || fail '无法切换核心链接'
 for pair in tailscale_enable:0 tailscale_ipv4_enable:1 tailscale_ipv6_enable:1 tailscale_advertise_routes:1 tailscale_accept_routes:1 tailscale_exit_node:0 tailscale_watchdog_enable:1; do
     key=${pair%:*}; value=${pair#*:}
     [ -n "$(dbus get "$key")" ] || dbus set "$key=$value" || fail '无法设置默认参数'
@@ -334,7 +334,7 @@ done
 HELPER=$KSROOT/bin/tsks-helper
 ts_start || fail '服务就绪检查失败'
 # Registration follows successful readiness, including disabled fresh installs.
-for pair in tailscale_version=3.0.0 softcenter_module_tailscale_version=3.0.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=安全组网、内核更新与自动恢复'; do
+for pair in tailscale_version=3.0.0 softcenter_module_tailscale_version=3.0.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
     dbus set "$pair" || fail '无法注册插件'
 done
 COMMITTED=1

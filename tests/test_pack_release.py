@@ -113,7 +113,7 @@ class ReleasePublicationTests(unittest.TestCase):
         self.assertEqual([call[1] for call in calls], ["create", "edit", "create", "upload"])
         self.assertEqual(calls[0][:3], ("release", "create", self.tag))
         self.assertIn("--draft", calls[0])
-        self.assertEqual(calls[1], ("release", "edit", self.tag, "--draft=false"))
+        self.assertEqual(calls[1], ("release", "edit", self.tag, "--draft=false", "--latest=false"))
         self.assertEqual(calls[2][:3], ("release", "create", "core-stable"))
         self.assertEqual(calls[3][:3], ("release", "upload", "core-stable"))
         self.assertTrue(all("--clobber" not in call for call in calls[:3]))

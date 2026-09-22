@@ -8,18 +8,18 @@ if [ -n "$ID" ]; then
     ts_job_begin "$ID" || exit 1
     ts_reply "{\"accepted\":true,\"job_id\":\"$ID\"}"
 fi
-ts_job_write running network 'Checking local service and WAN'
+ts_job_write running network '正在检查本机服务与互联网连接'
 if ts_status_file "$RUN/netcheck-status.json"; then
-    ts_job_log "Local backend state: $(ts_get "$RUN/netcheck-status.json" backend_state)"
-else ts_job_log 'Local service is unavailable'; fi
-if ts_wan_healthy; then ts_job_log 'WAN and validated HTTPS are reachable'; else ts_job_log 'WAN or validated HTTPS is unavailable'; fi
+    ts_job_log "本机服务状态：$(ts_get "$RUN/netcheck-status.json" backend_state)"
+else ts_job_log '本机服务暂不可用，请检查是否已启用 Tailscale'; fi
+if ts_wan_healthy; then ts_job_log '互联网连接与 HTTPS 证书校验通过'; else ts_job_log '互联网连接或 HTTPS 校验未通过，请检查路由器联网状态和系统时间'; fi
 # Never publish raw CLI netcheck output (addresses/host details). Only classify
 # whether a bounded probe finished. Detailed UI status uses sanitized LocalAPI.
 if ts_cli netcheck >/dev/null 2>&1; then
-    ts_job_log 'Tailscale network probe completed'
-    ts_job_write success complete 'Network checks completed'
+    ts_job_log 'Tailscale 网络探测已完成'
+    ts_job_write success complete '网络检查已完成，详细结果见下方日志'
 else
-    ts_job_log 'Tailscale network probe failed or exceeded its deadline'
-    ts_job_write failed network 'Network probe did not complete'
+    ts_job_log 'Tailscale 网络探测失败或超时'
+    ts_job_write failed network '网络探测未完成，请查看日志并检查联网状态后重试'
     exit 1
 fi

@@ -16,6 +16,22 @@ REPO = "thetapilla/tailscale-koolshare"
 ARCHES = ("arm", "arm64")
 MAX_MANIFEST = 65536
 STABLE_URL = f"https://github.com/{REPO}/releases/download/core-stable/manifest.json"
+STABLE_TITLE = "核心更新索引"
+STABLE_NOTES = ("供插件页面“检查更新”读取的签名索引。\n\n"
+                f"插件安装包请从[最新发行版](https://github.com/{REPO}/releases/latest)下载。\n")
+
+
+def core_release_notes(desc):
+    version, build = desc["version"], desc["build"]
+    return (f"## 更新内容\n\n"
+            f"- 基于 Tailscale {version} 构建 ARM32 和 ARM64 精简合并核心，构建编号为 `{build}`。\n"
+            "- 上游变更见 [Tailscale 更新日志](https://tailscale.com/changelog)。\n\n"
+            "## 使用方式\n\n"
+            "在插件页面点击“检查更新”，再点击“更新核心”。\n\n"
+            f"插件安装包请从[最新发行版](https://github.com/{REPO}/releases/latest)下载。\n\n"
+            "## 来源与校验\n\n"
+            f"[官方源码提交](https://github.com/tailscale/tailscale/commit/{desc['source_commit']})；"
+            "签名清单、SHA-256 校验值和构建信息见附件。\n")
 
 
 def gh(*args):
@@ -133,7 +149,7 @@ def existing_manifest(release, tag, descriptors):
         for arch, desc in remote.items():
             if not archive_matches(Path(temporary) / desc["url"].rsplit("/", 1)[1], desc):
                 raise ValueError("draft archive differs from signed manifest: " + arch)
-    gh("release", "edit", tag, "--draft=false")
+    gh("release", "edit", tag, "--draft=false", "--latest=false")
     readback_assets(remote)
     return data
 
@@ -161,18 +177,17 @@ def main():
         assets = [str(out / f'tailscale-core_{desc["version"]}_{desc["build"]}_{arch}.tar.gz') for arch in ARCHES]
         assets += [str(out / name) for name in ("manifest.json", "SHA256SUMS", "build-metadata.json")]
         notes = out / "release-notes.md"
-        notes.write_text(f"Tailscale {desc['version']} ({desc['build']}), built from official upstream commit `{desc['source_commit']}`.\n\n"
-                         f"Recipe SHA-256: `{desc['recipe_sha256']}`. Both ARM32 and ARM64 combined cores passed the 12 MiB gate, UPX integrity, CLI/daemon and LocalAPI smoke checks.\n")
+        notes.write_text(core_release_notes(desc))
         gh("release", "create", tag, *assets, "--draft", "--target", os.environ["GITHUB_SHA"],
-           "--title", f'Tailscale core {desc["version"]} {desc["build"]}', "--notes-file", str(notes), "--latest=false")
-        gh("release", "edit", tag, "--draft=false")
+           "--title", f'Tailscale 核心 {desc["version"]} ({desc["build"]})', "--notes-file", str(notes), "--latest=false")
+        gh("release", "edit", tag, "--draft=false", "--latest=false")
         readback_assets(descriptors)
         envelope = (out / "manifest.json").read_bytes()
     if current == descriptors:
         return
     if stable is None:
-        gh("release", "create", "core-stable", "--target", os.environ["GITHUB_SHA"], "--title", "Stable signed core feed",
-           "--notes", "Signed stable manifest for Tailscale Koolshare. Immutable core archives are published in versioned releases.", "--latest=false")
+        gh("release", "create", "core-stable", "--target", os.environ["GITHUB_SHA"], "--title", STABLE_TITLE,
+           "--notes", STABLE_NOTES, "--latest=false")
     with tempfile.TemporaryDirectory() as temporary:
         manifest = Path(temporary) / "manifest.json"
         manifest.write_bytes(envelope)

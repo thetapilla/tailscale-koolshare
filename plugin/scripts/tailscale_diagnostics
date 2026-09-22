@@ -8,18 +8,18 @@ trap 'ts_unlock' EXIT
 ts_job_begin "$ID" || exit 1
 ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
 ts_status_file "$RUN/diagnostics.json"
-ts_job_log 'Tailscale Koolshare 3.0.0 diagnostic summary'
+ts_job_log 'Tailscale 诊断摘要'
 for field in version backend_state online monitoring_available health_codes health_messages; do
     value=$(ts_get "$RUN/diagnostics.json" "$field")
     ts_job_log "$field: $value"
 done
-ts_job_log "Kernel: $(uname -r)"
-ts_job_log "Uptime seconds: $(awk '{print int($1)}' "$TSKS_PROC/uptime")"
-ts_job_log "Memory: $(awk '/^MemAvailable:/ {print $2 " KiB available"}' "$TSKS_PROC/meminfo")"
-ts_job_log "JFFS: $(df -Pk "$DATA" | awk 'END {print $4 " KiB available"}')"
+ts_job_log "Linux 内核：$(uname -r)"
+ts_job_log "系统运行时间（秒）：$(awk '{print int($1)}' "$TSKS_PROC/uptime")"
+ts_job_log "可用内存：$(awk '/^MemAvailable:/ {print $2 " KiB"}' "$TSKS_PROC/meminfo")"
+ts_job_log "JFFS 可用空间：$(df -Pk "$DATA" | awk 'END {print $4 " KiB"}')"
 if [ -f "$RUN/daemon.log" ] && [ ! -L "$RUN/daemon.log" ]; then
-    ts_job_log 'Recent daemon events (bounded and credential-redacted)'
+    ts_job_log '最近服务日志（已限制长度并隐藏识别到的凭据）'
     tail -c 8192 "$RUN/daemon.log" | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 || \
-        ts_job_log 'Daemon log could not be included'
+        ts_job_log '无法读取服务日志，请稍后重试'
 fi
-ts_job_write success complete '诊断摘要已生成'
+ts_job_write success complete '诊断摘要已生成，请查看下方日志'

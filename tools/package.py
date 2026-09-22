@@ -22,13 +22,11 @@ def check_host_installer(path):
             raise ValueError("software-center installer guard rejects text: " + token.decode())
 
 
-def build_packages(root, out, public_key=None, helper=None, revision=None):
+def build_packages(root, out, public_key=None, helper=None):
     root, out = Path(root), Path(out)
     version = (root / "VERSION").read_text().strip()
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("invalid plugin version")
-    if revision is not None and not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,31}", revision):
-        raise ValueError("invalid package revision")
     check_host_installer(root / "plugin/install.sh")
     if any(path.is_symlink() for path in (root / "plugin").rglob("*")):
         raise ValueError("plugin package symlinks are not accepted by the installer")
@@ -86,8 +84,7 @@ def build_packages(root, out, public_key=None, helper=None, revision=None):
                 checksums.append(f"{sha256(file)}  {file.relative_to(stage).as_posix()}\n")
         (stage / "manifest.sha256").write_text("".join(checksums))
         (stage / "manifest.sha256").chmod(0o644)
-        suffix = "_" + revision if revision else ""
-        archive = out / f"tailscale_{version}_{platform}{suffix}.tar.gz"
+        archive = out / f"tailscale_{version}_{platform}.tar.gz"
         archive_tree(stage, archive)
         result.append(archive)
     (out / "SHA256SUMS").write_text("".join(f"{sha256(path)}  {path.name}\n" for path in result))
@@ -99,9 +96,8 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT.parent / "dist")
     parser.add_argument("--public-key", type=Path, default=ROOT / "plugin/release.pub")
     parser.add_argument("--helper", type=Path, default=ROOT / "build/tsks-helper")
-    parser.add_argument("--revision", help="optional installation-package revision; plugin version is unchanged")
     args = parser.parse_args()
-    for path in build_packages(ROOT, args.output, args.public_key, args.helper, args.revision):
+    for path in build_packages(ROOT, args.output, args.public_key, args.helper):
         print(path)
 
 

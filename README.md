@@ -1,39 +1,43 @@
-# Tailscale Koolshare 3.0.0
+# Tailscale Koolshare
 
-适用于 Koolshare 软件中心的 Tailscale 路由器插件。提供可读后台、核心独立更新、状态诊断和有界自动恢复。
+适用于 Koolshare 软件中心的 Tailscale 路由器插件。通过路由器管理页面接入 Tailnet，管理子网路由和出口节点，并独立更新 Tailscale 核心。
 
-## 安装包
+- 查看服务状态、连接健康信息和接口流量。
+- 保留已有配置与设备身份，支持从原版插件迁移。
+- 手动检查、验证并更新核心，支持回退上一核心。
+- 提供诊断摘要和有频率限制的自动恢复。
 
-请下载 [3.0.0 安装兼容修订包 installfix1](https://github.com/thetapilla/tailscale-koolshare/releases/tag/v3.0.0-installfix1)。它修正了原始安装脚本注释触发软件中心保护扫描的兼容性问题，插件版本仍为3.0.0。原始发布文件保留供核对。
+## 下载与安装
 
-提供一个通用包和 HND、QCA、IPQ32、IPQ64、MTK 五个平台包。通用包自动识别平台，只安装该设备需要的架构；闪存空间较紧时选择对应平台包。RT-AX86U Pro、RT-BE86U 使用 HND 包。
+从 [最新插件 Release](https://github.com/thetapilla/tailscale-koolshare/releases/latest) 下载安装包，在软件中心的「离线安装」页面上传。插件版本以 [VERSION](VERSION) 为准；每批发布文件的校验值见同一 Release 中的 `SHA256SUMS`。
 
-从本仓库的插件 Release 下载 `tailscale_3.0.0_universal.tar.gz` 或对应平台包，在软件中心的离线安装页面上传。先保留当前版本和配置备份，安装时现有 Tailscale 连接会短暂中断。
+| 软件中心平台 | 安装包后缀 | 核心架构 |
+| --- | --- | --- |
+| 自动识别 | `_universal.tar.gz` | 包含 ARM32 和 ARM64，安装时选择所需架构 |
+| HND | `_hnd.tar.gz` | ARM32（`arm`） |
+| QCA | `_qca.tar.gz` | ARM32（`arm`） |
+| IPQ32 | `_ipq32.tar.gz` | ARM32（`arm`） |
+| IPQ64 | `_ipq64.tar.gz` | ARM64（`arm64`） |
+| MTK | `_mtk.tar.gz` | ARM64（`arm64`） |
 
-全新安装携带 Tailscale 1.102.4。升级安装保留已安装核心和原有连接身份，包括从 2.x 迁移的核心；安装完成后可在插件页面独立更新核心。首次启用尚未授权的设备时，页面提供 Tailscale 登录链接。
+按固件的软件中心平台选择安装包；不确定时使用通用包。平台包体积较小，通用包只会安装设备需要的架构。固件需提供可用的 Koolshare 软件中心及 Linux 4.1 或更新内核。详细要求见 [使用指南](docs/USER-GUIDE.md)。
+
+安装完成后打开插件页面，启用 Tailscale，按页面的「登录并授权」链接完成首次接入。升级安装会保留已有核心、配置和设备身份；安装及应用设置期间，Tailscale 连接可能短暂中断。
 
 ## 核心更新
 
-页面分别显示插件版本和核心版本。点击「检查更新」查询本仓库已构建、测试并签名的稳定核心，再点击「更新核心」安装。更新失败时自动恢复上一版；成功更新后可手动回滚。后台不会自行安装新版本。
+插件版本与 Tailscale 核心版本分别管理。在页面点击「检查更新」，再点击「更新核心」安装本项目构建并签名的稳定核心。更新前会校验签名、文件哈希、版本和架构；更新失败时尝试恢复原核心，保留上一核心时可手动回退。更新需要手动发起。
 
-核心由官方 Tailscale 源码构建为精简 combined 程序，以两个入口提供 CLI 和 daemon。裁剪集合沿用原版插件，包括 Tailscale SSH、Taildrop 等非原版插件功能；原有系统 SSH 服务不受此构建选项影响。构建参数和工具版本见 [构建说明](docs/BUILD.md)。
+随安装包提供的核心来自官方 Tailscale 源码，采用精简构建；Tailscale SSH、Taildrop 等功能未包含在该构建中。完整构建选项见 [核心构建配方](tools/core_recipe.json)，更新和回退步骤见 [使用指南](docs/USER-GUIDE.md#核心更新与回退)。
 
-更新包按实际架构下载，验证 Ed25519 签名、SHA-256、版本、文件结构和 ELF 架构。更新需要至少 64 MiB 可用 RAM，并为持久存储保留 8 MiB 余量；不足时保留当前版本并报告原因。插件升级不会用附带核心覆盖已安装核心。
+## 文档
 
-## 诊断与恢复
-
-看门狗默认开启，可在页面关闭。每分钟检查本地服务与控制连接，对短时网络波动、等待授权或明确停用保持等待。符合恢复条件时重启插件服务，至少冷却30分钟，24小时最多两次；不重启路由器、不注销或删除设备身份。
-
-地址变化和NAT重建的规则维护独立运行，繁忙期间收到的NAT刷新会排队重试。
-
-「导出诊断」包含实际核心版本、后端状态、健康原因、资源概况及受限长度的脱敏运行日志。设备 state 文件、私钥与认证令牌不在诊断输出中。
-
-## 开发与验证
-
-源码、构建和测试可在本机 Docker 中运行。安装产物默认输出到工作目录的 `dist/`。参见 [构建说明](docs/BUILD.md)、[审计与验证](docs/AUDIT.md)、[实机验收](docs/ACCEPTANCE.md)。
-
-Docker 测试覆盖脚本控制逻辑、更新事务、原版配置迁移、前端及两种架构的真实核心。各厂商固件的网络栈和长期稳定性仍需要实机验收。
+- [使用指南](docs/USER-GUIDE.md)：安装、设置、核心管理与故障排查。
+- [架构与接口约定](CONTRACT.md)：运行目录、任务协议和签名格式。
+- [构建与发布](docs/BUILD.md)：构建环境、签名和发布流程。
+- [测试指南](docs/TESTING.md)：自动化检查、固件兼容性和设备验证。
+- [更新记录](CHANGELOG.md)。
 
 ## 来源与许可
 
-插件基于 [Koolshare rogsoft](https://github.com/koolshare/rogsoft/tree/master/tailscale) 的界面布局、图标及软件中心接口，原作者 sadog/Koolshare 的署名和权利保留。项目中的新实现与原版的关系见 [NOTICE](NOTICE)。Tailscale 使用官方源码及其 [BSD-3-Clause 许可](LICENSES/Tailscale-BSD-3-Clause.txt)。
+插件的页面布局、图标和软件中心接口源自 [Koolshare rogsoft](https://github.com/koolshare/rogsoft/tree/master/tailscale)，保留原作者 sadog / Koolshare 的署名和权利。来源说明见 [NOTICE](NOTICE)。Tailscale 使用官方源码及其 [BSD-3-Clause 许可](LICENSES/Tailscale-BSD-3-Clause.txt)。

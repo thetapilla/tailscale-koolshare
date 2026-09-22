@@ -68,6 +68,7 @@ elif name=='tsks-helper':
         sys.exit(subprocess.run(args[2:]).returncode)
     elif args[0]=='version':print('1.102.4')
     elif args[0]=='log':
+        if read('log_exit.json',0):sys.exit(1)
         with open(args[1],'a') as dest:
             for line in sys.stdin:dest.write(line);dest.flush()
 elif name in ('tailscale','tailscaled'):
@@ -77,6 +78,7 @@ elif name in ('tailscale','tailscaled'):
         (proc/'cmdline').write_bytes((sys.argv[0]+'\0'+'\0'.join(args)).encode())
         print('mock daemon started',flush=True)
         while True:time.sleep(1)
+    if name=='tailscale':print(read('cli_output.json',''),end='')
     sys.exit(read('cli_exit.json',0))
 elif name=='cru':pass
 elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
@@ -459,6 +461,34 @@ class BackendTests(unittest.TestCase):
         self.assertEqual((job["state"], job["id"]), ("success", "000123"))
         self.assertEqual(list(self.web.glob(".tailscale3*")), [])
         self.assertEqual((self.web / "tailscale3_000123.json").stat().st_mode & 0o777, 0o644)
+
+    def test_connection_details_returns_job_ack_and_bounded_sanitized_log(self):
+        self.write("cli_output.json", "100.64.2.3 test-device active\n")
+        original = self.read("config.json")
+        self.entry("tailscale_status", "000124")
+        self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "000124"})
+        job = json.loads((self.web / "tailscale3_000124.json").read_text())
+        self.assertEqual((job["state"], job["id"]), ("success", "000124"))
+        self.assertIn("test-device", (self.web / "tailscale3_000124.log").read_text())
+        helper_calls = self.calls("tsks-helper")
+        self.assertIn(["timeout", "15", str(self.ks / "tailscale/current/tailscale"),
+                       "--socket=" + str(self.run / "tailscaled.sock"), "status"], helper_calls)
+        self.assertIn(["log", str(self.web / "tailscale3_000124.log"), "65536"], helper_calls)
+        self.assertEqual(self.read("config.json"), original)
+        self.assertEqual(list(self.run.glob("status-result.*")), [])
+
+    def test_connection_details_cli_or_log_failure_is_terminal_failure(self):
+        for failure in ("cli_exit.json", "log_exit.json"):
+            with self.subTest(failure=failure):
+                self.write("cli_exit.json", 0)
+                self.write("log_exit.json", 0)
+                self.write(failure, 1)
+                result = self.entry("tailscale_status", "125", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "125"})
+                job = json.loads((self.web / "tailscale3_125.json").read_text())
+                self.assertEqual(job["state"], "failed")
+                self.assertEqual(list(self.run.glob("status-result.*")), [])
 
     def test_shared_lock_rejects_parallel_mutation(self):
         source = '. "$TSKS_ROOT/scripts/tailscale_lib.sh"; ts_init; ts_lock; echo locked; read done'

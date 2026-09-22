@@ -110,17 +110,21 @@ class PackagingTests(unittest.TestCase):
                         self.packages()
                     self.assertFalse(self.out.exists())
 
-    def test_revision_names_preserve_plugin_version(self):
-        paths = build_packages(self.root, self.out, revision="installfix1")
+    def test_same_version_replaces_canonical_archives(self):
+        paths = self.packages()
+        first = {path.name: path.read_bytes() for path in paths}
+        (self.root / "plugin/webs/Module_tailscale.asp").write_text("Updated help text")
+        paths = self.packages()
+        expected = {f"tailscale_3.0.0_{name}.tar.gz" for name in ("universal", *PLATFORMS)}
+        self.assertEqual({path.name for path in paths}, expected)
+        self.assertEqual({path.name for path in self.out.iterdir()}, expected | {"SHA256SUMS"})
         for path in paths:
-            self.assertTrue(path.name.endswith("_installfix1.tar.gz"))
+            self.assertNotEqual(path.read_bytes(), first[path.name])
             with tarfile.open(path) as tar:
                 self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
                 installer = tar.extractfile("tailscale/install.sh").read()
                 self.assertNotIn(b"detect_package", installer)
                 self.assertNotIn(b"ks_tar_install", installer)
-        with self.assertRaisesRegex(ValueError, "invalid package revision"):
-            build_packages(self.root, self.out, revision="../../outside")
 
     def test_rejects_wrong_architecture(self):
         (self.root / "build/helpers/arm/tsks-helper").write_bytes(elf("arm64"))

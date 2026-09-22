@@ -39,7 +39,7 @@ ts_core_read_journal() {
 ts_core_recover() {
     [ -f "$DATA/update.txn" ] || return 0
     [ "$TS_LOCKED" = 1 ] || return 1
-    ts_core_read_journal || { ts_job_log 'Core transaction journal is invalid'; return 1; }
+    ts_core_read_journal || { ts_job_log '核心恢复记录无效，请保留记录并检查诊断摘要'; return 1; }
     if [ "$CORE_PHASE" = committed ]; then
         "$HELPER" atomic-link "$CORE_OLD" "$DATA/previous" || return 1
         rm -f "$DATA/update.txn" "$DATA/update.state"
@@ -63,7 +63,7 @@ ts_core_recover() {
     if [ "$CORE_ENABLED" = 1 ]; then ts_start || return 1; fi
     rm -f "$DATA/update.txn" "$DATA/update.state"
     sync
-    ts_job_log 'Recovered the previous core after an interrupted transaction'
+    ts_job_log '已恢复中断操作前的核心'
 }
 ts_core_check() {
     local arch current version comparison tmp installed_build offered_build
@@ -76,14 +76,14 @@ ts_core_check() {
     current=$("$HELPER" version "$DATA/current/tailscale.combined") || return 1
     version=$(ts_get "$tmp.descriptor" version) || return 1
     comparison=$("$HELPER" compare "$version" "$current") || return 1
-    [ "$comparison" != -1 ] || { ts_job_log 'Feed does not permit a downgrade'; return 1; }
+    [ "$comparison" != -1 ] || { ts_job_log '更新源版本低于当前版本，已停止更新检查；如需回退，请使用“回退上一核心”'; return 1; }
     if [ "$comparison" = 0 ]; then
         installed_build=$(ts_get "$DATA/current/descriptor.json" build) || installed_build=legacy
         offered_build=$(ts_get "$tmp.descriptor" build) || return 1
         case $installed_build in r[1-9]*)
             installed_build=${installed_build#r}; offered_build=${offered_build#r}
             case $installed_build:$offered_build in *[!0-9:]*) return 1;; esac
-            [ "$offered_build" -ge "$installed_build" ] || { ts_job_log 'Feed build is older than installed build'; return 1; }
+            [ "$offered_build" -ge "$installed_build" ] || { ts_job_log '更新源构建版本早于当前版本，已停止更新检查'; return 1; }
             ;;
         esac
     fi
@@ -91,7 +91,7 @@ ts_core_check() {
     cp "$tmp.descriptor" "$DATA/.available.$$" && chmod 600 "$DATA/.available.$$" && mv -f "$DATA/.available.$$" "$DATA/available.json" || return 1
     mv -f "$tmp.json" "$DATA/available.signed.json"
     rm -f "$tmp.descriptor"
-    ts_job_log "Verified core release $version"
+    ts_job_log "核心 $version 的发布信息已通过签名校验"
 }
 ts_core_space() {
     local required available previous current mem
@@ -100,7 +100,7 @@ ts_core_space() {
     [ "$required" -le 12582912 ] || return 1
     mem=$(awk '/^MemAvailable:/ {print $2; exit}' "$TSKS_PROC/meminfo")
     [ -n "$mem" ] || mem=$(awk '/^MemFree:/ {print $2; exit}' "$TSKS_PROC/meminfo")
-    [ "${mem:-0}" -ge 65536 ] || { ts_job_log 'At least 64 MiB available RAM is required'; return 1; }
+    [ "${mem:-0}" -ge 65536 ] || { ts_job_log '可用内存不足：核心更新至少需要 64 MiB，请释放内存后重试'; return 1; }
     available=$(df -Pk "$DATA" | awk 'END {print $4}')
     required=$(( (required + 1023) / 1024 + 8192 ))
     if [ "${available:-0}" -lt "$required" ]; then
@@ -112,7 +112,7 @@ ts_core_space() {
             available=$(df -Pk "$DATA" | awk 'END {print $4}')
         fi
     fi
-    [ "${available:-0}" -ge "$required" ] || { ts_job_log 'Insufficient persistent storage with the 8 MiB reserve'; return 1; }
+    [ "${available:-0}" -ge "$required" ] || { ts_job_log '可用存储不足：核心更新需保留 8 MiB 余量，请释放存储空间后重试'; return 1; }
 }
 ts_core_switch() {
     local old_state old_id new_state new_id identity_ok
@@ -129,7 +129,7 @@ ts_core_switch() {
         old_id=$(ts_get "$RUN/pre-update-status.json" node_id) || old_id=
     fi
     ts_core_journal prepared || return 1
-    ts_job_write running switching '正在切换核心，连接将短暂中断'
+    ts_job_write running switching '正在切换核心，连接可能短暂中断'
     if ! ts_stop; then ts_core_recover; return 1; fi
     if [ "$CORE_HAD_STATE" = 1 ]; then
         cp -p "$STATE" "$DATA/update.state" && chmod 600 "$DATA/update.state" || { ts_core_recover; return 1; }
@@ -149,10 +149,10 @@ ts_core_switch() {
         if [ -n "$old_id" ] && [ "$old_id" != null ] && [ -n "$new_id" ] && [ "$new_id" != null ] && [ "$new_id" != "$old_id" ]; then identity_ok=0; fi
         if [ "$identity_ok" != 1 ]; then
             if ts_core_recover; then
-                ts_job_write rolled_back rollback '新版核心启动未通过，已恢复上一版'
+                ts_job_write rolled_back rollback '核心切换后的检查未通过，已恢复上一核心'
                 return 2
             fi
-            ts_job_log 'Automatic rollback requires attention; recovery journal retained'
+            ts_job_log '自动恢复上一核心未完成，已保留恢复记录；请查看诊断摘要'
             return 1
         fi
     fi
@@ -160,7 +160,7 @@ ts_core_switch() {
     "$HELPER" atomic-link "$CORE_OLD" "$DATA/previous" || return 1
     rm -f "$DATA/update.txn" "$DATA/update.state"
     sync
-    ts_job_log 'Core transaction committed'
+    ts_job_log '核心切换已完成'
 }
 ts_core_update() {
     local tmp version build arch target url required current candidate
@@ -172,7 +172,7 @@ ts_core_update() {
     current=$(ts_core_target "$DATA/current") || return 1
     if [ "$current" = "$target" ]; then
         [ "$(ts_get "$DATA/current/descriptor.json" binary_sha256)" = "$(ts_get "$tmp/descriptor.json" binary_sha256)" ] && ts_core_valid "$DATA/current" || { rm -rf "$tmp"; return 1; }
-        ts_job_log 'This core build is already installed'; rm -rf "$tmp"; return 0
+        ts_job_log '当前已安装更新源提供的核心，无需更新'; rm -rf "$tmp"; return 0
     fi
     required=$(ts_get "$tmp/descriptor.json" unpacked_size)
     ts_core_space "$required" || { rm -rf "$tmp"; return 1; }
@@ -195,7 +195,7 @@ ts_core_update() {
 }
 ts_core_rollback() {
     local target
-    target=$(ts_core_target "$DATA/previous") || { ts_job_log 'No previous core is available'; return 1; }
+    target=$(ts_core_target "$DATA/previous") || { ts_job_log '没有可回退的上一核心'; return 1; }
     # Snapshot the current state in this transaction; never replay old backup
     # state merely because a user requested a later manual rollback.
     ts_core_switch "$target"
