@@ -1,0 +1,109 @@
+name: Stable Tailscale core
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable upstream version; blank selects latest stable'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: stable-core-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.26.6'
+          cache: false
+      - name: Build signed feed verifier
+        env:
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+          GOENV: 'off'
+        run: |
+          mkdir -p build
+          go build -mod=readonly -buildvcs=false -trimpath -o build/tsks-helper ./cmd/tsks-helper
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: python3 tools/check_stable.py --version "$REQUESTED_VERSION"
+  build:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm,arm64
+      - name: Build official core and verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          python3 tools/build_core.py --version "$CORE_VERSION" --jobs 2
+          python3 tools/build_helper.py
+      - name: Verify both CPU architectures
+        run: |
+          python3 tools/smoke_core.py
+          python3 tools/test_helper.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          node tests/test_ui.js
+          python3 tools/test_busybox.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-core-build
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            build/cores/
+            build/helpers/
+            build/tsks-helper
+            build/core-build.json
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    environment: core-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-core-build
+          path: build
+      - name: Sign verified artifacts
+        env:
+          TSKS_SIGNING_KEY: ${{ secrets.TSKS_SIGNING_KEY }}
+        run: |
+          set -eu
+          chmod 755 build/tsks-helper
+          install -d -m 700 .secrets
+          trap 'rm -f .secrets/ci-signing.key' EXIT
+          umask 077
+          printf '%s\n' "$TSKS_SIGNING_KEY" > .secrets/ci-signing.key
+          python3 tools/release_core.py --key .secrets/ci-signing.key
+      - name: Publish immutable release and advance signed feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/publish_core.py

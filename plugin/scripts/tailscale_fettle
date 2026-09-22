@@ -1,0 +1,5 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ts_parse_request "$@"
+ts_reply "$(ts_status_json)"

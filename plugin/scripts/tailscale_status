@@ -1,0 +1,6 @@
+#!/bin/sh
+# Status inspection is read-only and does not acquire the lifecycle lock.
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ts_parse_request "$@"
+ts_reply "$(ts_status_json)"

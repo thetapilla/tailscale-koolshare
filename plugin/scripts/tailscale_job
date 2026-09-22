@@ -1,0 +1,11 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ID=${1:-}; job=${2:-}
+ts_job_id "$ID" && ts_job_id "$job" || exit 1
+file=$WEB/tailscale3_$job.json
+if [ -f "$file" ] && [ ! -L "$file" ]; then
+    ts_reply "$(cat "$file")"
+else
+    ts_reply "{\"schema\":1,\"id\":\"$job\",\"state\":\"unknown\",\"phase\":\"unknown\",\"message\":\"未找到任务记录，请刷新状态确认操作结果\"}"
+fi

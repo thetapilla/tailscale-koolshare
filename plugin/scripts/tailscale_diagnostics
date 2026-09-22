@@ -1,0 +1,25 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ID=${1:-}
+ts_job_id "$ID" || exit 1
+ts_lock || { ts_reply '{"accepted":false,"error":"busy"}'; exit 1; }
+trap 'ts_unlock' EXIT
+ts_job_begin "$ID" || exit 1
+ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
+ts_status_file "$RUN/diagnostics.json"
+ts_job_log 'Tailscale Koolshare 3.0.0 diagnostic summary'
+for field in version backend_state online monitoring_available health_codes health_messages; do
+    value=$(ts_get "$RUN/diagnostics.json" "$field")
+    ts_job_log "$field: $value"
+done
+ts_job_log "Kernel: $(uname -r)"
+ts_job_log "Uptime seconds: $(awk '{print int($1)}' "$TSKS_PROC/uptime")"
+ts_job_log "Memory: $(awk '/^MemAvailable:/ {print $2 " KiB available"}' "$TSKS_PROC/meminfo")"
+ts_job_log "JFFS: $(df -Pk "$DATA" | awk 'END {print $4 " KiB available"}')"
+if [ -f "$RUN/daemon.log" ] && [ ! -L "$RUN/daemon.log" ]; then
+    ts_job_log 'Recent daemon events (bounded and credential-redacted)'
+    tail -c 8192 "$RUN/daemon.log" | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 || \
+        ts_job_log 'Daemon log could not be included'
+fi
+ts_job_write success complete '诊断摘要已生成'

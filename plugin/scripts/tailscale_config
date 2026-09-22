@@ -1,0 +1,13 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ts_parse_request "$@"
+if [ -n "$ID" ]; then shift; fi
+[ "$#" = 0 ] || shift
+case $ACTION in
+    web_submit)
+        if [ "$#" = 0 ]; then ts_mutation web_submit
+        elif [ "$#" = 1 ] && ts_bits_valid "$1"; then ts_mutation web_submit "$1"
+        else ts_reply '{"accepted":false,"error":"invalid_config_snapshot"}'; exit 1; fi;;
+    start|stop|restart|start_nat) ts_mutation "$ACTION";;
+    *) ts_reply '{"accepted":false,"error":"invalid_action"}'; exit 1;; esac

@@ -1,0 +1,7 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+# A busy user/updater operation wins; cron retries on its next 60-second tick.
+ts_lock || exit 0
+trap 'ts_unlock' EXIT
+ts_watchdog_run

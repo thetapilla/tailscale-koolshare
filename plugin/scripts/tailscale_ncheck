@@ -1,0 +1,25 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ts_parse_request "$@"
+if ! ts_lock; then ts_reply '{"accepted":false,"error":"busy"}'; exit 1; fi
+trap 'ts_unlock' EXIT
+if [ -n "$ID" ]; then
+    ts_job_begin "$ID" || exit 1
+    ts_reply "{\"accepted\":true,\"job_id\":\"$ID\"}"
+fi
+ts_job_write running network 'Checking local service and WAN'
+if ts_status_file "$RUN/netcheck-status.json"; then
+    ts_job_log "Local backend state: $(ts_get "$RUN/netcheck-status.json" backend_state)"
+else ts_job_log 'Local service is unavailable'; fi
+if ts_wan_healthy; then ts_job_log 'WAN and validated HTTPS are reachable'; else ts_job_log 'WAN or validated HTTPS is unavailable'; fi
+# Never publish raw CLI netcheck output (addresses/host details). Only classify
+# whether a bounded probe finished. Detailed UI status uses sanitized LocalAPI.
+if ts_cli netcheck >/dev/null 2>&1; then
+    ts_job_log 'Tailscale network probe completed'
+    ts_job_write success complete 'Network checks completed'
+else
+    ts_job_log 'Tailscale network probe failed or exceeded its deadline'
+    ts_job_write failed network 'Network probe did not complete'
+    exit 1
+fi

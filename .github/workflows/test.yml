@@ -1,0 +1,27 @@
+name: Plugin checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.26.6'
+          cache: false
+      - name: Helper, package, backend and UI tests
+        run: |
+          go test ./...
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          node tests/test_ui.js
+      - name: Router shell syntax
+        run: |
+          find plugin -type f \( -path '*/scripts/*' -o -name '*.sh' \) -exec sh -c 'for file do sh -n "$file" || exit 1; done' sh {} +

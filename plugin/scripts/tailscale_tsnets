@@ -1,0 +1,24 @@
+#!/bin/sh
+. "${TSKS_ROOT:-/koolshare}/scripts/tailscale_lib.sh" || exit 1
+ts_init || exit 1
+ts_parse_request "$@"
+file="$RUN/interfaces.$$"
+result='{"interfaces":['
+separator=
+if ts_status_file "$file"; then
+    index=0
+    while [ "$index" -lt 16 ]; do
+        addr=$(ts_get "$file" "ips.$index") || break
+        # Addresses are validated by helper; quote again for the host API.
+        case $addr in ''|*[!0-9A-Fa-f:.]*) index=$((index + 1)); continue;; esac
+        rx=$(cat "$TSKS_SYSFS/class/net/tailscale0/statistics/rx_bytes" 2>/dev/null)
+        tx=$(cat "$TSKS_SYSFS/class/net/tailscale0/statistics/tx_bytes" 2>/dev/null)
+        ts_counter "$rx" || rx=0
+        ts_counter "$tx" || tx=0
+        result="$result$separator{\"if\":\"tailscale0\",\"ip\":$(ts_quote "$addr"),\"rx\":$rx,\"tx\":$tx}"
+        separator=,
+        index=$((index + 1))
+    done
+fi
+rm -f "$file"
+ts_reply "$result]}"
