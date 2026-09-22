@@ -42,6 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("all", "backend", "core", "install"), default="all")
     args = parser.parse_args()
+    (ROOT / "build").mkdir(parents=True, exist_ok=True)
     archive = ROOT / ".cache/downloads/busybox-1.25.1.tar.bz2"
     download("https://busybox.net/downloads/busybox-1.25.1.tar.bz2", archive, BUSYBOX_SHA256)
     build_script = PROFILE_CHECK + r'''
