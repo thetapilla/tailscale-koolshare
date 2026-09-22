@@ -161,12 +161,26 @@ class InstallTests(unittest.TestCase):
         (self.pkg / 'manifest.sha256').write_text(''.join(lines))
 
     def install(self, success=True):
-        result = subprocess.run([SHELL, str(self.pkg / 'install.sh')], env=self.env, text=True, capture_output=True, timeout=30)
+        # The real host scans the entire installer before executing it. Keep
+        # the literal grep semantics so comments are covered as on the router.
+        gate = 'a=$(grep "detect_package" "$1"); b=$(grep "ks_tar_install" "$1"); [ -z "$a" ] && [ -z "$b" ]'
+        result = subprocess.run([SHELL, '-c', gate, 'host-preflight', str(self.pkg / 'install.sh')], env=self.env, text=True, capture_output=True, timeout=5)
+        if result.returncode == 0:
+            result = subprocess.run([SHELL, str(self.pkg / 'install.sh')], env=self.env, text=True, capture_output=True, timeout=30)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
+
+    def test_host_preflight_stops_a_comment_match_before_plugin_execution(self):
+        original = (self.pkg / 'install.sh').read_text()
+        for token in ('detect_package', 'ks_tar_install'):
+            (self.pkg / 'install.sh').write_text(original + '\n# Reference: ' + token + '.sh\n')
+            self.checksums()
+            self.install(False)
+            self.assertEqual(self.calls('tsks-helper'), [])
+            self.assertFalse((self.mock / 'lifecycle').exists())
 
     def calls(self, name):
         file = self.mock / 'calls.jsonl'

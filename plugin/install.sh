@@ -41,7 +41,7 @@ platform() {
     uname -r | awk -F. '$1>4 || ($1==4 && $2>=1) {ok=1} END {exit !ok}' || fail '需要 Linux 4.1 或更新的固件'
     MODEL=$(nvram get odmpid 2>/dev/null)
     [ -n "$MODEL" ] || MODEL=$(nvram get productid 2>/dev/null)
-    # Same model/platform mapping as Koolshare ks_tar_install.sh.
+    # Match the software center's model-to-platform mapping.
     case "$MODEL" in
         TX-AX6000|TUF-AX4200Q|RT-AX57_Go|GS7|ZenWiFi_BT8P|GS7_Air|GS-BE7200X) PLATFORM=mtk; ARCH=arm64;;
         ZenWiFi_BD4) PLATFORM=ipq32; ARCH=arm;;

@@ -101,6 +101,27 @@ class PackagingTests(unittest.TestCase):
                 digest, name = line.split("  ", 1)
                 self.assertEqual(hashlib.sha256(tar.extractfile("tailscale/" + name).read()).hexdigest(), digest)
 
+    def test_host_guard_rejects_protected_text_even_in_comments(self):
+        for token in ("detect_package", "ks_tar_install"):
+            for content in (f"#!/bin/sh\n# Reference: {token}.sh\n", f"#!/bin/sh\necho {token}\n"):
+                with self.subTest(token=token, content=content):
+                    (self.root / "plugin/install.sh").write_text(content)
+                    with self.assertRaisesRegex(ValueError, "software-center installer guard"):
+                        self.packages()
+                    self.assertFalse(self.out.exists())
+
+    def test_revision_names_preserve_plugin_version(self):
+        paths = build_packages(self.root, self.out, revision="installfix1")
+        for path in paths:
+            self.assertTrue(path.name.endswith("_installfix1.tar.gz"))
+            with tarfile.open(path) as tar:
+                self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
+                installer = tar.extractfile("tailscale/install.sh").read()
+                self.assertNotIn(b"detect_package", installer)
+                self.assertNotIn(b"ks_tar_install", installer)
+        with self.assertRaisesRegex(ValueError, "invalid package revision"):
+            build_packages(self.root, self.out, revision="../../outside")
+
     def test_rejects_wrong_architecture(self):
         (self.root / "build/helpers/arm/tsks-helper").write_bytes(elf("arm64"))
         with self.assertRaisesRegex(ValueError, "architecture mismatch"):

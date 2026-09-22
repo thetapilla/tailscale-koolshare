@@ -11,13 +11,25 @@ from artifact_utils import MAX_BINARY, archive_tree, check_elf, sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORMS = {"hnd": "arm", "qca": "arm", "ipq32": "arm", "ipq64": "arm64", "mtk": "arm64"}
+HOST_INSTALLER_BLOCKED_TEXT = (b"detect_package", b"ks_tar_install")
 
 
-def build_packages(root, out, public_key=None, helper=None):
+def check_host_installer(path):
+    """Match the host's raw installer-text gate, including shell comments."""
+    text = Path(path).read_bytes()
+    for token in HOST_INSTALLER_BLOCKED_TEXT:
+        if token in text:
+            raise ValueError("software-center installer guard rejects text: " + token.decode())
+
+
+def build_packages(root, out, public_key=None, helper=None, revision=None):
     root, out = Path(root), Path(out)
     version = (root / "VERSION").read_text().strip()
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("invalid plugin version")
+    if revision is not None and not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,31}", revision):
+        raise ValueError("invalid package revision")
+    check_host_installer(root / "plugin/install.sh")
     if any(path.is_symlink() for path in (root / "plugin").rglob("*")):
         raise ValueError("plugin package symlinks are not accepted by the installer")
     public_key = Path(public_key or root / "plugin/release.pub")
@@ -48,6 +60,7 @@ def build_packages(root, out, public_key=None, helper=None):
         if stage.exists():
             shutil.rmtree(stage)
         shutil.copytree(root / "plugin", stage, symlinks=True)
+        check_host_installer(stage / "install.sh")
         (stage / "version").write_text(version + "\n")
         valid = list(PLATFORMS) if platform == "universal" else [platform]
         (stage / ".valid").write_text("\n".join(valid) + "\n")
@@ -73,7 +86,8 @@ def build_packages(root, out, public_key=None, helper=None):
                 checksums.append(f"{sha256(file)}  {file.relative_to(stage).as_posix()}\n")
         (stage / "manifest.sha256").write_text("".join(checksums))
         (stage / "manifest.sha256").chmod(0o644)
-        archive = out / f"tailscale_{version}_{platform}.tar.gz"
+        suffix = "_" + revision if revision else ""
+        archive = out / f"tailscale_{version}_{platform}{suffix}.tar.gz"
         archive_tree(stage, archive)
         result.append(archive)
     (out / "SHA256SUMS").write_text("".join(f"{sha256(path)}  {path.name}\n" for path in result))
@@ -85,8 +99,9 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT.parent / "dist")
     parser.add_argument("--public-key", type=Path, default=ROOT / "plugin/release.pub")
     parser.add_argument("--helper", type=Path, default=ROOT / "build/tsks-helper")
+    parser.add_argument("--revision", help="optional installation-package revision; plugin version is unchanged")
     args = parser.parse_args()
-    for path in build_packages(ROOT, args.output, args.public_key, args.helper):
+    for path in build_packages(ROOT, args.output, args.public_key, args.helper, args.revision):
         print(path)
 
 

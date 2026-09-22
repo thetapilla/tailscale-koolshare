@@ -4,6 +4,8 @@
 
 ## 安装包
 
+请下载 [3.0.0 安装兼容修订包 installfix1](https://github.com/thetapilla/tailscale-koolshare/releases/tag/v3.0.0-installfix1)。它修正了原始安装脚本注释触发软件中心保护扫描的兼容性问题，插件版本仍为3.0.0。原始发布文件保留供核对。
+
 提供一个通用包和 HND、QCA、IPQ32、IPQ64、MTK 五个平台包。通用包自动识别平台，只安装该设备需要的架构；闪存空间较紧时选择对应平台包。RT-AX86U Pro、RT-BE86U 使用 HND 包。
 
 从本仓库的插件 Release 下载 `tailscale_3.0.0_universal.tar.gz` 或对应平台包，在软件中心的离线安装页面上传。先保留当前版本和配置备份，安装时现有 Tailscale 连接会短暂中断。
