@@ -23,6 +23,8 @@ ts_init() {
     chmod 700 "$RUN" "${STATE%/*}" || return 1
     [ ! -d /tmp/.xt ] || export XTABLES_LIBDIR=/tmp/.xt
     TS_LOCKED=0
+    TS_IPTABLES_WAIT=
+    TS_IP6TABLES_WAIT=
 }
 
 ts_now() { date +%s; }
@@ -33,6 +35,31 @@ ts_quote() { "$HELPER" quote "$1"; }
 ts_get() { "$HELPER" json-get "$1" "$2" 2>/dev/null; }
 ts_bool() { [ "$1" = 1 ] && printf true || printf false; }
 ts_bound() { "$HELPER" timeout "$@"; }
+ts_temp() { "$HELPER" temp "$1"; }
+
+ts_ipt() {
+    local binary=$1 wait help
+    shift
+    case $binary in
+        iptables) wait=$TS_IPTABLES_WAIT;;
+        ip6tables) wait=$TS_IP6TABLES_WAIT;;
+        *) return 1;;
+    esac
+    if [ -z "$wait" ]; then
+        # Older firmware has no xtables wait option. Read advertised options;
+        # never probe compatibility by changing a rule.
+        wait=failed
+        if help=$(ts_bound 3 "$binary" --help 2>&1); then
+            wait=no
+            if printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:],])(-w|--wait)([[:space:],]|$)'; then wait=yes; fi
+        fi
+        case $binary in iptables) TS_IPTABLES_WAIT=$wait;; ip6tables) TS_IP6TABLES_WAIT=$wait;; esac
+    fi
+    [ "$wait" != failed ] || return 1
+    # Bound legacy commands and versions whose -w has no seconds argument.
+    [ "$wait" != yes ] || set -- -w "$@"
+    ts_bound 5 "$binary" "$@"
+}
 
 ts_lock() {
     [ "$TS_LOCKED" = 1 ] && return 0
@@ -69,7 +96,7 @@ ts_job_begin() {
     done
     local target="$WEB/tailscale3_$TS_JOB.log" tmp
     ts_public_file "$target" && ts_public_file "$WEB/tailscale3_$TS_JOB.json" || return 1
-    tmp=$(mktemp "$WEB/.tailscale3.XXXXXX") || return 1
+    tmp=$(ts_temp "$WEB/.tailscale3.XXXXXX") || return 1
     chmod 644 "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
     ts_job_write running accepted '已接收操作请求'
 }
@@ -81,7 +108,7 @@ ts_job_write() {
     case $1 in running|success|failed|rolled_back) ;; *) return 1;; esac
     local target="$WEB/tailscale3_$TS_JOB.json" tmp
     ts_public_file "$target" || return 1
-    tmp=$(mktemp "$WEB/.tailscale3.XXXXXX") || return 1
+    tmp=$(ts_temp "$WEB/.tailscale3.XXXXXX") || return 1
     printf '{"schema":1,"id":"%s","state":%s,"phase":%s,"message":%s,"updated_at":%s}\n' \
         "$TS_JOB" "$(ts_quote "$1")" "$(ts_quote "$2")" "$(ts_quote "$3")" "$(ts_now)" >"$tmp" || { rm -f "$tmp"; return 1; }
     chmod 644 "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
@@ -99,7 +126,7 @@ ts_job_log() {
         target="$WEB/tailscale3_$TS_JOB.log"
         ts_public_file "$target" || return 1
         local tmp
-        tmp=$(mktemp "$WEB/.tailscale3.XXXXXX") || return 1
+        tmp=$(ts_temp "$WEB/.tailscale3.XXXXXX") || return 1
         [ ! -f "$target" ] || tail -c 16384 "$target" >"$tmp"
         printf '%s\n' "$line" >>"$tmp"
         chmod 644 "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
@@ -176,7 +203,7 @@ ts_lan() {
         split(ip,a,".");split(mask,m,".");prefix=0;zero=0;net="";
         for(i=1;i<=4;i++){n=0;for(b=128;b>=1;b/=2){bit=int(m[i]/b)%2;
             if(bit){if(zero)exit 1;prefix++;if(int(a[i]/b)%2)n+=b}else zero=1}
-            net=net (i==1?"":".") n}
+            net=sprintf("%s%s%d",net,(i==1?"":"."),n)}
         if(prefix<1 || prefix>32)exit 1;print net "/" prefix
     }') && [ -n "$LAN_CIDR" ]
 }
@@ -241,7 +268,7 @@ ts_legacy_cleanup() {
     local binary=$1 table line token bad
     which "${binary}-save" >/dev/null 2>&1 || return 0
     for table in filter nat; do
-        "${binary}-save" -t "$table" 2>/dev/null | awk '
+        ts_bound 5 "${binary}-save" -t "$table" 2>/dev/null | awk '
             /^-A / && /--comment ("tailscale_rule"|tailscale_rule)( |$)/ && /-j (ACCEPT|DROP|MASQUERADE|DNAT)( |$)/ {
                 gsub(/"tailscale_rule"/,"tailscale_rule");sub(/^-A /,"-D ");print
             }' >"$RUN/legacy-rules"
@@ -254,7 +281,7 @@ ts_legacy_cleanup() {
             set -f
             set -- $line
             set +f
-            "$binary" -w 2 -t "$table" "$@" >/dev/null 2>&1 || :
+            ts_ipt "$binary" -t "$table" "$@" >/dev/null 2>&1 || :
         done <"$RUN/legacy-rules"
     done
     rm -f "$RUN/legacy-rules"
@@ -262,15 +289,15 @@ ts_legacy_cleanup() {
 
 ts_chain() {
     local binary=$1 table=$2 parent=$3 chain=$4
-    "$binary" -w 2 -t "$table" -N "$chain" 2>/dev/null || :
-    "$binary" -w 2 -t "$table" -F "$chain" || return 1
+    ts_ipt "$binary" -t "$table" -N "$chain" 2>/dev/null || :
+    ts_ipt "$binary" -t "$table" -F "$chain" || return 1
     if [ "$table:$parent" = nat:POSTROUTING ]; then
         # Fullcone and other established NAT hooks get first opportunity;
         # plugin MASQUERADE is the final fallback for LAN-to-tailnet traffic.
-        while "$binary" -w 2 -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
-        "$binary" -w 2 -t "$table" -A "$parent" -j "$chain"
-    elif ! "$binary" -w 2 -t "$table" -C "$parent" -j "$chain" 2>/dev/null; then
-        "$binary" -w 2 -t "$table" -I "$parent" 1 -j "$chain"
+        while ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+        ts_ipt "$binary" -t "$table" -A "$parent" -j "$chain"
+    elif ! ts_ipt "$binary" -t "$table" -C "$parent" -j "$chain" 2>/dev/null; then
+        ts_ipt "$binary" -t "$table" -I "$parent" 1 -j "$chain"
     fi
 }
 
@@ -296,12 +323,12 @@ ts_firewall_apply() {
         allowed=$IPV4
         [ "$binary" != ip6tables ] || allowed=$IPV6
         if [ "$allowed" = 0 ]; then
-            "$binary" -w 2 -A TSKS_INPUT -p udp --dport 41641 -j DROP &&
-            "$binary" -w 2 -A TSKS_OUTPUT -p udp --sport 41641 -j DROP || return 1
+            ts_ipt "$binary" -A TSKS_INPUT -p udp --dport 41641 -j DROP &&
+            ts_ipt "$binary" -A TSKS_OUTPUT -p udp --sport 41641 -j DROP || return 1
         fi
         if ts_lan; then
-            "$binary" -w 2 -A TSKS_FORWARD -i tailscale0 -o "$LAN_IF" -j ACCEPT &&
-            "$binary" -w 2 -A TSKS_FORWARD -i "$LAN_IF" -o tailscale0 -j ACCEPT || return 1
+            ts_ipt "$binary" -A TSKS_FORWARD -i tailscale0 -o "$LAN_IF" -j ACCEPT &&
+            ts_ipt "$binary" -A TSKS_FORWARD -i "$LAN_IF" -o tailscale0 -j ACCEPT || return 1
         fi
     done
     # Tailscale's netfilter remains enabled. This additional NAT is specifically
@@ -309,7 +336,7 @@ ts_firewall_apply() {
     if ts_lan; then
         ts_chain iptables nat POSTROUTING TSKS_POSTROUTING &&
         ts_chain iptables nat PREROUTING TSKS_PREROUTING || return 1
-        iptables -w 2 -t nat -A TSKS_POSTROUTING -s "$LAN_CIDR" -o tailscale0 -j MASQUERADE || return 1
+        ts_ipt iptables -t nat -A TSKS_POSTROUTING -s "$LAN_CIDR" -o tailscale0 -j MASQUERADE || return 1
         if [ -n "$status_source" ]; then
             cp "$status_source" "$RUN/firewall-next.json" || return 1
         else
@@ -320,7 +347,7 @@ ts_firewall_apply() {
             while [ "$index" -lt 8 ]; do
                 tailip=$(ts_get "$RUN/firewall-next.json" "ips.$index") || break
                 if ts_ipv4 "$tailip"; then
-                    iptables -w 2 -t nat -A TSKS_PREROUTING -i tailscale0 -d "$tailip/32" -j DNAT --to-destination "$LAN_IP" || return 1
+                    ts_ipt iptables -t nat -A TSKS_PREROUTING -i tailscale0 -d "$tailip/32" -j DNAT --to-destination "$LAN_IP" || return 1
                     break
                 fi
                 index=$((index + 1))
@@ -337,9 +364,9 @@ ts_firewall_remove() {
         ts_legacy_cleanup "$binary"
         for item in filter:INPUT:TSKS_INPUT filter:OUTPUT:TSKS_OUTPUT filter:FORWARD:TSKS_FORWARD nat:POSTROUTING:TSKS_POSTROUTING nat:PREROUTING:TSKS_PREROUTING; do
             table=${item%%:*}; item=${item#*:}; parent=${item%%:*}; chain=${item#*:}
-            while "$binary" -w 2 -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
-            "$binary" -w 2 -t "$table" -F "$chain" 2>/dev/null || :
-            "$binary" -w 2 -t "$table" -X "$chain" 2>/dev/null || :
+            while ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+            ts_ipt "$binary" -t "$table" -F "$chain" 2>/dev/null || :
+            ts_ipt "$binary" -t "$table" -X "$chain" 2>/dev/null || :
         done
     done
 }
@@ -362,7 +389,7 @@ ts_start() {
         # The helper redacts credentials while consuming output and rotates a
         # bounded RAM log. Both children close the inherited lifecycle lock.
         rm -f "$RUN/daemon.pipe"
-        mkfifo -m 600 "$RUN/daemon.pipe" || return 1
+        "$HELPER" fifo "$RUN/daemon.pipe" || return 1
         "$HELPER" log "$RUN/daemon.log" 65536 9>&- <"$RUN/daemon.pipe" >/dev/null 2>&1 &
         printf '%s\n' "$!" >"$RUN/logger.pid"
         "$DATA/current/tailscaled" --state="$STATE" --socket="$SOCKET" --port=41641 \

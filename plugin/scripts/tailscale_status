@@ -10,7 +10,7 @@ trap 'ts_job_write failed interrupted "连接详情读取已中断，请稍后�
 ts_job_begin "${ID:-$(date +%s)}" || exit 1
 ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
 ts_job_write running status '正在读取连接详情'
-result_file=$(mktemp "$RUN/status-result.XXXXXX") || {
+result_file=$(ts_temp "$RUN/status-result.XXXXXX") || {
     ts_job_write failed status '无法准备连接详情，请检查可用存储后重试'
     exit 1
 }

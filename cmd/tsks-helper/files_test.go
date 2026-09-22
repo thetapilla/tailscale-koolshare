@@ -48,3 +48,54 @@ func TestLogRedactionAndBounds(t *testing.T) {
 		t.Fatal("reader did not recover after oversized line")
 	}
 }
+
+func TestFirmwareFilePrimitives(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	seen := map[string]bool{}
+	for i := 0; i < 32; i++ {
+		name, e := temporaryFile(filepath.Join(dir, ".status.XXXXXX"))
+		if e != nil || seen[name] || filepath.Dir(name) != dir {
+			t.Fatal(name, e)
+		}
+		seen[name] = true
+		st, e := os.Lstat(name)
+		if e != nil || !st.Mode().IsRegular() || st.Mode().Perm() != 0600 || st.Size() != 0 {
+			t.Fatal(st, e)
+		}
+	}
+	for _, template := range []string{filepath.Join(dir, "plain"), filepath.Join(dir, "missing", "xXXXXXX")} {
+		if _, e := temporaryFile(template); e == nil {
+			t.Fatal("invalid template accepted", template)
+		}
+	}
+	fifo := filepath.Join(dir, "daemon.pipe")
+	if e := run([]string{"fifo", fifo}); e != nil {
+		t.Fatal(e)
+	}
+	st, e := os.Lstat(fifo)
+	if e != nil || st.Mode()&os.ModeNamedPipe == 0 || st.Mode().Perm() != 0600 {
+		t.Fatal(st, e)
+	}
+	if e := run([]string{"fifo", fifo}); e == nil {
+		t.Fatal("existing FIFO replaced")
+	}
+	file := filepath.Join(dir, "keep")
+	os.WriteFile(file, []byte("preserved"), 0600)
+	link := filepath.Join(dir, "link")
+	os.Symlink(file, link)
+	for _, path := range []string{file, link} {
+		if e := run([]string{"fifo", path}); e == nil {
+			t.Fatal("existing path replaced", path)
+		}
+	}
+	b, _ := os.ReadFile(file)
+	if string(b) != "preserved" {
+		t.Fatal("existing data modified")
+	}
+	for _, args := range [][]string{{"fifo"}, {"temp"}, {"temp", "invalid"}} {
+		if e := run(args); e == nil {
+			t.Fatal("invalid command accepted", args)
+		}
+	}
+}

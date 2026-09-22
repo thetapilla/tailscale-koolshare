@@ -9,6 +9,22 @@ import (
 	"strings"
 )
 
+func temporaryFile(template string) (string, error) {
+	if !strings.HasSuffix(template, "XXXXXX") {
+		return "", errors.New("temporary file template must end with XXXXXX")
+	}
+	pattern := strings.TrimSuffix(filepath.Base(template), "XXXXXX") + "*"
+	f, e := os.CreateTemp(filepath.Dir(template), pattern)
+	if e != nil {
+		return "", e
+	}
+	if e = f.Close(); e != nil {
+		os.Remove(f.Name())
+		return "", e
+	}
+	return f.Name(), nil
+}
+
 func atomicLink(target, path string) error {
 	if filepath.IsAbs(target) || strings.Contains(target, "..") || !strings.HasPrefix(target, "cores/") {
 		return errors.New("invalid core link target")

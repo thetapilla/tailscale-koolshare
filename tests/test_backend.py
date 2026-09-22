@@ -15,6 +15,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get("TSKS_TEST_SHELL", "/bin/sh")
+FIRMWARE_TOOLS = ("awk", "cat", "chmod", "cp", "date", "df", "grep", "ln", "ls", "mkdir",
+                  "mv", "readlink", "rm", "sha256sum", "sleep", "tail", "tr", "uname", "wc", "which")
 
 MOCK = r'''#!/usr/bin/env python3
 import fcntl,json,os,shlex,sys
@@ -51,6 +53,13 @@ elif name=='curl':
         sys.exit(code)
 elif name=='tsks-helper':
     if args[0]=='quote':print(json.dumps(args[1],ensure_ascii=False))
+    elif args[0]=='fifo':os.mkfifo(args[1],0o600)
+    elif args[0]=='temp':
+        import tempfile
+        path=Path(args[1])
+        if not path.name.endswith('XXXXXX'):sys.exit(1)
+        fd,name=tempfile.mkstemp(prefix=path.name[:-6],dir=path.parent)
+        os.close(fd);print(name)
     elif args[0]=='json-get':
         try:
             val=json.loads(Path(args[1]).read_text())
@@ -83,7 +92,20 @@ elif name in ('tailscale','tailscaled'):
 elif name=='cru':pass
 elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
     table='filter'
-    if '-w' in args:i=args.index('-w');del args[i:i+2]
+    mode=read('iptables-wait.json','legacy')
+    if args==['--help']:
+        if mode=='help-failed':sys.exit(1)
+        print('iptables: -C, --check chain rule')
+        if mode=='wait':print('  -w, --wait  Wait for the xtables lock')
+        elif mode=='seconds':print('  --wait -w [seconds]  Wait for the xtables lock')
+        sys.exit(0)
+    if any(arg.startswith('-w') or arg.startswith('--wait') for arg in args):
+        if mode=='legacy':sys.exit(2)
+        if args[0]!='-w':sys.exit(2)
+        del args[0]
+        if args and args[0].isdigit():
+            if mode!='seconds':sys.exit(2)
+            del args[0]
     if '-t' in args:i=args.index('-t');table=args[i+1];del args[i:i+2]
     db=read('firewall.json',{})
     family=name.split('-')[0]; key=family+':'+table
@@ -123,6 +145,14 @@ class BackendTests(unittest.TestCase):
         self.web = self.base / "web"
         self.mock = self.base / "mock"
         self.mock.mkdir()
+        self.utilities = self.base / "utilities"
+        self.utilities.mkdir()
+        busybox = os.environ.get("TSKS_TEST_BUSYBOX")
+        for name in FIRMWARE_TOOLS:
+            target = busybox or shutil.which(name)
+            if not target:
+                raise RuntimeError("Test host lacks fixture utility: " + name)
+            (self.utilities / name).symlink_to(target)
         (self.ks / "bin").mkdir(parents=True)
         (self.ks / "tailscale/current").mkdir(parents=True)
         shutil.copytree(ROOT / "plugin/scripts", self.ks / "scripts")
@@ -137,7 +167,7 @@ class BackendTests(unittest.TestCase):
         self.env = dict(os.environ, TSKS_ROOT=str(self.ks), TSKS_RUN=str(self.run),
                         TSKS_WEB=str(self.web), TSKS_SYSFS=str(self.base / "sys"),
                         TSKS_PROC=str(self.base / "proc"), MOCK_ROOT=str(self.mock),
-                        PATH=str(self.mock) + os.pathsep + os.environ["PATH"])
+                        PATH=os.pathsep.join((str(self.mock), str(self.utilities))))
         self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "1"})
         self.write("nvram.json", {"lan_ifname": "br0", "lan_ipaddr": "192.168.50.1",
                                   "lan_netmask": "255.255.255.0", "wan_primary": "0",
@@ -215,6 +245,38 @@ class BackendTests(unittest.TestCase):
             values["lan_netmask"] = mask
             self.write("nvram.json", values)
             self.assertNotEqual(self.shell("ts_lan", check=False).returncode, 0)
+
+    def test_firmware_fixture_excludes_missing_applet_dependencies(self):
+        for name in ("od", "mkfifo", "mktemp", "timeout"):
+            self.assertNotEqual(self.shell("which " + name, check=False).returncode, 0)
+
+    def test_firewall_legacy_commands_are_bounded_without_wait_option(self):
+        self.shell("ts_firewall_apply; ts_firewall_apply")
+        for family in ("iptables", "ip6tables"):
+            calls = self.calls(family)
+            self.assertEqual(calls.count(["--help"]), 1)
+            self.assertFalse(any("-w" in args for args in calls))
+        firewall_calls = [args for args in self.calls("tsks-helper") if args[0] == "timeout" and args[2].startswith(("iptables", "ip6tables"))]
+        self.assertTrue(firewall_calls)
+        for args in firewall_calls:
+            self.assertEqual(args[1], "3" if args[-1] == "--help" else "5")
+
+    def test_firewall_wait_option_is_advertised_and_bounded(self):
+        for mode in ("wait", "seconds"):
+            with self.subTest(mode=mode):
+                self.write("iptables-wait.json", mode)
+                (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                self.shell("ts_firewall_apply")
+                for family in ("iptables", "ip6tables"):
+                    calls = [args for args in self.calls(family) if args != ["--help"]]
+                    self.assertTrue(calls)
+                    self.assertTrue(all(args[0] == "-w" and args[1] != "2" for args in calls))
+
+    def test_firewall_failed_help_probe_does_not_guess_options_or_mutate(self):
+        self.write("iptables-wait.json", "help-failed")
+        self.assertNotEqual(self.shell("ts_chain iptables filter INPUT TSKS_INPUT", check=False).returncode, 0)
+        self.assertEqual(self.calls("iptables"), [["--help"]])
+        self.assertFalse((self.mock / "firewall.json").exists())
 
     def test_firewall_idempotence_scoping_and_fullcone_preservation(self):
         foreign = ["-m", "comment", "--comment", "tailscale_rule", "-j", "FULLCONENAT"]
@@ -328,6 +390,8 @@ class BackendTests(unittest.TestCase):
             self.shell("ts_pid_alive; ts_lock; ts_unlock")
             self.assertIn("mock daemon started", (self.run / "daemon.log").read_text())
             self.assertTrue((self.run / "logger.pid").exists())
+            self.assertEqual((self.run / "daemon.pipe").stat().st_mode & 0o777, 0o600)
+            self.assertIn(["fifo", str(self.run / "daemon.pipe")], self.calls("tsks-helper"))
             pid = (self.run / "tailscaled.pid").read_text()
             (self.run / "tailscaled.pid").unlink()
             self.shell("ts_lock; ts_start; ts_unlock")
@@ -471,6 +535,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual((job["state"], job["id"]), ("success", "000124"))
         self.assertIn("test-device", (self.web / "tailscale3_000124.log").read_text())
         helper_calls = self.calls("tsks-helper")
+        self.assertIn(["temp", str(self.run / "status-result.XXXXXX")], helper_calls)
         self.assertIn(["timeout", "15", str(self.ks / "tailscale/current/tailscale"),
                        "--socket=" + str(self.run / "tailscaled.sock"), "status"], helper_calls)
         self.assertIn(["log", str(self.web / "tailscale3_000124.log"), "65536"], helper_calls)

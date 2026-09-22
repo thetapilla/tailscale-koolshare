@@ -33,6 +33,26 @@ func run(a []string) error {
 		return errors.New("command required")
 	}
 	switch a[0] {
+	case "fifo":
+		if len(a) != 2 {
+			return errors.New("fifo PATH")
+		}
+		return syscall.Mkfifo(a[1], 0600)
+	case "temp":
+		if len(a) != 2 {
+			return errors.New("temp TEMPLATE")
+		}
+		path, e := temporaryFile(a[1])
+		if e != nil {
+			return e
+		}
+		fmt.Println(path)
+		return nil
+	case "elf":
+		if len(a) != 3 {
+			return errors.New("elf BINARY ARCH")
+		}
+		return checkELF(a[1], a[2])
 	case "atomic-link":
 		if len(a) != 3 {
 			return errors.New("atomic-link TARGET LINK")

@@ -89,25 +89,26 @@ space_preflight() {
 }
 
 elf_ok() {
-    # ELF magic, class, little-endian and e_machine. Never execute wrong-arch data.
-    local file=$1 arch=$2 signature machine
-    signature=$(od -An -tu1 -N6 "$file" | tr -s ' ' | sed 's/^ //;s/ $//')
-    machine=$(od -An -tu1 -j18 -N2 "$file" | tr -s ' ' | sed 's/^ //;s/ $//')
-    case $arch in arm) [ "$signature" = '127 69 76 70 1 1' ] && [ "$machine" = '40 0' ];;
-        arm64) [ "$signature" = '127 69 76 70 2 1' ] && [ "$machine" = '183 0' ];; *) return 1;; esac
+    "$VERIFIED_HELPER" elf "$1" "$2"
 }
+
+core_invalid() { CORE_ERROR=$1; return 1; }
 
 validate_core() {
     local binary=$1 descriptor=$2 expected size version actual
-    [ -f "$binary" ] && [ ! -L "$binary" ] && elf_ok "$binary" "$ARCH" || return 1
-    [ "$("$VERIFIED_HELPER" json-get "$descriptor" arch)" = "$ARCH" ] || return 1
-    expected=$("$VERIFIED_HELPER" json-get "$descriptor" binary_sha256) || return 1
-    size=$("$VERIFIED_HELPER" json-get "$descriptor" unpacked_size) || return 1
-    version=$("$VERIFIED_HELPER" json-get "$descriptor" version) || return 1
-    [ "$(sha256sum "$binary" | awk '{print $1}')" = "$expected" ] && [ "$(wc -c <"$binary" | tr -d ' ')" = "$size" ] || return 1
-    [ "$size" -le 12582912 ] && [ "$size" -gt 64 ] || return 1
-    actual=$("$VERIFIED_HELPER" version "$binary") || return 1
-    [ "$actual" = "$version" ]
+    CORE_ERROR=
+    [ -f "$binary" ] && [ ! -L "$binary" ] || { core_invalid '核心文件缺失或类型无效'; return 1; }
+    elf_ok "$binary" "$ARCH" || { core_invalid '核心 ELF 格式或架构不匹配'; return 1; }
+    [ "$("$VERIFIED_HELPER" json-get "$descriptor" arch)" = "$ARCH" ] || { core_invalid '核心描述中的架构不匹配'; return 1; }
+    expected=$("$VERIFIED_HELPER" json-get "$descriptor" binary_sha256) &&
+        size=$("$VERIFIED_HELPER" json-get "$descriptor" unpacked_size) &&
+        version=$("$VERIFIED_HELPER" json-get "$descriptor" version) || { core_invalid '核心描述缺少必要字段'; return 1; }
+    case $size in ''|*[!0-9]*) core_invalid '核心大小无效'; return 1;; esac
+    [ "$size" -le 12582912 ] && [ "$size" -gt 64 ] || { core_invalid '核心大小超出支持范围'; return 1; }
+    [ "$(sha256sum "$binary" | awk '{print $1}')" = "$expected" ] || { core_invalid '核心 SHA-256 校验失败'; return 1; }
+    [ "$(wc -c <"$binary" | tr -d ' ')" = "$size" ] || { core_invalid '核心文件大小与描述不一致'; return 1; }
+    actual=$("$VERIFIED_HELPER" version "$binary") || { core_invalid '核心无法执行或读取版本超时'; return 1; }
+    [ "$actual" = "$version" ] || { core_invalid '核心实际版本与描述不一致'; return 1; }
 }
 
 core_link_ok() {
@@ -119,12 +120,13 @@ core_link_ok() {
 prepare_core() {
     [ ! -L "$DATA" ] && [ ! -L "$DATA/cores" ] || fail '核心目录不能使用外部符号链接'
     "$VERIFIED_HELPER" verify "$PKG/release.json" "$PKG/release.pub" "$ARCH" >"$STAGE/verified.json" || fail '核心签名校验失败'
-    validate_core "$PAYLOAD/tailscale.combined" "$STAGE/verified.json" || fail '核心文件与签名不一致'
+    validate_core "$PAYLOAD/tailscale.combined" "$STAGE/verified.json" || fail "$CORE_ERROR"
     CORE_VERSION=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" version) || fail '无效核心版本'
     CORE_BUILD=$("$VERIFIED_HELPER" json-get "$STAGE/verified.json" build) || fail '无效核心构建版本'
     if [ -L "$DATA/current" ]; then
         OLD_CORE=$(readlink "$DATA/current")
-        core_link_ok "$OLD_CORE" && validate_core "$DATA/$OLD_CORE/tailscale.combined" "$DATA/$OLD_CORE/descriptor.json" || fail '已安装核心校验失败，保留现状'
+        core_link_ok "$OLD_CORE" || fail '已安装核心目录结构无效'
+        validate_core "$DATA/$OLD_CORE/tailscale.combined" "$DATA/$OLD_CORE/descriptor.json" || fail "已安装核心校验失败：$CORE_ERROR"
         [ "$(readlink "$DATA/$OLD_CORE/tailscale")" = tailscale.combined ] && [ "$(readlink "$DATA/$OLD_CORE/tailscaled")" = tailscale.combined ] || fail '已安装核心链接无效'
         OLD_KIND=current
         SELECTED=$OLD_CORE
@@ -152,7 +154,8 @@ prepare_core() {
         ln -s tailscale.combined "$STAGE/core/tailscale" && ln -s tailscale.combined "$STAGE/core/tailscaled" || fail '无法创建核心链接'
         chmod 755 "$STAGE/core/tailscale.combined"
         if [ -e "$DATA/$SELECTED" ]; then
-            [ ! -L "$DATA/$SELECTED" ] && validate_core "$DATA/$SELECTED/tailscale.combined" "$STAGE/core/descriptor.json" || fail '现有核心版本目录冲突'
+            [ ! -L "$DATA/$SELECTED" ] || fail '现有核心版本目录不能使用符号链接'
+            validate_core "$DATA/$SELECTED/tailscale.combined" "$STAGE/core/descriptor.json" || fail "现有核心版本目录冲突：$CORE_ERROR"
         fi
     fi
 }

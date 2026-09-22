@@ -11,10 +11,13 @@
 | `python3 -m unittest discover -s tests -p 'test_*.py' -v` | 后台生命周期、配置和防火墙；安装迁移；更新事务；打包与发布逻辑 |
 | `node tests/test_ui.js` | 异步请求、超时、任务关联、轮询、按钮状态和文本渲染 |
 | `python3 tools/test_helper.py` | Linux 上的签名与哈希、归档路径和文件类型、架构、LocalAPI、超时、原子链接及日志脱敏 |
-| `python3 tools/test_busybox.py` | 固定版本 BusyBox ash 的脚本语法与后台、安装、核心更新回归测试 |
+| `python3 tools/test_busybox.py` | BusyBox 1.25.1 ash 的脚本语法与后台、安装、核心更新回归测试；安装测试使用受限 applet 命令目录 |
 | `python3 tools/smoke_core.py` | 两种目标架构的真实压缩程序、daemon、辅助程序及 LocalAPI 冒烟测试 |
+| `python3 tools/smoke_install.py --lifecycle` | 六份正式安装包的安装、重装、迁移及平台一致性；真实 ARM 核心、辅助程序、签名、userspace 服务启动与页面任务写入 |
 
-脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。
+脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。回归测试仅允许显式列出的命令，禁用 `command` 内置命令，且不提供 `od`、`mkfifo`、`mktemp` 和外部 `timeout`。核心架构检查、日志管道、临时文件及命令超时由随包辅助程序处理；防火墙测试覆盖旧版无等待参数和新版支持等待参数的分支。
+
+安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。
 
 真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon 和未登录状态，不需要加入 Tailnet。
 

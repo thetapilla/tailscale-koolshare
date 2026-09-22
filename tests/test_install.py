@@ -2,6 +2,8 @@
 
 The helper is a fixture here to isolate installation/rollback behavior. Actual
 signature, archive and timeout security is tested by cmd/tsks-helper Go tests.
+The installer gets an explicit command inventory, never the host's full PATH.
+The BusyBox runner supplies the same-version applets for that inventory.
 """
 import fcntl
 import hashlib
@@ -18,6 +20,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get('TSKS_TEST_SHELL', '/bin/sh')
+FIRMWARE_TOOLS = ('awk', 'cat', 'chmod', 'cp', 'dirname', 'find', 'grep', 'ln',
+                  'mkdir', 'readlink', 'rm', 'rmdir', 'sed', 'sha256sum', 'sleep',
+                  'sync', 'tr', 'wc', 'which')
 MOCK = r'''#!/usr/bin/env python3
 import fcntl,hashlib,json,os,sys
 from pathlib import Path
@@ -45,7 +50,12 @@ elif name=='flock':
     try:fcntl.flock(int(args[-1]),fcntl.LOCK_UN if '-u' in args else fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:sys.exit(1)
 elif name=='tsks-helper':
-    if args[0]=='verify':
+    if args[0]=='elf':
+        data=Path(args[1]).read_bytes()
+        expected={'arm':(1,40),'arm64':(2,183)}.get(args[2])
+        if not expected or len(data)<20:sys.exit(1)
+        if data[:6]!=b'\x7fELF'+bytes((expected[0],1)) or int.from_bytes(data[18:20],'little')!=expected[1]:sys.exit(1)
+    elif args[0]=='verify':
         data=json.loads(Path(args[1]).read_text())
         if not data.get('valid'):sys.exit(1)
         print(json.dumps(data[args[3]]))
@@ -110,13 +120,20 @@ class InstallTests(unittest.TestCase):
         self.pkg = self.base / 'package/tailscale'
         self.ks = self.base / 'koolshare'
         self.mock = self.base / 'mock'
+        self.utilities = self.base / 'utilities'
         self.run = self.base / 'run'
-        self.ks.mkdir(); self.mock.mkdir(); self.run.mkdir()
+        self.ks.mkdir(); self.mock.mkdir(); self.utilities.mkdir(); self.run.mkdir()
+        busybox = os.environ.get('TSKS_TEST_BUSYBOX')
+        for name in FIRMWARE_TOOLS:
+            target = busybox or shutil.which(name)
+            if not target:
+                raise RuntimeError('Test host lacks fixture utility: ' + name)
+            (self.utilities / name).symlink_to(target)
         shutil.copytree(ROOT / 'plugin', self.pkg)
         (self.pkg / 'version').write_text('3.0.0\n')
         (self.pkg / '.valid').write_text('hnd\nqca\nipq32\nipq64\nmtk\n')
         (self.pkg / 'scripts/tailscale_lib.sh').write_text(LIBRARY)
-        command = self.mock / 'command'
+        command = self.mock / 'mock-command'
         command.write_text(MOCK.replace('#!/usr/bin/env python3', '#!' + sys.executable))
         command.chmod(0o755)
         for name in ('dbus', 'nvram', 'uname', 'flock', 'df', 'mv'):
@@ -139,7 +156,7 @@ class InstallTests(unittest.TestCase):
         self.write('config.json', {})
         self.write('nvram.json', {'productid': 'RT-AX88U'})
         self.env = dict(os.environ, TSKS_ROOT=str(self.ks), TSKS_RUN=str(self.run), TSKS_WEB=str(self.base / 'web'),
-                        TSKS_PROC=str(self.base / 'proc'), MOCK_ROOT=str(self.mock), PATH=str(self.mock) + os.pathsep + os.environ['PATH'])
+                        TSKS_PROC=str(self.base / 'proc'), MOCK_ROOT=str(self.mock), PATH=os.pathsep.join((str(self.mock), str(self.utilities))))
         (self.base / 'proc').mkdir()
         (self.base / 'proc/meminfo').write_text('MemAvailable: 131072 kB\n')
         self.checksums()
@@ -226,6 +243,23 @@ class InstallTests(unittest.TestCase):
         self.assertIn('start version=\n', (self.mock / 'lifecycle').read_text())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
 
+    def test_universal_and_hnd_install_without_optional_firmware_commands(self):
+        for name in ('od', 'timeout', 'command'):
+            self.assertIsNone(shutil.which(name, path=self.env['PATH']))
+        for package in ('universal', 'hnd'):
+            with self.subTest(package=package):
+                if package == 'hnd':
+                    shutil.rmtree(self.ks)
+                    self.ks.mkdir()
+                    self.write('config.json', {})
+                    (self.pkg / '.valid').write_text('hnd\n')
+                    shutil.rmtree(self.pkg / 'payload/arm64')
+                    self.checksums()
+                result = self.install()
+                self.assertNotIn('not found', result.stderr)
+                self.assertIn(['elf', str(self.pkg / 'payload/arm/tailscale.combined'), 'arm'], self.calls('tsks-helper'))
+                self.assertEqual(self.read('config.json')['tailscale_version'], '3.0.0')
+
     def test_odmpid_platform_mapping_selects_arm64_and_matching_valid(self):
         self.write('nvram.json', {'productid': 'RT-AX88U', 'odmpid': 'TX-AX6000'})
         (self.pkg / '.valid').write_text('mtk\n'); self.checksums(); self.install()
@@ -253,17 +287,38 @@ class InstallTests(unittest.TestCase):
 
     def test_signed_core_hash_and_arch_are_validated_before_stop(self):
         core = self.pkg / 'payload/arm/tailscale.combined'
-        core.write_bytes(binary('arm', b'tampered')); self.checksums(); self.install(False)
+        core.write_bytes(binary('arm', b'tampered')); self.checksums()
+        result = self.install(False)
+        self.assertIn('核心 SHA-256 校验失败', result.stderr)
+        self.assertNotIn('签名', result.stderr)
         self.assertFalse((self.mock / 'lifecycle').exists())
         data = json.loads((self.pkg / 'release.json').read_text())
         data['arm'] = descriptor(binary('arm64'), 'arm')
-        core.write_bytes(binary('arm64')); (self.pkg / 'release.json').write_text(json.dumps(data)); self.checksums(); self.install(False)
+        core.write_bytes(binary('arm64')); (self.pkg / 'release.json').write_text(json.dumps(data)); self.checksums()
+        result = self.install(False)
+        self.assertIn('核心 ELF 格式或架构不匹配', result.stderr)
+        self.assertNotIn('签名', result.stderr)
+        self.assertFalse((self.mock / 'lifecycle').exists())
+
+    def test_unexecutable_and_unexpected_core_versions_have_distinct_errors(self):
+        self.write('versions.json', {})
+        result = self.install(False)
+        self.assertIn('核心无法执行或读取版本超时', result.stderr)
+        self.assertNotIn('签名', result.stderr)
+        self.assertFalse((self.mock / 'lifecycle').exists())
+        digest = hashlib.sha256(binary('arm')).hexdigest()
+        self.write('versions.json', {digest: '1.100.0'})
+        result = self.install(False)
+        self.assertIn('核心实际版本与描述不一致', result.stderr)
+        self.assertNotIn('签名', result.stderr)
         self.assertFalse((self.mock / 'lifecycle').exists())
 
     def test_bad_signature_fails_without_mutating_existing_install(self):
         old = self.legacy()
         signed = json.loads((self.pkg / 'release.json').read_text()); signed['valid'] = False
-        (self.pkg / 'release.json').write_text(json.dumps(signed)); self.checksums(); self.install(False)
+        (self.pkg / 'release.json').write_text(json.dumps(signed)); self.checksums()
+        result = self.install(False)
+        self.assertIn('核心签名校验失败', result.stderr)
         self.assertEqual((self.ks / 'bin/tailscale.combined').read_bytes(), old)
         self.assertEqual(self.read('config.json')['tailscale_version'], '2.0.0')
         self.assertFalse((self.mock / 'lifecycle').exists())

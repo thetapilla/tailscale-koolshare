@@ -174,3 +174,54 @@ func TestCIDR(t *testing.T) {
 		t.Fatal("noncontiguous mask accepted")
 	}
 }
+
+func TestELFCommand(t *testing.T) {
+	// The check must work with no firmware tools available in PATH.
+	t.Setenv("PATH", t.TempDir())
+	for _, arch := range []string{"arm", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			head := make([]byte, 64)
+			copy(head, "\x7fELF")
+			head[4], head[5], head[18] = 1, 1, 40
+			other := "arm64"
+			if arch == "arm64" {
+				head[4], head[18], other = 2, 183, "arm"
+			}
+			file := filepath.Join(t.TempDir(), "core")
+			if e := os.WriteFile(file, head, 0600); e != nil {
+				t.Fatal(e)
+			}
+			if e := run([]string{"elf", file, arch}); e != nil {
+				t.Fatal(e)
+			}
+			for _, invalid := range []string{other, "amd64", ""} {
+				if e := run([]string{"elf", file, invalid}); e == nil {
+					t.Fatalf("accepted architecture %q", invalid)
+				}
+			}
+			for _, offset := range []int{0, 4, 5, 18, 19} {
+				broken := append([]byte(nil), head...)
+				broken[offset] ^= 0xff
+				os.WriteFile(file, broken, 0600)
+				if e := checkELF(file, arch); e == nil {
+					t.Fatalf("accepted corrupt header at offset %d", offset)
+				}
+			}
+			os.WriteFile(file, head[:19], 0600)
+			if e := checkELF(file, arch); e == nil {
+				t.Fatal("accepted truncated header")
+			}
+			os.WriteFile(file, head, 0600)
+			link := file + ".link"
+			os.Symlink(file, link)
+			for _, path := range []string{link, file + ".missing", filepath.Dir(file)} {
+				if e := checkELF(path, arch); e == nil {
+					t.Fatalf("accepted non-regular file %s", path)
+				}
+			}
+		})
+	}
+	if e := run([]string{"elf"}); e == nil {
+		t.Fatal("accepted missing arguments")
+	}
+}

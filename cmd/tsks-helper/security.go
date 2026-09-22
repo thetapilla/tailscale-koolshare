@@ -359,24 +359,8 @@ func extract(src, meta, dest string) error {
 	if _, e = tr.Next(); e != io.EOF {
 		return errors.New("extra archive member")
 	}
-	core, e := os.Open(filepath.Join(dest, "tailscale.combined"))
-	if e != nil {
+	if e = checkELF(filepath.Join(dest, "tailscale.combined"), d.Arch); e != nil {
 		return e
-	}
-	head := make([]byte, 20)
-	_, e = io.ReadFull(core, head)
-	core.Close()
-	if e != nil {
-		return e
-	}
-	wantClass := byte(1)
-	wantMachine := uint16(40)
-	if d.Arch == "arm64" {
-		wantClass = 2
-		wantMachine = 183
-	}
-	if string(head[:4]) != "\x7fELF" || head[4] != wantClass || head[5] != 1 || binary.LittleEndian.Uint16(head[18:20]) != wantMachine {
-		return errors.New("ELF architecture mismatch")
 	}
 	if e = os.Chmod(filepath.Join(dest, "tailscale.combined"), 0755); e != nil {
 		return e
@@ -390,5 +374,40 @@ func extract(src, meta, dest string) error {
 		return e
 	}
 	ok = true
+	return nil
+}
+
+// checkELF validates a core without executing it or invoking firmware utilities.
+// The installer and the update archive reader use the same architecture checks.
+func checkELF(path, arch string) error {
+	var wantClass byte
+	var wantMachine uint16
+	switch arch {
+	case "arm":
+		wantClass, wantMachine = 1, 40
+	case "arm64":
+		wantClass, wantMachine = 2, 183
+	default:
+		return errors.New("unsupported ELF architecture")
+	}
+	st, e := os.Lstat(path)
+	if e != nil {
+		return e
+	}
+	if !st.Mode().IsRegular() {
+		return errors.New("ELF must be a regular file")
+	}
+	f, e := os.Open(path)
+	if e != nil {
+		return e
+	}
+	defer f.Close()
+	var head [20]byte
+	if _, e = io.ReadFull(f, head[:]); e != nil {
+		return fmt.Errorf("read ELF header: %w", e)
+	}
+	if string(head[:4]) != "\x7fELF" || head[4] != wantClass || head[5] != 1 || binary.LittleEndian.Uint16(head[18:20]) != wantMachine {
+		return errors.New("ELF architecture mismatch")
+	}
 	return nil
 }

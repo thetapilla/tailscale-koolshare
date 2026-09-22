@@ -25,3 +25,5 @@ jobs:
       - name: Router shell syntax
         run: |
           find plugin -type f \( -path '*/scripts/*' -o -name '*.sh' \) -exec sh -c 'for file do sh -n "$file" || exit 1; done' sh {} +
+      - name: BusyBox firmware compatibility
+        run: python3 tools/test_busybox.py
