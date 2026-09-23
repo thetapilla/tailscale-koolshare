@@ -21,18 +21,31 @@ OLD_KIND=none
 say() { printf '%s\n' "$*"; }
 fail() { say "安装失败：$*" >&2; exit 1; }
 
-# Check every entry before sha256sum opens any manifest-supplied pathname.
-check_package() {
+# Reject unsafe paths before selecting or running the bundled verifier.
+check_package_paths() {
     [ -f "$PKG/manifest.sha256" ] && [ ! -L "$PKG/manifest.sha256" ] || fail '缺少校验清单'
     [ -z "$(find "$PKG" -type l -print)" ] || fail '安装包不能包含符号链接'
     awk 'NF!=2 || length($1)!=64 || $1~/[^a-f0-9]/ || $2~/[^A-Za-z0-9_.\/-]/ || $2~/^\// || $2~/(^|\/)\.\.?($|\/)/ || $2~/\/\// || seen[$2]++ {exit 1} END {if(NR==0)exit 1}' "$PKG/manifest.sha256" || fail '校验清单格式无效'
-    (cd "$PKG" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || fail '安装包文件校验失败'
-    find "$PKG" -type f | while IFS= read -r file; do
-        rel=${file#"$PKG/"}
-        [ "$rel" = manifest.sha256 ] && continue
-        awk -v name="$rel" '$2==name {found=1} END {exit !found}' "$PKG/manifest.sha256" || exit 1
-    done || fail '安装包有未经校验的文件'
+}
+
+check_package() {
+    "$VERIFIED_HELPER" check-tree "$PKG" || fail '安装包文件校验失败'
     [ "$(cat "$PKG/version")" = 3.0.0 ] || fail '插件版本无效'
+}
+
+verify_helper() {
+    local expected actual
+    expected=$(awk -v name="payload/$ARCH/tsks-helper" '$2==name {print $1}' "$PKG/manifest.sha256")
+    [ "${#expected}" = 64 ] || fail '安装清单缺少校验程序'
+    # Bootstrap with firmware crypto before executing the packaged helper.
+    if which sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$VERIFIED_HELPER" | awk '{print $1}')
+    elif which openssl >/dev/null 2>&1; then
+        actual=$(openssl dgst -sha256 "$VERIFIED_HELPER" | awk '{print $NF}')
+    else
+        fail '固件缺少 SHA-256 校验工具，无法验证安装程序'
+    fi
+    [ "$actual" = "$expected" ] || fail '安装校验程序的 SHA-256 不匹配'
 }
 
 platform() {
@@ -105,7 +118,8 @@ validate_core() {
         version=$("$VERIFIED_HELPER" json-get "$descriptor" version) || { core_invalid '核心描述缺少必要字段'; return 1; }
     case $size in ''|*[!0-9]*) core_invalid '核心大小无效'; return 1;; esac
     [ "$size" -le 12582912 ] && [ "$size" -gt 64 ] || { core_invalid '核心大小超出支持范围'; return 1; }
-    [ "$(sha256sum "$binary" | awk '{print $1}')" = "$expected" ] || { core_invalid '核心 SHA-256 校验失败'; return 1; }
+    actual=$("$VERIFIED_HELPER" sha256 "$binary") || { core_invalid '无法计算核心 SHA-256'; return 1; }
+    [ "$actual" = "$expected" ] || { core_invalid '核心 SHA-256 校验失败'; return 1; }
     [ "$(wc -c <"$binary" | tr -d ' ')" = "$size" ] || { core_invalid '核心文件大小与描述不一致'; return 1; }
     actual=$("$VERIFIED_HELPER" version "$binary") || { core_invalid '核心无法执行或读取版本超时'; return 1; }
     [ "$actual" = "$version" ] || { core_invalid '核心实际版本与描述不一致'; return 1; }
@@ -138,7 +152,7 @@ prepare_core() {
         LEGACY_VERSION=$("$VERIFIED_HELPER" version "$KSROOT/bin/tailscale.combined") || fail '无法读取旧核心版本'
         LEGACY_SIZE=$(wc -c <"$KSROOT/bin/tailscale.combined" | tr -d ' ')
         [ "$LEGACY_SIZE" -le 12582912 ] && [ "$LEGACY_SIZE" -gt 64 ] || fail '旧核心大小不受支持'
-        LEGACY_SHA=$(sha256sum "$KSROOT/bin/tailscale.combined" | awk '{print $1}')
+        LEGACY_SHA=$("$VERIFIED_HELPER" sha256 "$KSROOT/bin/tailscale.combined") || fail '无法校验旧核心'
         SELECTED=cores/$LEGACY_VERSION-legacy-$ARCH
         mkdir -p "$STAGE/core" || fail '无法准备核心目录'
         cp -p "$KSROOT/bin/tailscale.combined" "$STAGE/core/tailscale.combined" || fail '无法保留旧核心'
@@ -294,8 +308,10 @@ cleanup() {
     exit "$rc"
 }
 
-check_package
+check_package_paths
 platform
+verify_helper
+check_package
 mkdir -p "$STAGE" "$RUN" || fail '无法创建安全暂存目录'
 chmod 700 "$STAGE" "$RUN"
 trap cleanup EXIT

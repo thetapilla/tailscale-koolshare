@@ -33,6 +33,21 @@ func run(a []string) error {
 		return errors.New("command required")
 	}
 	switch a[0] {
+	case "sha256":
+		if len(a) != 2 {
+			return errors.New("sha256 FILE")
+		}
+		digest, e := fileSHA256(a[1])
+		if e != nil {
+			return e
+		}
+		fmt.Println(digest)
+		return nil
+	case "check-tree":
+		if len(a) != 2 {
+			return errors.New("check-tree ROOT")
+		}
+		return checkTree(a[1])
 	case "fifo":
 		if len(a) != 2 {
 			return errors.New("fifo PATH")

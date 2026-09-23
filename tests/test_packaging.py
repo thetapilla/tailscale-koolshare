@@ -31,11 +31,14 @@ class PackagingTests(unittest.TestCase):
         plugin = self.root / "plugin"
         (plugin / "scripts").mkdir(parents=True)
         (plugin / "webs").mkdir()
+        (plugin / "res").mkdir()
         (plugin / "init.d").mkdir()
         (plugin / "scripts/tailscale_config").write_text("#!/bin/sh\nexit 0\n")
         (plugin / "init.d/S96tailscale.sh").write_text("#!/bin/sh\nexit 0\n")
         (plugin / "install.sh").write_text("#!/bin/sh\nexit 0\n")
-        (plugin / "webs/Module_tailscale.asp").write_text("3.0.0")
+        self.page = '<script src="/res/tailscale3.js?v=3.0.0"></script>'
+        (plugin / "webs/Module_tailscale.asp").write_text(self.page)
+        (plugin / "res/tailscale3.js").write_text("window.fixture = 1;\n")
         (plugin / "version").write_text("old-source-version\n")
         (plugin / "release.pub").write_text("ab" * 32 + "\n")
         for arch in ("arm", "arm64"):
@@ -113,7 +116,7 @@ class PackagingTests(unittest.TestCase):
     def test_same_version_replaces_canonical_archives(self):
         paths = self.packages()
         first = {path.name: path.read_bytes() for path in paths}
-        (self.root / "plugin/webs/Module_tailscale.asp").write_text("Updated help text")
+        (self.root / "plugin/webs/Module_tailscale.asp").write_text(self.page + "Updated help text")
         paths = self.packages()
         expected = {f"tailscale_3.0.0_{name}.tar.gz" for name in ("universal", *PLATFORMS)}
         self.assertEqual({path.name for path in paths}, expected)
@@ -125,6 +128,28 @@ class PackagingTests(unittest.TestCase):
                 installer = tar.extractfile("tailscale/install.sh").read()
                 self.assertNotIn(b"detect_package", installer)
                 self.assertNotIn(b"ks_tar_install", installer)
+
+    def test_same_version_script_change_refreshes_browser_cache(self):
+        self.packages()
+        with self.open("hnd") as tar:
+            first = tar.extractfile("tailscale/webs/Module_tailscale.asp").read()
+        script = self.root / "plugin/res/tailscale3.js"
+        script.write_text("window.fixture = 2;\n")
+        self.packages()
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()[:16]
+        for platform in ("universal", *PLATFORMS):
+            with self.open(platform) as tar:
+                page = tar.extractfile("tailscale/webs/Module_tailscale.asp").read()
+                self.assertNotEqual(first, page)
+                self.assertIn(f"/res/tailscale3.js?v=3.0.0-{digest}".encode(), page)
+                self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
+        self.assertEqual((self.root / "plugin/webs/Module_tailscale.asp").read_text(), self.page)
+
+    def test_missing_or_duplicate_script_reference_rejects_package(self):
+        for page in ("missing script", self.page * 2):
+            (self.root / "plugin/webs/Module_tailscale.asp").write_text(page)
+            with self.assertRaisesRegex(ValueError, "exactly once"):
+                self.packages()
 
     def test_rejects_wrong_architecture(self):
         (self.root / "build/helpers/arm/tsks-helper").write_bytes(elf("arm64"))

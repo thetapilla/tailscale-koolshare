@@ -14,8 +14,12 @@ ts_core_valid() {
     [ -f "$dir/descriptor.json" ] && [ -x "$dir/tailscale.combined" ] || return 1
     expected=$(ts_get "$dir/descriptor.json" binary_sha256) || return 1
     [ "${#expected}" = 64 ] || return 1
-    actual=$(sha256sum "$dir/tailscale.combined" | awk '{print $1}')
-    [ "$actual" = "$expected" ] || return 1
+    actual=$("$HELPER" sha256 "$dir/tailscale.combined") || {
+        ts_job_log '无法读取核心文件的校验值，请检查核心文件和存储状态'; return 1;
+    }
+    [ "$actual" = "$expected" ] || {
+        ts_job_log '核心文件校验失败，已停止切换；请重新下载核心后重试'; return 1;
+    }
     version=$("$HELPER" version "$dir/tailscale.combined") || return 1
     [ "$version" = "$(ts_get "$dir/descriptor.json" version)" ]
 }

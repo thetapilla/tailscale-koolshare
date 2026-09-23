@@ -31,7 +31,7 @@
 
 ## 请求与任务协议
 
-httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支持直接命令行调用的生命周期和核心方法将动作放在 `$1`。前端生成不大于 `1000000000` 的正整数请求 ID，以兼容 32 位传输；后端任务 ID 校验接受最多 15 位十进制数字。
+httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支持直接命令行调用的生命周期和核心方法将动作放在 `$1`。前端请求 ID 限定在 `1` 至 `99999999`，到达上限后从 `1` 继续，避免软件中心拒绝九位 ID。后端任务 ID 校验接受最多 15 位十进制数字，供查询已有任务使用；恢复任务时仍生成新的八位以内传输 ID。
 
 | 方法 | 参数 | 用途 |
 | --- | --- | --- |
@@ -50,7 +50,11 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 {"accepted":true,"job_id":"12345"}
 ```
 
-锁冲突返回 `{"accepted":false,"error":"busy"}`。软件中心传输层的 `response.result` 可能是 JSON 对象，也可能是 JSON 字符串，前端应兼容两种表示。响应丢失时，前端先按原任务 ID 查询结果，避免重复提交变更。
+锁冲突返回 `{"accepted":false,"error":"busy"}`。响应丢失时，前端先按原任务 ID 查询结果，避免重复提交变更。
+
+脚本回复统一经过 `ts_reply`。软件中心的 httpdb 会把回调正文直接放入外层 JSON 的字符串字段，因此回传前必须进行 JSON 字符串转义，并去掉转义结果最外层的引号。回调使用 `POST /_resp/<请求 ID>`，由辅助程序完成转义，curl 以二进制正文发送，保留换行、反斜杠和 Unicode 的编码。
+
+浏览器先解析 HTTP 响应，再将 `response.result` 字符串解析为插件结果；前端同时接受对象形式的结果。`GET /_api/tailscale_` 直接返回配置对象数组，不经过脚本回调。直接命令行调用没有请求 ID 时，`ts_reply` 向标准输出写入原始插件 JSON。
 
 任务 JSON 原子写入，字段如下：
 
@@ -63,7 +67,7 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 | `message` | 可显示的结果或进度信息 |
 | `updated_at` | Unix 时间戳 |
 
-查不到任务时，查询接口返回 `state: "unknown"`，客户端应重新读取状态确认结果。日志作为独立文本显示，不作为成功或失败的判据。
+查不到任务时，查询接口返回 `state: "unknown"`。后台尝试取得操作锁，并在锁内重新查询记录；确认任务仍不存在且没有正在执行的操作后，才返回 `operation_busy: false`。客户端核对任务 ID 后结束失效记录的跟踪，重新读取设置和状态；不把任务缺失判定为成功，也不自动重发变更。`operation_busy` 为 `true` 或缺失时继续跟踪。日志作为独立文本显示，不作为成功或失败的判据。
 
 状态接口返回 `schema`、`enabled`、`plugin_version`、`core_version`、`backend_state`、`online`、`health_codes`、`health_messages`、`auth_url`、`monitoring_available`，以及 `watchdog` 和 `core` 对象。`online` 可以是布尔值或 `null`。`watchdog` 包含 `enabled`、`last_recovery`、`count_24h`；恢复记录表示尝试次数。`core` 包含 `installed`、`available`、`can_rollback`。状态读取异常时可附带 `error`。
 
@@ -97,6 +101,11 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 
 | 命令 | 行为 |
 | --- | --- |
+| `sha256 FILE` | 流式计算常规文件的 SHA-256，输出十六进制摘要 |
+| `check-tree ROOT` | 验证安装清单、文件哈希及目录完整性，拒绝越界路径、重复条目和符号链接 |
+| `elf BINARY ARCH` | 检查常规文件的 ELF 标识、字节序和 ARM 架构，不执行待检程序 |
+| `fifo PATH` | 创建权限为 `0600` 的日志管道，拒绝覆盖已有路径 |
+| `temp TEMPLATE` | 按以 `XXXXXX` 结尾的模板独占创建权限为 `0600` 的临时文件，输出路径 |
 | `timeout SECONDS COMMAND [ARGS...]` | 直接执行参数，不经过 shell；保留退出码，超时返回 `124` |
 | `version BINARY` | 设置 `TS_BE_CLI=1`，在 5 秒内读取并校验核心版本 |
 | `status SOCKET` | 通过受限 LocalAPI 请求返回状态、健康信息和身份存在标志；不返回原始 state |
@@ -134,4 +143,6 @@ https://github.com/thetapilla/tailscale-koolshare/releases/download/core-v<VERSI
 
 安装包只有一个 `tailscale/` 根目录，包含插件文件、版本、公钥、签名核心清单、`manifest.sha256` 和 `payload/<arch>/`。每个架构 payload 包含核心、辅助程序和描述符。通用包包含两种架构及五个平台标记，平台包仅含相应架构，安装器只安装所选架构。
 
-平台对应关系为 `hnd`、`qca`、`ipq32` → `arm`；`ipq64`、`mtk` → `arm64`。规范输出目录为仓库相邻的 `../dist/`，文件名为 `tailscale_<VERSION>_<PLATFORM>.tar.gz`，共六个安装包及 `SHA256SUMS`。包内版本在归档前写入；文件排序、权限、所有者及时间戳统一规范化。
+安装器先检查清单路径和目录中的链接，再选择本机辅助程序。执行辅助程序前，使用固件的 `sha256sum` 或 OpenSSL 核对该程序的清单摘要；两者均不可用时停止安装。通过引导校验后，由辅助程序验证整个安装目录，再加载后台库。核心安装、更新及回滚的 SHA-256 校验直接使用辅助程序。
+
+平台对应关系为 `hnd`、`qca`、`ipq32` → `arm`；`ipq64`、`mtk` → `arm64`。规范输出目录为仓库相邻的 `../dist/`，文件名为 `tailscale_<VERSION>_<PLATFORM>.tar.gz`，共六个安装包及 `SHA256SUMS`。包内版本在归档前写入；页面的脚本 URL 附带内容哈希，同版本替换脚本后也会更新浏览器缓存标识。文件排序、权限、所有者及时间戳统一规范化。

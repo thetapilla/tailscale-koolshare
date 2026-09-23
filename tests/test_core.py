@@ -17,7 +17,11 @@ import test_backend as backend
 
 
 CORE_COMMANDS = r'''
-    if args[0]=='fetch':
+    if args[0]=='sha256':
+        import hashlib
+        if read('fault.json','')=='read-hash':sys.exit(1)
+        print(hashlib.sha256(Path(args[1]).read_bytes()).hexdigest())
+    elif args[0]=='fetch':
         kind='manifest' if args[1].endswith('manifest.json') else 'archive'
         if read('fault.json','')=='fetch-'+kind:sys.exit(1)
         Path(args[2]).write_text(json.dumps(read('feed.json',{})))
@@ -169,6 +173,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.lifecycle(), [f"stop {self.old}", f"start {self.new}"])
         self.assertFalse((self.data / "update.txn").exists())
         self.assertFalse((self.data / "update.state").exists())
+
+    def test_core_verification_uses_helper_without_firmware_hash_applet(self):
+        self.assertNotEqual(self.shell("which sha256sum", check=False).returncode, 0)
+        self.shell('ts_core_valid "$DATA/current"')
+        self.assertIn(["sha256", str(self.data / "current/tailscale.combined")], self.calls("tsks-helper"))
+        self.write("fault.json", "read-hash")
+        self.assertNotEqual(self.shell('ts_core_valid "$DATA/current"', check=False).returncode, 0)
+        self.assertIn("无法读取核心文件的校验值", (self.run / "events.log").read_text())
+        self.assert_untouched()
 
     def test_download_signature_and_hash_failures_never_stop_current(self):
         for fault in ("fetch-manifest", "signature", "fetch-archive", "archive-hash", "binary-hash"):

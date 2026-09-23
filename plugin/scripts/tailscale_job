@@ -7,5 +7,19 @@ file=$WEB/tailscale3_$job.json
 if [ -f "$file" ] && [ ! -L "$file" ]; then
     ts_reply "$(cat "$file")"
 else
-    ts_reply "{\"schema\":1,\"id\":\"$job\",\"state\":\"unknown\",\"phase\":\"unknown\",\"message\":\"未找到任务记录，请刷新状态确认操作结果\"}"
+    operation_busy=true
+    if ts_lock; then
+        trap 'ts_unlock' EXIT
+        # A writer may have published the job between lookup and lock. Read it
+        # again before reporting that no operation owns the missing record.
+        if [ -f "$file" ] && [ ! -L "$file" ]; then
+            result=$(cat "$file") || exit 1
+            ts_unlock
+            ts_reply "$result"
+            exit $?
+        fi
+        operation_busy=false
+        ts_unlock
+    fi
+    ts_reply "{\"schema\":1,\"id\":\"$job\",\"state\":\"unknown\",\"phase\":\"unknown\",\"operation_busy\":$operation_busy,\"message\":\"未找到任务记录，请刷新状态确认操作结果\"}"
 fi

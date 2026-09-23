@@ -39,6 +39,7 @@
 #job_state { font-weight:bold; }
 #job_title { font-size:15px; font-weight:bold; }
 #interfaces_body td { word-break:break-all; }
+#tailscale_tcnets th { color:#f1f3f4; }
 #app[skin=ASUSWRT] .ts_box { outline:none; }
 #app[skin=ROG] .ts_box { outline:1px solid #91071f; }
 #app[skin=TUF] .ts_box { outline:1px solid #ffa523; }

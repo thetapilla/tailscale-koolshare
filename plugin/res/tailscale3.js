@@ -9,12 +9,13 @@
     var storage = options.storage, ask = options.confirm || function () { return true; };
     var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable'];
     var buttons = ['apply_settings', 'core_check', 'core_update', 'core_rollback', 'run_status', 'run_netcheck', 'run_diagnostics'];
-    // Older 32-bit software-center transports may store request IDs as int32.
-    var lastId = Math.floor(Math.random() * 1000000000), timer = null, xhr = null;
+    // Software-center httpdb accepts request IDs of at most eight digits.
+    var maxRequestId = 99999999, lastId = Math.floor(Math.random() * maxRequestId), timer = null, xhr = null;
     var started = false, stopped = false, inFlight = false, epoch = 0;
     var configReady = false, dirty = false, busy = false, pending = null, submitted = null, job = null, logTarget = null;
     var configDue = 0, statusDue = 0, interfacesDue = 0, jobDue = 0, logDue = 0;
     var canUpdate = false, canRollback = false, statusGood = false, lastStatus = null;
+    var configNotice = '', statusNotice = '';
     var jobStarted = 0, jobPaused = false, JOB_WINDOW = 15 * 60 * 1000;
 
     function node(id) { return doc.getElementById(id); }
@@ -23,6 +24,14 @@
     }
     function text(id, value) { var el = node(id); if (el) { el.textContent = plain(value, 8192); } }
     function visible(id, show) { var el = node(id); if (el) { el.style.display = show ? '' : 'none'; } }
+    function connectionNotice() { text('connection_notice', [configNotice, statusNotice].filter(Boolean).join('\n')); }
+    function readError(error, response, subject) {
+        if (error === 'parsererror' || (!error && response && typeof response.result === 'number')) {
+            return '软件中心返回的' + subject + '内容无法读取，正在重试。';
+        }
+        if (error === 'timeout') { return '读取' + subject + '超时，正在重试。'; }
+        return '暂时无法读取' + subject + '，正在重试；当前显示可能尚未更新。';
+    }
     function savePending(value) {
         if (!storage) { return; }
         try {
@@ -31,7 +40,7 @@
         } catch (ignored) { /* Storage may be disabled in the router browser. */ }
     }
     function id() {
-        lastId = lastId % 1000000000 + 1;
+        lastId = lastId % maxRequestId + 1;
         return String(lastId);
     }
     function validId(value) { return /^[0-9]{1,15}$/.test(String(value)); }
@@ -72,7 +81,7 @@
         if (node('core_update')) { node('core_update').disabled = locked || !statusGood || !canUpdate; }
         if (node('core_rollback')) { node('core_rollback').disabled = locked || !statusGood || !canRollback; }
         visible('job_resume', jobPaused);
-        text('settings_notice', !configReady ? '正在读取设置…' : dirty ? '设置尚未应用' : '');
+        text('settings_notice', !configReady ? (configNotice ? '读取设置失败，正在重试…' : '正在读取设置…') : dirty ? '设置尚未应用' : '');
     }
     function schedule(delay) {
         if (stopped || !started) { return; }
@@ -107,7 +116,9 @@
             var result = unpack(response), data = result && result[0], i;
             if (error || !data || typeof data !== 'object') {
                 configDue = clock() + 3000;
-                text('connection_notice', '暂时无法读取设置，正在重试…');
+                configNotice = readError(error, response, '设置');
+                connectionNotice();
+                controls();
                 return;
             }
             if (!dirty) {
@@ -117,7 +128,8 @@
             }
             configReady = true;
             configDue = Infinity;
-            text('connection_notice', '');
+            configNotice = '';
+            connectionNotice();
             controls();
         });
     }
@@ -140,7 +152,8 @@
         text('watchdog_recovery', recoveryTime(watchdog.last_recovery));
         text('health_messages', health);
         visible('health_row', !!health);
-        text('connection_notice', data.error && !(data.enabled === false && data.error === 'local_api_unavailable') ? errorMessage(data.error) : '');
+        statusNotice = data.error && !(data.enabled === false && data.error === 'local_api_unavailable') ? errorMessage(data.error) : '';
+        connectionNotice();
         if (link) {
             if (auth) { link.setAttribute('href', auth); }
             else { link.removeAttribute('href'); }
@@ -154,7 +167,13 @@
             if (error || !data || data.schema !== 1 || typeof data.backend_state !== 'string') {
                 statusGood = false;
                 statusDue = clock() + 5000;
-                text('connection_notice', '暂时无法读取状态，正在重试；当前显示可能尚未更新。');
+                statusNotice = readError(error, response, '状态');
+                connectionNotice();
+                if (!lastStatus) {
+                    ['plugin_version', 'core_current', 'daemon_state', 'tailnet_state', 'monitoring_state', 'watchdog_recovery'].forEach(function (field) {
+                        text(field, '暂时无法读取');
+                    });
+                }
                 if (node('auth_link')) { node('auth_link').removeAttribute('href'); }
                 visible('auth_link', false);
                 controls();
@@ -230,6 +249,25 @@
             var data = unpack(response), terminal;
             if (!job || job.id !== expected) { return; }
             jobDue = clock() + 1500;
+            if (!error && data && data.schema === 1 && String(data.id) === expected && data.state === 'unknown' && data.operation_busy === false) {
+                // The backend checked the operation lock and rechecked the job
+                // record. Release tracking, without claiming a task result.
+                if (job.reloadConfig) { dirty = false; }
+                job = null;
+                busy = false;
+                jobPaused = false;
+                savePending(null);
+                logTarget = null;
+                logDue = Infinity;
+                configDue = 0;
+                configReady = false;
+                statusDue = 0;
+                interfacesDue = 0;
+                text('job_state', '任务结果无法确认');
+                text('job_message', '未找到任务记录。当前没有操作正在运行，请核对设置和状态后按需重试。');
+                controls();
+                return;
+            }
             if (error || !data || data.schema !== 1 || String(data.id) !== expected || !/^(running|success|failed|rolled_back)$/.test(data.state)) {
                 jobDue = clock() + 3000;
                 text('job_message', '任务状态暂不可用，正在重试。请勿重复提交。');
@@ -270,7 +308,7 @@
         });
     }
     function pump() {
-        var now = clock(), due;
+        var now = clock(), due, next = null;
         if (stopped || !started || inFlight) { return; }
         if (pending) { submit(pending); return; }
         if (job && !jobPaused && now - jobStarted >= JOB_WINDOW) {
@@ -278,12 +316,14 @@
             text('job_message', '操作耗时较长，暂未确认结果。可继续查询任务进度。');
             controls();
         }
-        if (job && !jobPaused && jobDue <= now) { readJob(); return; }
-        if (logTarget && logDue <= now) { readLog(); return; }
-        if (configDue <= now) { readConfig(); return; }
-        if (statusDue <= now) { readStatus(); return; }
-        if (interfacesDue <= now) { readInterfaces(); return; }
-        due = Math.min(configDue, statusDue, interfacesDue, logTarget ? logDue : Infinity, job && !jobPaused ? jobDue : Infinity);
+        // Select the oldest due read so a slow, failing endpoint cannot starve
+        // the others. Ties retain task/config/status/interface order.
+        due = Infinity;
+        [[job && !jobPaused ? jobDue : Infinity, readJob], [logTarget ? logDue : Infinity, readLog],
+            [configDue, readConfig], [statusDue, readStatus], [interfacesDue, readInterfaces]].forEach(function (entry) {
+            if (entry[0] < due) { due = entry[0]; next = entry[1]; }
+        });
+        if (next && due <= now) { next(); return; }
         schedule(Math.max(100, Math.min(5000, due - now)));
     }
     function action(method, params, title, fields) {

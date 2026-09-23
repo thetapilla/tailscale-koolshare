@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get("TSKS_TEST_SHELL", "/bin/sh")
 FIRMWARE_TOOLS = ("awk", "cat", "chmod", "cp", "date", "df", "grep", "ln", "ls", "mkdir",
-                  "mv", "readlink", "rm", "sha256sum", "sleep", "tail", "tr", "uname", "wc", "which")
+                  "mv", "readlink", "rm", "sleep", "tail", "tr", "uname", "wc", "which")
 
 MOCK = r'''#!/usr/bin/env python3
 import fcntl,json,os,shlex,sys
@@ -45,8 +45,18 @@ elif name=='nvram':print(read('nvram.json',{}).get(args[1],''))
 elif name=='flock':
     try:fcntl.flock(int(args[-1]),fcntl.LOCK_UN if '-u' in args else fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:sys.exit(1)
+    if '-u' not in args and os.environ.get('PUBLISH_JOB_ON_LOCK'):
+        dest=Path(os.environ['TSKS_WEB']);dest.mkdir(exist_ok=True)
+        (dest/'tailscale3_999.json').write_text(os.environ['PUBLISH_JOB_ON_LOCK'])
 elif name=='curl':
-    if '-d' in args:(root/'reply.json').write_text(args[args.index('-d')+1])
+    if '--data-binary' in args or '-d' in args:
+        option='--data-binary' if '--data-binary' in args else '-d'
+        body=args[args.index(option)+1]
+        # The real software-center daemon inserts the callback bytes verbatim
+        # between quotes. Parsing twice is the browser's actual wire contract.
+        envelope='{"result": "'+body+'"}'
+        (root/'reply-envelope.json').write_text(envelope)
+        (root/'reply.json').write_text(json.loads(envelope)['result'])
     else:
         code=read('https.json',0)
         if code==0:print('200')
@@ -247,7 +257,7 @@ class BackendTests(unittest.TestCase):
             self.assertNotEqual(self.shell("ts_lan", check=False).returncode, 0)
 
     def test_firmware_fixture_excludes_missing_applet_dependencies(self):
-        for name in ("od", "mkfifo", "mktemp", "timeout"):
+        for name in ("od", "mkfifo", "mktemp", "timeout", "sha256sum"):
             self.assertNotEqual(self.shell("which " + name, check=False).returncode, 0)
 
     def test_firewall_legacy_commands_are_bounded_without_wait_option(self):
@@ -517,6 +527,42 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(net["interfaces"]), 2)
         self.assertEqual(net["interfaces"][0]["ip"], "100.64.2.3")
         self.assertEqual(net["interfaces"][0]["rx"], 12000000000000)
+
+    def test_reply_encodes_the_real_software_center_string_envelope(self):
+        values = [
+            {"accepted": True, "job_id": "123"},
+            {"accepted": False, "error": "busy"},
+            {"schema": 1, "interfaces": []},
+            {"schema": 1, "id": "123", "state": "failed", "message": '中文 "引号" \\ 路径\r\n下一行\t<&>'},
+            {"value": "x" * 8192, "number": 0, "enabled": False, "nullable": None},
+        ]
+        for value in values:
+            with self.subTest(value=repr(value)[:120]):
+                self.env["WIRE_PAYLOAD"] = json.dumps(value, ensure_ascii=False)
+                self.shell('ID=123; ts_reply "$WIRE_PAYLOAD"')
+                envelope = self.read("reply-envelope.json")
+                self.assertIsInstance(envelope["result"], str)
+                self.assertEqual(json.loads(envelope["result"]), value)
+                self.assertEqual(self.read("reply.json"), value)
+                self.assertIn("--data-binary", self.calls("curl")[-1])
+                self.assertEqual(json.loads(self.shell('ID=; ts_reply "$WIRE_PAYLOAD"').stdout), value)
+
+    def test_missing_job_reports_idle_only_after_acquiring_and_rechecking_lock(self):
+        self.entry("tailscale_job", "900", "999")
+        self.assertEqual(self.read("reply.json")["operation_busy"], False)
+        source = '. "$TSKS_ROOT/scripts/tailscale_lib.sh"; ts_init; ts_lock; echo locked; read done'
+        proc = subprocess.Popen([SHELL, "-c", source], env=self.env, text=True,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "locked")
+            self.entry("tailscale_job", "901", "999")
+            self.assertEqual(self.read("reply.json")["operation_busy"], True)
+        finally:
+            proc.communicate("done\n", timeout=5)
+        completed = {"schema": 1, "id": "999", "state": "success", "phase": "complete", "message": "完成"}
+        self.env["PUBLISH_JOB_ON_LOCK"] = json.dumps(completed)
+        self.entry("tailscale_job", "902", "999")
+        self.assertEqual(self.read("reply.json"), completed)
 
     def test_mutation_ack_and_atomic_terminal_job(self):
         self.entry("tailscale_config", "000123", "start_nat")

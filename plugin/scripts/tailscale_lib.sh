@@ -77,9 +77,13 @@ ts_unlock() {
 ts_reply() {
     if [ -n "${ID:-}" ]; then
         ts_job_id "$ID" || return 1
-        # base.sh's response transport, without importing dbus via eval.
+        # The software-center daemon embeds this body inside a JSON string.
+        # Escape with the helper, then remove only its outer quote delimiters.
+        local encoded
+        encoded=$(ts_quote "$1") || return 1
+        encoded=${encoded#\"}; encoded=${encoded%\"}
         curl --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
-                -X POST -d "$1" "http://127.0.0.1:3030/_resp/$ID" >/dev/null 2>&1
+                -X POST --data-binary "$encoded" "http://127.0.0.1:3030/_resp/$ID" >/dev/null 2>&1
     else
         printf '%s\n' "$1"
     fi

@@ -15,11 +15,33 @@
 | `python3 tools/smoke_core.py` | 两种目标架构的真实压缩程序、daemon、辅助程序及 LocalAPI 冒烟测试 |
 | `python3 tools/smoke_install.py --lifecycle` | 六份正式安装包的安装、重装、迁移及平台一致性；真实 ARM 核心、辅助程序、签名、userspace 服务启动与页面任务写入 |
 
-脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。回归测试仅允许显式列出的命令，禁用 `command` 内置命令，且不提供 `od`、`mkfifo`、`mktemp` 和外部 `timeout`。核心架构检查、日志管道、临时文件及命令超时由随包辅助程序处理；防火墙测试覆盖旧版无等待参数和新版支持等待参数的分支。
+脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。回归测试仅允许显式列出的命令，禁用 `command` 内置命令，且不提供 `od`、`mkfifo`、`mktemp`、`sha256sum` 和外部 `timeout`。安装清单与核心校验、日志管道、临时文件及命令超时由随包辅助程序处理；防火墙测试覆盖旧版无等待参数和新版支持等待参数的分支。
 
 安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。
 
 真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon 和未登录状态，不需要加入 Tailnet。
+
+## 固件组件与浏览器集成
+
+对本地固件镜像执行以下命令，可在隔离容器中提取并运行其原始 BusyBox、Shell 和工具集。原镜像保持只读；报告按镜像 SHA-256 保存到 `build/firmware-compat/`，包含各组测试前后的源码哈希。`--export-runtime` 同时导出接口测试所需的最小运行目录。
+
+```sh
+python3 tools/firmware_compat.py --build-image --export-runtime /path/to/firmware.pkgtb
+python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root
+```
+
+接口测试运行固件中的 httpdb、skipd、DBus 客户端及 Shell，并执行实际辅助程序。覆盖请求 ID 边界、回复编码、状态与接口查询、设置、任务回执、操作锁、错误结果和失效任务恢复。NVRAM、网络、防火墙、外网下载及 LocalAPI 数据采用固定测试输入。
+
+浏览器测试需要 Node.js、Playwright 和兼容的 Chromium。先启动回环地址上的隔离接口服务，再在另一终端运行浏览器检查：
+
+```sh
+python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root --serve --port 33030
+node tools/smoke_ui.js --firmware-root /path/to/runtime-root --upstream http://127.0.0.1:33030
+```
+
+浏览器加载固件自带的 jQuery、软件中心资源和插件原始页面，覆盖初始显示、设置保存、诊断、核心检查、异常响应后的恢复及页面刷新后的任务跟踪。路由器导航与硬件相关模板值使用测试替身。`--chromium` 可指定已有浏览器；Playwright 可通过 `NODE_PATH` 使用已有安装。
+
+打包后，为上述两个工具都增加 `--plugin-root build/packages/universal/tailscale`，可检查归档暂存区内的实际页面、脚本、缓存标识和辅助程序。截图保存在 `build/ui-smoke/`，表示隔离测试数据；完整固件启动、硬件网络与流量转发仍按下节设备检查执行。固件及提取资源作为本地测试输入，不随源码和插件 Release 分发。
 
 ## 发布产物检查
 

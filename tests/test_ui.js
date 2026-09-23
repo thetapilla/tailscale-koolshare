@@ -102,8 +102,9 @@ test('config errors retry; empty interfaces continue polling and stale status di
     while (h.requests[0] && h.requests[0].body) {
         const r = h.next(); h.reply(r, r.body.method === 'tailscale_fettle' ? h.status() : { interfaces: [] }); h.advance();
     }
+    assert.match(h.nodes.connection_notice.textContent, /设置.*重试/);
+    assert.match(h.nodes.settings_notice.textContent, /读取设置失败/);
     h.reply(h.next(), [{ tailscale_enable: '1' }]); h.advance();
-    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
     h.advance(5000);
     let r = h.next(); assert.equal(r.body.method, 'tailscale_fettle'); r.finish('timeout'); h.advance();
     assert.equal(h.nodes.core_update.disabled, true);
@@ -112,6 +113,31 @@ test('config errors retry; empty interfaces continue polling and stale status di
     r = h.next('tailscale_fettle'); h.reply(r, ''); h.advance();
     h.advance(1000);
     r = h.next('tailscale_tsnets'); h.reply(r, { interfaces: [] }); h.advance();
+    assert.match(h.nodes.interfaces_notice.textContent, /自动刷新/);
+    assert.equal(h.maxSimultaneous(), 1);
+});
+
+test('an initial malformed response replaces loading labels and clears after valid status arrives', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '1' }]);
+    h.next('tailscale_fettle').finish('parsererror'); h.advance();
+    for (const field of ['plugin_version', 'core_current', 'daemon_state', 'tailnet_state', 'monitoring_state', 'watchdog_recovery']) {
+        assert.doesNotMatch(h.nodes[field].textContent, /正在读取/);
+        assert.match(h.nodes[field].textContent, /无法读取/);
+    }
+    assert.match(h.nodes.connection_notice.textContent, /返回的状态内容无法读取/);
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance(5000);
+    h.reply(h.next('tailscale_fettle'), h.status()); h.advance();
+    assert.equal(h.nodes.connection_notice.textContent, '');
+    assert.equal(h.nodes.daemon_state.textContent, '运行中');
+    assert.equal(h.nodes.core_update.disabled, false);
+});
+
+test('slow repeated config and status failures cannot starve interface polling', () => {
+    const h = harness(); h.app.init();
+    h.advance(10000); h.next().finish('timeout'); h.advance();
+    const status = h.next('tailscale_fettle'); h.advance(10000); status.finish('timeout');
+    const interfaces = h.next('tailscale_tsnets'); h.reply(interfaces, { interfaces: [] }); h.advance();
+    assert.match(h.nodes.settings_notice.textContent, /读取设置失败/);
     assert.match(h.nodes.interfaces_notice.textContent, /自动刷新/);
     assert.equal(h.maxSimultaneous(), 1);
 });
@@ -218,7 +244,22 @@ test('poll request IDs remain unique, an in-flight poll queues a user action, an
     const ids = h.history.filter(r => r.body).map(r => r.body.id);
     assert.equal(ids.length, new Set(ids).size);
     assert.ok(ids.every(id => /^[0-9]{1,15}$/.test(String(id))));
-    assert.ok(ids.every(id => Number.isInteger(id) && id > 0 && id <= 1000000000));
+    assert.ok(ids.every(id => Number.isInteger(id) && id > 0 && id <= 99999999));
+});
+
+test('request IDs wrap within the eight-digit httpdb limit', () => {
+    const random = Math.random;
+    let h;
+    try {
+        Math.random = () => 99999998 / 99999999;
+        h = harness();
+    } finally { Math.random = random; }
+    h.boot();
+    assert.deepEqual(h.history.filter(r => r.body).map(r => r.body.id), [99999999, 1]);
+    h.click('run_status'); const request = h.next('tailscale_status');
+    assert.equal(request.body.id, 2);
+    h.accept(request); h.finishJob(h.next('tailscale_job'), 'success'); h.advance();
+    assert.equal(h.nodes.apply_settings.disabled, false);
 });
 
 test('navigation during submission preserves the known job and resumes polling without resubmitting', () => {
@@ -243,7 +284,11 @@ test('diagnostics completion preserves unsaved option changes and retries missin
 
 test('a resumed diagnostic still loads settings correctly before it finishes', () => {
     const h = harness({ tailscale3_pending: JSON.stringify({ id: '179000000000001', title: '生成诊断摘要' }) });
-    h.app.init(); h.finishJob(h.next('tailscale_job'), 'running');
+    h.app.init();
+    const resumed = h.next('tailscale_job');
+    assert.ok(resumed.body.id > 0 && resumed.body.id <= 99999999);
+    assert.deepEqual(resumed.body.params, ['179000000000001']);
+    h.finishJob(resumed, 'running');
     h.next().finish(null, 'working');
     h.reply(h.next(), [{ tailscale_enable: '1', tailscale_accept_routes: '1', tailscale_watchdog_enable: '1' }]);
     h.reply(h.next('tailscale_fettle'), h.status());
@@ -253,6 +298,29 @@ test('a resumed diagnostic still loads settings correctly before it finishes', (
     assert.equal(h.nodes.tailscale_accept_routes.checked, true);
     assert.equal(h.nodes.tailscale_watchdog_enable.checked, true);
     assert.equal(h.nodes.apply_settings.disabled, false);
+});
+
+test('a missing resumed task releases tracking only after the backend proves idle and settings reload', () => {
+    const h = harness({ tailscale3_pending: JSON.stringify({ id: '34567', title: '应用设置', reloadConfig: true }) });
+    h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'unknown', { id: '34568', operation_busy: false });
+    assert.equal(h.nodes.apply_settings.disabled, true);
+    h.reply(h.next(), [{ tailscale_enable: '1' }]); h.reply(h.next('tailscale_fettle'), h.status());
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance(3000);
+    h.finishJob(h.next('tailscale_job'), 'unknown', { operation_busy: true });
+    assert.equal(h.nodes.apply_settings.disabled, true);
+    h.advance(3000);
+    // A due status read may run before the retrying job.
+    if (h.requests[0].body.method === 'tailscale_fettle') { h.reply(h.next(), h.status()); }
+    h.finishJob(h.next('tailscale_job'), 'unknown', { operation_busy: false });
+    assert.equal(h.nodes.apply_settings.disabled, true);
+    assert.equal(h.storage.tailscale3_pending, undefined);
+    assert.equal(h.nodes.job_state.textContent, '任务结果无法确认');
+    h.reply(h.next(), [{ tailscale_enable: '0' }]); h.reply(h.next('tailscale_fettle'), h.status({ enabled: false }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    assert.equal(h.nodes.apply_settings.disabled, false);
+    assert.equal(h.nodes.tailscale_enable.checked, false);
+    assert.ok(h.history.filter(r => r.body).every(r => ['tailscale_job', 'tailscale_fettle', 'tailscale_tsnets'].includes(r.body.method)));
 });
 
 test('long unknown task pauses with explicit resume and never unlocks writes or guesses success', () => {

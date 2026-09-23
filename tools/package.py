@@ -22,6 +22,18 @@ def check_host_installer(path):
             raise ValueError("software-center installer guard rejects text: " + token.decode())
 
 
+def stamp_ui(stage, version):
+    """Refresh browser caches when a same-version package changes its script."""
+    page = stage / "webs/Module_tailscale.asp"
+    digest = sha256(stage / "res/tailscale3.js")[:16]
+    source = f"/res/tailscale3.js?v={version}-{digest}"
+    text, count = re.subn(r'(?<=src=")/res/tailscale3\.js(?:\?[^"\s]*)?(?=")',
+                          source, page.read_text())
+    if count != 1:
+        raise ValueError("page must reference the UI script exactly once")
+    page.write_text(text)
+
+
 def build_packages(root, out, public_key=None, helper=None):
     root, out = Path(root), Path(out)
     version = (root / "VERSION").read_text().strip()
@@ -59,6 +71,7 @@ def build_packages(root, out, public_key=None, helper=None):
             shutil.rmtree(stage)
         shutil.copytree(root / "plugin", stage, symlinks=True)
         check_host_installer(stage / "install.sh")
+        stamp_ui(stage, version)
         (stage / "version").write_text(version + "\n")
         valid = list(PLATFORMS) if platform == "universal" else [platform]
         (stage / ".valid").write_text("\n".join(valid) + "\n")

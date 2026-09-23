@@ -21,7 +21,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get('TSKS_TEST_SHELL', '/bin/sh')
 FIRMWARE_TOOLS = ('awk', 'cat', 'chmod', 'cp', 'dirname', 'find', 'grep', 'ln',
-                  'mkdir', 'readlink', 'rm', 'rmdir', 'sed', 'sha256sum', 'sleep',
+                  'mkdir', 'readlink', 'rm', 'rmdir', 'sed', 'sleep',
                   'sync', 'tr', 'wc', 'which')
 MOCK = r'''#!/usr/bin/env python3
 import fcntl,hashlib,json,os,sys
@@ -49,8 +49,24 @@ elif name=='dbus':
 elif name=='flock':
     try:fcntl.flock(int(args[-1]),fcntl.LOCK_UN if '-u' in args else fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:sys.exit(1)
+elif name=='openssl':
+    if args[:2]!=['dgst','-sha256'] or len(args)!=3:sys.exit(1)
+    print('SHA256('+args[2]+')= '+hashlib.sha256(Path(args[2]).read_bytes()).hexdigest())
+elif name=='sha256sum':print(hashlib.sha256(Path(args[0]).read_bytes()).hexdigest()+'  '+args[0])
 elif name=='tsks-helper':
-    if args[0]=='elf':
+    if args[0]=='sha256':print(hashlib.sha256(Path(args[1]).read_bytes()).hexdigest())
+    elif args[0]=='check-tree':
+        base=Path(args[1]);seen=set()
+        try:
+            for line in (base/'manifest.sha256').read_text().splitlines():
+                digest,name=line.split('  ',1)
+                if name in seen:sys.exit(1)
+                seen.add(name)
+                file=base/name
+                if file.is_symlink() or not file.is_file() or hashlib.sha256(file.read_bytes()).hexdigest()!=digest:sys.exit(1)
+            if {p.relative_to(base).as_posix() for p in base.rglob('*') if p.is_file() and p.name!='manifest.sha256'}!=seen:sys.exit(1)
+        except (OSError,ValueError):sys.exit(1)
+    elif args[0]=='elf':
         data=Path(args[1]).read_bytes()
         expected={'arm':(1,40),'arm64':(2,183)}.get(args[2])
         if not expected or len(data)<20:sys.exit(1)
@@ -138,6 +154,7 @@ class InstallTests(unittest.TestCase):
         command.chmod(0o755)
         for name in ('dbus', 'nvram', 'uname', 'flock', 'df', 'mv'):
             (self.mock / name).symlink_to(command)
+        (self.mock / 'openssl').symlink_to(os.environ.get('TSKS_TEST_OPENSSL') or command)
         manifest = {'valid': True}; versions = {}
         for arch in ('arm', 'arm64'):
             target = self.pkg / 'payload' / arch
@@ -244,7 +261,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
 
     def test_universal_and_hnd_install_without_optional_firmware_commands(self):
-        for name in ('od', 'timeout', 'command'):
+        for name in ('od', 'timeout', 'command', 'sha256sum'):
             self.assertIsNone(shutil.which(name, path=self.env['PATH']))
         for package in ('universal', 'hnd'):
             with self.subTest(package=package):
@@ -272,12 +289,27 @@ class InstallTests(unittest.TestCase):
         (self.pkg / '.valid').write_text('hnd\n'); self.write('kernel.json', '2.6.36'); self.checksums(); self.install(False)
         self.assertEqual(self.calls('tsks-helper'), [])
 
-    def test_tampered_helper_and_unlisted_files_fail_before_helper_execution(self):
+    def test_bootstrap_rejects_tampered_helper_and_verifier_rejects_unlisted_files(self):
         with (self.pkg / 'payload/arm/tsks-helper').open('a') as f: f.write('\n# tampered\n')
         self.install(False); self.assertEqual(self.calls('tsks-helper'), [])
         self.checksums(); (self.pkg / 'scripts/tailscale_unlisted').write_text('bad')
-        self.install(False); self.assertEqual(self.calls('tsks-helper'), [])
+        self.install(False)
+        self.assertEqual(self.calls('tsks-helper'), [['check-tree', str(self.pkg)]])
         self.assertFalse((self.mock / 'lifecycle').exists())
+
+    def test_missing_bootstrap_crypto_stops_before_helper_execution(self):
+        (self.mock / 'openssl').unlink()
+        result = self.install(False)
+        self.assertIn('固件缺少 SHA-256 校验工具', result.stderr)
+        self.assertEqual(self.calls('tsks-helper'), [])
+        self.assertFalse((self.mock / 'lifecycle').exists())
+
+    def test_native_sha256_bootstrap_works_without_openssl(self):
+        (self.mock / 'openssl').unlink()
+        (self.mock / 'sha256sum').symlink_to(self.mock / 'mock-command')
+        self.install()
+        self.assertEqual(self.calls('sha256sum'), [[str(self.pkg / 'payload/arm/tsks-helper')]])
+        self.assertEqual(self.calls('openssl'), [])
 
     def test_traversal_manifest_and_package_symlink_are_rejected(self):
         with (self.pkg / 'manifest.sha256').open('a') as f: f.write('0' * 64 + '  ../../outside\n')
@@ -358,7 +390,7 @@ class InstallTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.install(False)
         self.assertFalse((self.mock / 'lifecycle').exists())
-        self.assertEqual(self.calls('tsks-helper'), [])
+        self.assertEqual(self.calls('tsks-helper'), [['check-tree', str(self.pkg)]])
 
     def test_pending_core_transaction_blocks_install_before_copies(self):
         old = self.legacy(); before = self.read('config.json')
@@ -369,19 +401,19 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(journal.read_text(), '{"phase":"switching","old":"cores/old"}')
         self.assertEqual((self.ks / 'bin/tailscale.combined').read_bytes(), old)
         self.assertEqual(self.read('config.json'), before)
-        self.assertEqual(self.calls('tsks-helper'), [])
+        self.assertEqual(self.calls('tsks-helper'), [['check-tree', str(self.pkg)]])
         self.assertEqual(self.calls('mv'), [])
         self.assertFalse((self.mock / 'lifecycle').exists())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
 
     def test_flash_and_ram_preflight_fail_before_copy_or_stop(self):
         self.write('space.json', 4096); self.install(False)
-        self.assertEqual(self.calls('tsks-helper'), [])
+        self.assertEqual(self.calls('tsks-helper'), [['check-tree', str(self.pkg)]])
         self.assertFalse((self.mock / 'lifecycle').exists())
         self.write('space.json', 1048576)
         (self.base / 'proc/meminfo').write_text('MemAvailable: 8192 kB\n')
         self.install(False)
-        self.assertEqual(self.calls('tsks-helper'), [])
+        self.assertEqual(self.calls('tsks-helper'), [['check-tree', str(self.pkg)]] * 2)
         self.assertFalse((self.mock / 'lifecycle').exists())
 
     def test_partial_file_replacement_failure_restores_original_install(self):
