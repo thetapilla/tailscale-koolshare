@@ -473,6 +473,46 @@ class BackendTests(unittest.TestCase):
             self.tick(now, alive=False)
         self.assertEqual(self.recoveries(), 0)
 
+    def assert_automatic_restart_preserves_intent(self, update, manual_start=False):
+        saved = dict(self.status, ips=[], **update)
+        state = self.ks / "configs/tailscale/tailscaled.state"
+        state.write_text("persisted-identity-and-connection-preferences")
+        (self.run / "started-at").write_text("10000")
+        self.write("status.json", saved)
+        self.tick(20000, alive=True)
+        self.write("status.json", None)
+        self.tick(20060, alive=False)
+        self.tick(20120, alive=False)
+        # Both pre-recovery probes observe the missing service. The new daemon
+        # then exposes the same persisted preference and lifecycle state.
+        self.write("status.json", saved)
+        self.write("status-queue.json", [None, None, saved])
+        self.env["MOCK_DAEMON"] = "1"
+        try:
+            self.shell("ts_now() { echo 20180; }; ts_lock; ts_watchdog_run; ts_unlock")
+            self.assertEqual(len(self.calls("tailscaled")), 1)
+            self.assertFalse(any("up" in args for args in self.calls("tailscale")))
+            self.assertEqual(state.read_text(), "persisted-identity-and-connection-preferences")
+            self.assertEqual((state.parent / "watchdog-ledger").read_text(), "20180\n")
+            if manual_start:
+                self.shell("ts_lock; ts_start; ts_unlock")
+                self.assertTrue(any("up" in args for args in self.calls("tailscale")))
+                self.assertEqual(len(self.calls("tailscaled")), 1)
+        finally:
+            self.shell("ts_lock; ts_stop; ts_unlock")
+
+    def test_automatic_restart_preserves_cli_down_after_process_loss(self):
+        self.assert_automatic_restart_preserves_intent(dict(backend_state="Stopped", want_running=False), manual_start=True)
+
+    def test_automatic_restart_preserves_logout_after_process_loss(self):
+        self.assert_automatic_restart_preserves_intent(dict(backend_state="NeedsLogin", want_running=False, logged_out=True))
+
+    def test_automatic_restart_preserves_waiting_login_after_process_loss(self):
+        self.assert_automatic_restart_preserves_intent(dict(backend_state="NeedsLogin", want_running=True))
+
+    def test_automatic_restart_resumes_wanted_service_without_up(self):
+        self.assert_automatic_restart_preserves_intent(dict(backend_state="Running", want_running=True))
+
     def test_watchdog_control_timeout_requires_continuity_and_https(self):
         (self.run / "started-at").write_text("10000")
         self.write("status.json", dict(self.status, online=False))

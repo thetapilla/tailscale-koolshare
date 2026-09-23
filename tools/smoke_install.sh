@@ -176,6 +176,13 @@ ts_pid_alive
 [ "$(ts_get "$RUN/start-status.json" ok)" = true ]
 case $(ts_get "$RUN/start-status.json" backend_state) in NeedsLogin|Starting) ;; *) exit 1;; esac
 [ -s "$RUN/daemon.log" ]
+# A user-requested disconnect persists through an automatic process recovery.
+ts_cli down
+ts_status_file "$RUN/disconnected.json"
+[ "$(ts_get "$RUN/disconnected.json" want_running)" = false ]
+ts_restart automatic
+ts_pid_alive
+[ "$(ts_get "$RUN/start-status.json" want_running)" = false ]
 ts_job_write success finished 'Lifecycle fixture passed'
 [ "$(ts_get "$WEB/tailscale3_12345.json" state)" = success ]
 ts_stop
@@ -197,7 +204,7 @@ LIFECYCLE
     [ "$(stat -c %a "$case_root/web/tailscale3_12345.json")" = 644 ] || fail 'public job permissions'
     [ "$(stat -c %a "$case_root/run/daemon.log")" = 600 ] || fail 'private log permissions'
     [ "$(stat -c %a "$ks/configs/tailscale/tailscaled.state")" = 600 ] || fail 'new state permissions'
-    printf 'PASS %s: enabled userspace daemon, real LocalAPI/settings, FIFO logger, public jobs and legacy firewall argv\n' "$arch"
+    printf 'PASS %s: userspace daemon, LocalAPI/settings, FIFO logger, public jobs, legacy firewall argv and preserved disconnect on automatic restart\n' "$arch"
 }
 
 for platform do

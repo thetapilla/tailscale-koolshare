@@ -376,6 +376,8 @@ ts_firewall_remove() {
 }
 
 ts_start() {
+    local startup=${1:-manual}
+    case $startup in manual|automatic) ;; *) return 1;; esac
     ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
     ts_cron
     [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
@@ -420,7 +422,7 @@ ts_start() {
     ts_cli "$@" >/dev/null 2>&1 || { ts_job_log '无法应用 Tailscale 设置，请检查本机服务状态'; return 1; }
     want=$(ts_get "$RUN/start-status.json" want_running)
     state=$(ts_get "$RUN/start-status.json" backend_state)
-    if [ "$want" != true ] || [ "$state" = NeedsLogin ]; then
+    if [ "$startup" = manual ] && { [ "$want" != true ] || [ "$state" = NeedsLogin ]; }; then
         # No --reset: existing identity and unexposed preferences are preserved.
         ts_cli up >/dev/null 2>&1 || :
     fi
@@ -447,7 +449,7 @@ ts_stop() {
     ts_job_log '服务已停止，连接身份已保留'
 }
 
-ts_restart() { ts_stop && ts_start; }
+ts_restart() { ts_stop && ts_start "$@"; }
 
 ts_watch_read() {
     WD_FAILURES=0; WD_CONTROL=0; WD_LAST=0; WD_HISTORY=
@@ -599,7 +601,9 @@ ts_watchdog_run() {
     chmod 600 "$ledger.new" && mv -f "$ledger.new" "$ledger" || return 1
     WD_FAILURES=0; WD_CONTROL=0; ts_watch_save
     ts_job_log "自动恢复尝试，原因：$reason"
-    ts_restart
+    # The daemon restores its persisted connection intent. Automatic recovery
+    # must not turn an explicit down/logout into a new connection request.
+    ts_restart automatic
 }
 
 ts_status_json() {

@@ -113,12 +113,14 @@ const server = http.createServer((req, res) => {
             /暂无|暂时无法读取/.test(document.getElementById('interfaces_notice').textContent), null, { timeout: 15000 });
     }
     async function report(checks, initialLoadMs) {
-        console.log(JSON.stringify({ playwright: require('playwright/package.json').version, chromium: browser.version(),
+        const result = { playwright: require('playwright/package.json').version, chromium: browser.version(),
             jquery: await page.evaluate(() => jQuery.fn.jquery), jquery_sha256: crypto.createHash('sha256').update(jquery).digest('hex'),
             plugin_js_sha256: crypto.createHash('sha256').update(fs.readFileSync(path.join(plugin, 'res/tailscale3.js'))).digest('hex'),
             script_url: await page.locator('script[src*="tailscale3.js"]').getAttribute('src'),
             environment: 'isolated fixture with extracted firmware userspace', real_httpdb: upstream.origin, requests: calls.length, initial_load_ms: initialLoadMs,
-            result: 'passed', checks }));
+            result: 'passed', checks };
+        fs.writeFileSync(path.join(screenshots, 'result.json'), JSON.stringify(result, null, 2) + '\n');
+        console.log(JSON.stringify(result));
     }
     async function job(button, expected) {
         await waitEnabled(button);
@@ -139,10 +141,14 @@ const server = http.createServer((req, res) => {
         assert.match(await page.evaluate(() => jQuery.fn.jquery), /^(1\.10\.2|3\.7\.1)$/);
         await page.waitForFunction(() => document.getElementById('interfaces_notice').textContent !== '正在读取…' &&
             (document.getElementById('interfaces_body').children.length > 0 || document.getElementById('interfaces_notice').textContent.includes('暂无')), null, { timeout: 15000 });
+        const headingColors = await page.locator('#tailscale_tcnets th').evaluateAll(elements => elements.map(element => getComputedStyle(element).color));
+        assert.equal(headingColors.length, 4);
+        assert.ok(headingColors.every(color => color === 'rgb(241, 243, 244)'), 'Network table headings must retain readable contrast');
+        assert.deepEqual(scriptErrors, []);
         const initialLoadMs = Date.now() - start;
         await page.screenshot({ path: path.join(screenshots, 'loaded.png'), fullPage: true });
         console.log(JSON.stringify({ phase: 'initial state', result: 'passed', milliseconds: initialLoadMs }));
-        if (args.includes('--initial-only')) { await report(['initial state'], initialLoadMs); return; }
+        if (args.includes('--initial-only')) { await report(['initial state', 'table heading contrast'], initialLoadMs); return; }
         await job('run_diagnostics', /^操作完成$/);
         await job('run_status', /^操作完成$/);
         await job('run_netcheck', /^操作完成$/);
