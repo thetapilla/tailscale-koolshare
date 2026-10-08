@@ -16,6 +16,7 @@ import (
 type statusResult struct {
 	OK          bool     `json:"ok"`
 	Version     string   `json:"version"`
+	VersionLong string   `json:"version_long"`
 	Backend     string   `json:"backend_state"`
 	Online      *bool    `json:"online"`
 	Codes       []string `json:"health_codes"`
@@ -50,6 +51,19 @@ func localJSON(c *http.Client, path string, v any) error {
 
 var authPattern = regexp.MustCompile(`https://login\.tailscale\.com/a/[^\s"<>]+`)
 
+// Tagged Tailscale builds report version.Long through LocalAPI while the CLI
+// and signed release descriptor use version.Short. Only strip the documented
+// release commit stamps; development, dirty and untagged builds must not become
+// indistinguishable from a release. Preserve the full string for diagnostics.
+var releaseLongPattern = regexp.MustCompile(`^([0-9]+\.[0-9]+\.[0-9]+)-t[0-9a-f]{9}(?:-g[0-9a-f]{9})?$`)
+
+func releaseVersion(version string) string {
+	if match := releaseLongPattern.FindStringSubmatch(version); match != nil {
+		return match[1]
+	}
+	return version
+}
+
 var keyPattern = regexp.MustCompile(`(?i)(tskey-[a-z0-9_-]+|(?:privkey|nodekey|machinekey):[a-f0-9]{32,}|(?:authkey|access_token|id_token|token|password)=[^\s&"<>]+)`)
 
 func redact(s string) string {
@@ -75,7 +89,8 @@ func readStatus(socket string) statusResult {
 		return out
 	}
 	out.OK = true
-	out.Version = s.Version
+	out.Version = releaseVersion(s.Version)
+	out.VersionLong = s.Version
 	out.Backend = s.BackendState
 	out.HaveNodeKey = s.HaveNodeKey
 	if s.Self != nil {

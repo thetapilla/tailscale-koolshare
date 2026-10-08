@@ -31,6 +31,8 @@ class PackagingTests(unittest.TestCase):
         self.out = Path(self.temp.name) / "dist"
         self.root.mkdir()
         (self.root / "VERSION").write_text("3.0.0\n")
+        (self.root / "tools").mkdir()
+        (self.root / "tools/bundled_core.json").write_text('{"version":"1.102.4","build":"r1"}\n')
         plugin = self.root / "plugin"
         (plugin / "scripts").mkdir(parents=True)
         (plugin / "webs").mkdir()
@@ -157,6 +159,11 @@ class PackagingTests(unittest.TestCase):
     def test_rejects_wrong_architecture(self):
         (self.root / "build/helpers/arm/tsks-helper").write_bytes(elf("arm64"))
         with self.assertRaisesRegex(ValueError, "architecture mismatch"):
+            self.packages()
+
+    def test_rejects_core_that_differs_from_bundle_pin(self):
+        (self.root / "tools/bundled_core.json").write_text('{"version":"1.104.1","build":"r1"}\n')
+        with self.assertRaisesRegex(ValueError, "bundled core pin"):
             self.packages()
 
     def test_rejects_changed_binary(self):

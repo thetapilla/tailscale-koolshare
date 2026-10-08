@@ -6,7 +6,9 @@
 
 需要 Python 3.12 或更新版本、Docker，以及用于前端测试的 Node.js。构建主机支持 amd64 或 arm64；运行另一种目标架构的冒烟测试时，Docker 需提供对应的 QEMU/binfmt 支持。
 
-[VERSION](../VERSION) 是插件版本的来源。[tools/core_recipe.json](../tools/core_recipe.json) 固定初始上游核心及源码校验值、UPX 版本及校验值、容器镜像摘要、功能标签、压缩参数和核心大小上限。
+[VERSION](../VERSION) 指定插件版本；[tools/bundled_core.json](../tools/bundled_core.json) 独立指定安装包预装的核心版本与构建号。预装版本来自已发布并签名的不可变核心 Release，按插件发布需要更新。
+
+[tools/core_recipe.json](../tools/core_recipe.json) 固定核心构建配方，包括基线源码校验值、UPX 版本及校验值、容器镜像摘要、功能标签、压缩参数和核心大小上限。配方中的 `initial_version` 是源码构建的默认基线，不决定插件预装版本。
 
 构建从官方 Tailscale 仓库解析稳定版本标签，锁定具体提交和源码归档 SHA-256。初始版本还必须匹配配方中的固定校验值。核心 Go 版本根据该提交的 `go.mod`、可选 `toolchain` 指令及 `go.toolchain.version` 自动选择，取其中明确要求的最高稳定版本，并从 Go 官方发布元数据获取两种主机架构的下载地址、大小和 SHA-256。构建沿用官方 Go 工具链；上游定制工具链的提交号记录在锁中，便于追溯。声明无法解析或对应正式工具链尚不可用时，流程会停止并保留现有更新源。
 
@@ -22,40 +24,21 @@ Actions 在检查阶段生成或恢复锁，通过 artifact 传给构建阶段�
 
 核心采用 combined 构建，通过两个入口提供 CLI 和 daemon。编译使用 `CGO_ENABLED=0`、`GOOS=linux`、`GOARM=7` 或 `GOARM64=v8.0`，并启用 `-trimpath`、`-buildvcs=false`、`-mod=readonly`、符号裁剪和空 build ID。具体裁剪标签及 UPX 参数以配方为准。压缩后的程序必须通过 UPX 完整性检查及大小限制。
 
-## 构建与验证
+## 构建插件安装包
 
-在仓库根目录运行：
+在仓库根目录依次构建辅助程序、准备预装核心并打包：
 
 ```sh
-python3 tools/build_core.py
 python3 tools/build_helper.py
-python3 tools/smoke_core.py
-python3 tools/test_helper.py
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-node tests/test_ui.js
-python3 tools/test_busybox.py
-```
-
-`build_core.py` 默认构建配方中的初始版本，也可通过 `--version <稳定版本>` 指定官方稳定版本。本地首次构建会解析依赖，并在 `.cache/locks/` 保存该配方的锁；指定 `--lock` 则复用已有输入。核心输出到 `build/cores/<arch>/`，辅助程序输出到 `build/helpers/<arch>/`，主机构建的辅助程序位于 `build/tsks-helper`。辅助程序构建可独立运行，无需先构建核心。
-
-核心源码及工具缓存位于 `.cache/`。Docker 将构建脚本和辅助程序源码挂载为只读，核心源码所在的缓存目录及构建产物目录可写。核心和辅助程序编译使用调用用户的 UID/GID。签名密钥目录不挂入构建容器。
-
-两种架构的冒烟测试在无网络、只读容器中执行，使用临时运行目录。测试范围包括版本探测、userspace daemon 启动、辅助程序读取 LocalAPI、路由及出口偏好和 CLI 检查。固件 TUN、防火墙及真实 Tailnet 流量的验证方法见 [设备与固件验证](TESTING.md#设备与固件验证)。
-
-## 签名与安装包
-
-发布密钥为 Ed25519 私钥，以 128 个十六进制字符保存；提交的 `plugin/release.pub` 是对应公钥。首次建立发布信任根时才生成密钥，重建现有版本需使用与现有公钥匹配的密钥。
-
-验证完成后，在构建主机执行：
-
-```sh
-python3 tools/release_core.py --key .secrets/release.key
+python3 tools/prepare_bundle.py
 python3 tools/package.py
 ```
 
-`release_core.py` 检查两种架构的成功构建记录。新格式元数据必须与依赖锁中的版本、源码、实际 Go 版本和配方一致，再绑定大小和程序哈希生成签名清单。它使用主机辅助程序立即验证两个架构的描述符。`--created-at` 可指定原清单的时间戳，用于重建相同签名封装。该命令生成本地产物，不发布到 GitHub。
+`build_helper.py` 依据辅助程序的独立工具链构建两种 ARM 产物及主机验证程序，分别写入 `build/helpers/<arch>/` 和 `build/tsks-helper`。`prepare_bundle.py` 按 `bundled_core.json` 从对应的 `core-v<VERSION>-<BUILD>` Release 下载原签名清单和两份核心归档，使用 `plugin/release.pub` 验证签名，再校验版本、构建号、文件哈希、大小、归档结构和 ELF 架构。两种架构的源码提交和配方必须一致，全部通过后才替换打包输入。
 
-核心归档及元数据写入 `build/core-release/`。安装包写入仓库相邻的 `../dist/`：
+已下载的不可变核心资源可通过 `prepare_bundle.py --release-dir /path/to/core-release` 导入，该目录需包含 `manifest.json` 和清单所列的两份归档，执行相同校验。核心解包至 `build/cores/<arch>/`，原签名清单及归档保存在 `build/core-release/`。插件打包复用这些已签名资源，无需发布私钥，也不修改原核心发布。
+
+安装包写入仓库相邻的 `../dist/`：
 
 ```text
 tailscale_<VERSION>_universal.tar.gz
@@ -67,7 +50,42 @@ tailscale_<VERSION>_mtk.tar.gz
 SHA256SUMS
 ```
 
-打包先验证签名描述符和 ELF 架构，再在 `build/packages/` 中分别暂存六个包，写入版本与文件校验清单，并规范化归档元数据。通用包与对应平台包的同架构 payload、脚本和资源来自同一组输入。安装脚本的完整文本也必须通过软件中心保护规则检查。
+打包核对预装版本、签名描述符和 ELF 架构，在 `build/packages/` 中分别暂存六个包，写入版本、前端缓存标识和文件校验清单，并规范化归档元数据。通用包与对应平台包的同架构 payload、脚本和资源来自同一组输入。安装脚本的完整文本也必须通过软件中心保护规则检查。
+
+## 构建与验证
+
+辅助程序构建和插件打包完成后，执行以下检查；完整覆盖范围及固件组件测试见 [测试指南](TESTING.md)。
+
+```sh
+python3 tools/test_helper.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+node tests/test_ui.js
+python3 tools/test_busybox.py
+python3 tools/smoke_install.py --lifecycle
+```
+
+两种架构的安装冒烟测试使用正式安装包，在临时容器中检查安装和 userspace 服务生命周期。已签名核心之间的更新与回退通过 `smoke_core_update.py` 验证，输入准备见 [真实核心更新事务](TESTING.md#真实核心更新事务)。这些测试无需加入 Tailnet；固件 TUN、防火墙及真实流量的验证方法见 [设备与固件验证](TESTING.md#设备与固件验证)。
+
+## 构建和签名新核心
+
+需要发布新核心时，先将 `CORE_VERSION` 设置为目标官方稳定版本，再执行：
+
+```sh
+python3 tools/build_core.py --version "$CORE_VERSION"
+python3 tools/build_helper.py
+python3 tools/smoke_core.py
+python3 tools/release_core.py --key .secrets/release.key
+```
+
+`build_core.py` 未指定版本时使用配方中的 `initial_version`。本地首次构建会解析依赖，并在 `.cache/locks/` 保存该配方的锁；指定 `--lock` 则复用已有输入。核心和成功构建记录输出到 `build/cores/<arch>/`，总体元数据写入 `build/core-build.json`。`smoke_core.py` 读取该构建元数据，验证两种架构的真实压缩程序、版本探测、userspace daemon、LocalAPI、路由及出口偏好和 CLI 检查。
+
+源码及工具缓存位于 `.cache/`。Docker 将构建脚本和辅助程序源码挂载为只读，核心源码缓存及产物目录可写。核心和辅助程序编译使用调用用户的 UID/GID。签名密钥目录不挂入构建容器。
+
+发布密钥为 Ed25519 私钥，以 128 个十六进制字符保存；提交的 `plugin/release.pub` 是对应公钥。首次建立发布信任根时才生成密钥，后续核心发布需使用与该公钥匹配的密钥。
+
+`release_core.py` 检查两种架构的成功构建记录。新格式元数据必须与依赖锁中的版本、源码、实际 Go 版本和配方一致，再绑定大小和程序哈希生成签名清单，并使用主机辅助程序验证两个架构的描述符。`--created-at` 可指定原清单的时间戳，用于重建相同签名封装。核心归档、签名清单及元数据写入 `build/core-release/`；该命令生成本地产物，不发布到 GitHub。
+
+完成下述核心发布后，将需要预装的版本与构建号写入 `bundled_core.json`，重新执行插件安装包构建流程。
 
 ## 插件发布
 

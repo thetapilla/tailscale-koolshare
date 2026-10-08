@@ -88,6 +88,7 @@ for pattern in $TSKS_TEST_PATTERNS; do
 done
 '''
     mounts = [
+                    "--mount", f"type=bind,src={ROOT / 'VERSION'},dst=/repo/VERSION,readonly",
                     "--mount", f"type=bind,src={ROOT / 'plugin'},dst=/repo/plugin,readonly",
                     "--mount", f"type=bind,src={ROOT / 'tests'},dst=/repo/tests,readonly",
                     "--mount", f"type=bind,src={ROOT / '.cache'},dst=/cache,readonly",

@@ -20,6 +20,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get('TSKS_TEST_SHELL', '/bin/sh')
+PLUGIN_VERSION = (ROOT / 'VERSION').read_text().strip()
 FIRMWARE_TOOLS = ('awk', 'cat', 'chmod', 'cp', 'dirname', 'find', 'grep', 'ln',
                   'mkdir', 'readlink', 'rm', 'rmdir', 'sed', 'sleep',
                   'sync', 'tr', 'wc', 'which')
@@ -146,7 +147,7 @@ class InstallTests(unittest.TestCase):
                 raise RuntimeError('Test host lacks fixture utility: ' + name)
             (self.utilities / name).symlink_to(target)
         shutil.copytree(ROOT / 'plugin', self.pkg)
-        (self.pkg / 'version').write_text('3.0.0\n')
+        (self.pkg / 'version').write_text(PLUGIN_VERSION + '\n')
         (self.pkg / '.valid').write_text('hnd\nqca\nipq32\nipq64\nmtk\n')
         (self.pkg / 'scripts/tailscale_lib.sh').write_text(LIBRARY)
         command = self.mock / 'mock-command'
@@ -255,7 +256,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.ks / 'bin/tailscale').readlink().as_posix(), '../tailscale/current/tailscale')
         self.assertTrue((self.ks / 'res/tailscale3.js').is_file())
         self.assertFalse(any('arm64' in p.name for p in self.ks.rglob('*')))
-        self.assertEqual(self.read('config.json')['tailscale_version'], '3.0.0')
+        self.assertEqual(self.read('config.json')['tailscale_version'], PLUGIN_VERSION)
         self.assertEqual(self.read('config.json')['tailscale_enable'], '0')
         self.assertIn('start version=\n', (self.mock / 'lifecycle').read_text())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
@@ -275,7 +276,7 @@ class InstallTests(unittest.TestCase):
                 result = self.install()
                 self.assertNotIn('not found', result.stderr)
                 self.assertIn(['elf', str(self.pkg / 'payload/arm/tailscale.combined'), 'arm'], self.calls('tsks-helper'))
-                self.assertEqual(self.read('config.json')['tailscale_version'], '3.0.0')
+                self.assertEqual(self.read('config.json')['tailscale_version'], PLUGIN_VERSION)
 
     def test_odmpid_platform_mapping_selects_arm64_and_matching_valid(self):
         self.write('nvram.json', {'productid': 'RT-AX88U', 'odmpid': 'TX-AX6000'})

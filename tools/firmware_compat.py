@@ -288,6 +288,7 @@ def main():
                 "--read-only", "--tmpfs", "/tmp:rw,exec,nosuid,size=768m",
                 "--tmpfs", "/usr/sbin:rw,exec,nosuid,size=4m",
                 "--mount", f"type=bind,src={image},dst=/firmware-image,readonly",
+                "--mount", f"type=bind,src={ROOT / 'VERSION'},dst=/repo/VERSION,readonly",
                 "--mount", f"type=bind,src={ROOT / 'plugin'},dst=/repo/plugin,readonly",
                 "--mount", f"type=bind,src={ROOT / 'tests'},dst=/repo/tests,readonly",
                 "--mount", f"type=bind,src={ROOT / 'tools/firmware_compat.py'},dst=/repo/tools/firmware_compat.py,readonly",

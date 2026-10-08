@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 from artifact_utils import MAX_BINARY, archive_tree, check_elf, sha256
+from prepare_bundle import bundle_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORMS = {"hnd": "arm", "qca": "arm", "ipq32": "arm", "ipq64": "arm64", "mtk": "arm64"}
@@ -49,10 +50,13 @@ def build_packages(root, out, public_key=None, helper=None):
     if not manifest.is_file():
         raise ValueError("signed core manifest is required")
     descriptors = {}
+    bundled = bundle_identity(root)
     for arch in ("arm", "arm64"):
         binary = root / "build/cores" / arch / "tailscale.combined"
         size, digest = check_elf(binary, arch, MAX_BINARY)
         descriptor = json.loads((binary.parent / "descriptor.json").read_text())
+        if any(descriptor.get(key) != bundled[key] for key in bundled):
+            raise ValueError("core differs from the bundled core pin: " + arch)
         if descriptor["arch"] != arch or descriptor["unpacked_size"] != size or descriptor["binary_sha256"] != digest:
             raise ValueError("binary does not match verified descriptor: " + arch)
         if helper:

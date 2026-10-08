@@ -558,7 +558,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(status["core"], {"installed": "1.102.4", "available": "1.104.0", "can_rollback": False})
         self.assertEqual(status["health_messages"], ['safe "quoted" message\nnext line'])
         self.entry("tailscale_fettle", "123456789012345")
-        self.assertEqual(self.read("reply.json")["plugin_version"], "3.0.0")
+        self.assertEqual(self.read("reply.json")["plugin_version"], (ROOT / "VERSION").read_text().strip())
         statistics = self.base / "sys/class/net/tailscale0/statistics"
         statistics.mkdir(parents=True)
         (statistics / "rx_bytes").write_text("12000000000000")

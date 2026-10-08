@@ -9,7 +9,7 @@ ts_job_begin "$ID" || exit 1
 ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
 ts_status_file "$RUN/diagnostics.json"
 ts_job_log 'Tailscale 诊断摘要'
-for field in version backend_state online monitoring_available health_codes health_messages; do
+for field in version version_long backend_state online monitoring_available health_codes health_messages; do
     value=$(ts_get "$RUN/diagnostics.json" "$field")
     ts_job_log "$field: $value"
 done

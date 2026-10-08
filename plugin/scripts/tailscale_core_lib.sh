@@ -118,8 +118,77 @@ ts_core_space() {
     fi
     [ "${available:-0}" -ge "$required" ] || { ts_job_log '可用存储不足：核心更新需保留 8 MiB 余量，请释放存储空间后重试'; return 1; }
 }
+ts_core_health() {
+    local old_state=$1 old_id=$2 expected actual actual_long source_commit stamp new_state new_id have_key reason tries=0
+    expected=$(ts_get "$DATA/$CORE_NEW/descriptor.json" version) || return 1
+    source_commit=$(ts_get "$DATA/$CORE_NEW/descriptor.json" source_commit) || source_commit=
+    # Startup already waits for LocalAPI. Allow a few additional samples for a
+    # transient socket failure or a node identity still loading from state.
+    while [ "$tries" -lt 5 ]; do
+        reason=api
+        if ts_status_file "$RUN/core-health.json" && [ "$(ts_get "$RUN/core-health.json" ok)" = true ]; then
+            actual=$(ts_get "$RUN/core-health.json" version) || actual=
+            actual_long=$(ts_get "$RUN/core-health.json" version_long) || actual_long=$actual
+            if [ "$actual" != "$expected" ]; then
+                ts_job_log "核心自检失败：版本不匹配（预期 ${expected}，实际 ${actual_long}）"
+                return 1
+            fi
+            # The helper normalizes only tagged release stamps. When available,
+            # retain their source identity check as well as the release number.
+            # Imported legacy cores may have no recorded source commit.
+            case $actual_long in "$actual"-t*)
+                stamp=${actual_long#"$actual"-t}; stamp=${stamp%%-*}
+                if [ "${#stamp}" = 9 ] && [ -n "$source_commit" ] && [ "$source_commit" != null ]; then
+                    case $source_commit in "$stamp"*) ;; *)
+                        ts_job_log '核心自检失败：运行核心的源码版本与发布记录不符'
+                        return 1;;
+                    esac
+                fi;;
+            esac
+            new_state=$(ts_get "$RUN/core-health.json" backend_state) || new_state=
+            new_id=$(ts_get "$RUN/core-health.json" node_id) || new_id=
+            if [ "$old_state" = Running ]; then
+                case $new_state in NeedsLogin|NeedsMachineAuth)
+                    ts_job_log '核心自检失败：已授权设备需要重新登录或批准'
+                    return 1;;
+                esac
+            fi
+            if [ -n "$old_id" ] && [ "$old_id" != null ]; then
+                have_key=$(ts_get "$RUN/core-health.json" have_node_key) || have_key=
+                if [ "$have_key" = false ]; then
+                    ts_job_log '核心自检失败：原有设备密钥不可用'
+                    return 1
+                fi
+                if [ -z "$new_id" ] || [ "$new_id" = null ]; then
+                    reason=identity
+                elif [ "$new_id" != "$old_id" ]; then
+                    ts_job_log '核心自检失败：设备身份发生变化'
+                    return 1
+                else
+                    return 0
+                fi
+            else
+                return 0
+            fi
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 5 ] || sleep 1
+    done
+    case $reason in identity)
+        # Self.ID comes from the control map, which may not have arrived while
+        # offline. A retained node key and a healthy local lifecycle are enough
+        # to commit; network reconnection must not turn into a downgrade loop.
+        case $new_state:$have_key in Starting:true|Running:true)
+            ts_job_log '本机核心检查通过，等待控制面同步设备信息'
+            return 0;;
+        esac
+        ts_job_log '核心自检失败：未能确认原有设备身份';;
+        *) ts_job_log '核心自检失败：本机服务接口持续不可用';;
+    esac
+    return 1
+}
 ts_core_switch() {
-    local old_state old_id new_state new_id identity_ok
+    local old_state old_id identity_ok
     CORE_NEW=$1
     CORE_OLD=$(ts_core_target "$DATA/current") || return 1
     [ "$CORE_NEW" != "$CORE_OLD" ] || return 0
@@ -143,14 +212,12 @@ ts_core_switch() {
     ts_core_journal switched || { ts_core_recover; return 1; }
     if [ "$ENABLE" = 1 ]; then
         identity_ok=1
-        if ! ts_start || ! ts_status_file "$RUN/core-health.json" || [ "$(ts_get "$RUN/core-health.json" ok)" != true ] || \
-            [ "$(ts_get "$RUN/core-health.json" version)" != "$(ts_get "$DATA/$CORE_NEW/descriptor.json" version)" ]; then identity_ok=0; fi
-        new_state=$(ts_get "$RUN/core-health.json" backend_state) || new_state=
-        new_id=$(ts_get "$RUN/core-health.json" node_id) || new_id=
-        if [ "$old_state" = Running ]; then
-            case $new_state in NeedsLogin|NeedsMachineAuth) identity_ok=0;; esac
+        if ! ts_start; then
+            ts_job_log '核心自检失败：新核心启动未完成'
+            identity_ok=0
+        elif ! ts_core_health "$old_state" "$old_id"; then
+            identity_ok=0
         fi
-        if [ -n "$old_id" ] && [ "$old_id" != null ] && [ -n "$new_id" ] && [ "$new_id" != null ] && [ "$new_id" != "$old_id" ]; then identity_ok=0; fi
         if [ "$identity_ok" != 1 ]; then
             if ts_core_recover; then
                 ts_job_write rolled_back rollback '核心切换后的检查未通过，已恢复上一核心'

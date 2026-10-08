@@ -95,7 +95,7 @@ class CoreTests(unittest.TestCase):
         script = backend.MOCK.replace("    if args[0]=='quote':", CORE_COMMANDS.rstrip())
         script = script.replace("elif name=='cru':pass", "elif name=='cru':pass" + EXTRA_COMMANDS)
         script = script.replace("elif args[0]=='version':print('1.102.4')", "elif args[0]=='version':print(Path(args[1]).read_text().splitlines()[0].split(':',1)[1])")
-        script = script.replace("print(json.dumps(value))", "current=Path(os.environ['TSKS_ROOT'])/'tailscale/current';value.update(read('status-by-core.json',{}).get(os.readlink(current),{}));value['version']=json.loads((current/'descriptor.json').read_text())['version'];print(json.dumps(value))")
+        script = script.replace("print(json.dumps(value))", "current=Path(os.environ['TSKS_ROOT'])/'tailscale/current';value.setdefault('version',json.loads((current/'descriptor.json').read_text())['version']);value.update(read('status-by-core.json',{}).get(os.readlink(current),{}));print(json.dumps(value))")
         self.command.write_text(script.replace("#!/usr/bin/env python3", "#!" + sys.executable))
         for name in ("df", "sync", "cp"):
             (self.mock / name).symlink_to(self.command)
@@ -109,7 +109,11 @@ class CoreTests(unittest.TestCase):
         (self.base / "proc/meminfo").write_text("MemAvailable: 100000 kB\nMemFree: 100000 kB\n")
         self.state = self.ks / "configs/tailscale/tailscaled.state"
         self.state.write_text("original-identity-and-current-preferences")
-        self.newdesc = self.descriptor("1.104.0", "r1", "b" * 40)
+        # Omitted versions default to the active core. Explicit fixture values
+        # must reach the self-check unchanged so mismatches can be detected.
+        self.status.pop("version")
+        self.write("status.json", self.status)
+        self.newdesc = self.descriptor("1.104.1", "r1", "9a522a9786c97eb7910c01ccb7bd66557b04c910")
         self.offer(self.newdesc)
 
     @staticmethod
@@ -173,6 +177,103 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.lifecycle(), [f"stop {self.old}", f"start {self.new}"])
         self.assertFalse((self.data / "update.txn").exists())
         self.assertFalse((self.data / "update.state").exists())
+
+    def test_normalized_stamped_release_status_commits_with_full_version_preserved(self):
+        for version_long in ("1.104.1-t9a522a978", "1.104.1-t9a522a978-g123456abc", "1.104.1"):
+            with self.subTest(version_long=version_long):
+                self.write("status-by-core.json", {self.new: {
+                    "version": "1.104.1", "version_long": version_long}})
+                self.shell("ts_lock; ts_job_begin 116; ts_core_update")
+                self.assertEqual(os.readlink(self.data / "current"), self.new)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                self.assertEqual(json.loads((self.run / "core-health.json").read_text())["version_long"], version_long)
+                (self.data / "current").unlink()
+                (self.data / "current").symlink_to(self.old)
+
+    def test_same_release_with_different_running_source_rolls_back(self):
+        for version_long in ("1.104.1-t123456abc", "1.104.1-t123456abc-g9a522a978"):
+            with self.subTest(version_long=version_long):
+                self.write("status-by-core.json", {self.new: {
+                    "version": "1.104.1", "version_long": version_long}})
+                result = self.shell("ts_lock; ts_core_update", check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(os.readlink(self.data / "current"), self.old)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                self.assertIn("运行核心的源码版本与发布记录不符", (self.run / "events.log").read_text())
+
+    def test_legacy_target_without_source_metadata_accepts_matching_release(self):
+        target = self.make_core("1.94.2", "legacy", "e" * 40)
+        descriptor_path = self.data / target / "descriptor.json"
+        descriptor = json.loads(descriptor_path.read_text())
+        descriptor.pop("source_commit")
+        descriptor_path.write_text(json.dumps(descriptor))
+        self.write("status-by-core.json", {target: {
+            "version": "1.94.2", "version_long": "1.94.2-teeeeeeeee"}})
+        self.shell(f"ts_lock; ts_core_switch {target}")
+        self.assertEqual(os.readlink(self.data / "current"), target)
+        self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+
+    def test_actual_version_mismatch_and_nonrelease_versions_roll_back(self):
+        for version in ("1.104.10", "1.102.4", "1.104.1evil", "1.104.1-rc1",
+                        "1.104.1-dev20261008-t9a522a978", "1.104.1-t9a522a978-dirty"):
+            with self.subTest(version=version):
+                self.write("status-by-core.json", {self.new: {"version": version}})
+                result = self.shell("ts_lock; ts_job_begin 117; ts_core_update", check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(os.readlink(self.data / "current"), self.old)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                self.assertIn("版本不匹配", (self.run / "events.log").read_text())
+
+    def test_transient_api_failure_or_loading_identity_is_resampled(self):
+        for transient in (None, dict(self.status, ok=False), dict(self.status, node_id="", backend_state="Starting")):
+            with self.subTest(transient=transient):
+                self.write("status-queue.json", [self.status, transient, self.status])
+                self.shell("ts_lock; ts_core_update")
+                self.assertEqual(os.readlink(self.data / "current"), self.new)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                (self.data / "current").unlink()
+                (self.data / "current").symlink_to(self.old)
+
+    def test_missing_identity_and_unknown_key_rolls_back_after_bounded_wait(self):
+        self.write("status-by-core.json", {self.new: {"node_id": "", "have_node_key": None}})
+        result = self.shell("ts_lock; ts_core_update", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(os.readlink(self.data / "current"), self.old)
+        self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+        self.assertIn("未能确认原有设备身份", (self.run / "events.log").read_text())
+
+    def test_explicit_node_key_loss_rolls_back(self):
+        self.write("status-by-core.json", {self.new: {"node_id": "", "have_node_key": False,
+                                                     "backend_state": "Starting"}})
+        result = self.shell("ts_lock; ts_core_update", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(os.readlink(self.data / "current"), self.old)
+        self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+        self.assertIn("原有设备密钥不可用", (self.run / "events.log").read_text())
+
+    def test_control_plane_offline_without_self_keeps_healthy_core_and_node_key(self):
+        for state in ("Starting", "Running"):
+            with self.subTest(state=state):
+                self.write("status-by-core.json", {self.new: {"node_id": "", "backend_state": state,
+                    "have_node_key": True, "online": False, "health_codes": ["mapresponse-timeout"]}})
+                self.shell("ts_lock; ts_core_update")
+                self.assertEqual(os.readlink(self.data / "current"), self.new)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                self.assertIn("等待控制面同步设备信息", (self.run / "events.log").read_text())
+                (self.data / "current").unlink()
+                (self.data / "current").symlink_to(self.old)
+
+    def test_persistently_unavailable_api_rolls_back_with_distinct_reason(self):
+        self.write("status-by-core.json", {self.new: {"ok": False}})
+        result = self.shell("ts_lock; ts_core_update", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(os.readlink(self.data / "current"), self.old)
+        self.assertIn("本机服务接口持续不可用", (self.run / "events.log").read_text())
+
+    def test_control_plane_offline_does_not_roll_back_healthy_local_core(self):
+        self.write("status-by-core.json", {self.new: {"online": False, "health_codes": ["mapresponse-timeout"]}})
+        self.shell("ts_lock; ts_core_update")
+        self.assertEqual(os.readlink(self.data / "current"), self.new)
 
     def test_core_verification_uses_helper_without_firmware_hash_applet(self):
         self.assertNotEqual(self.shell("which sha256sum", check=False).returncode, 0)
@@ -256,6 +357,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.lifecycle(), [f"stop {self.old}", f"start {self.new}", f"stop {self.new}", f"start {self.old}"])
         job = json.loads((self.web / "tailscale3_104.json").read_text())
         self.assertEqual(job["state"], "rolled_back")
+        self.assertIn("新核心启动未完成", (self.run / "events.log").read_text())
         self.assertFalse((self.data / "update.txn").exists())
 
     def test_changed_node_identity_rolls_back_before_commit(self):
@@ -265,14 +367,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.data / "current"), self.old)
         self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
         self.assertEqual(json.loads((self.web / "tailscale3_114.json").read_text())["state"], "rolled_back")
+        self.assertIn("设备身份发生变化", (self.run / "events.log").read_text())
 
     def test_unexpected_reauthentication_rolls_back_before_commit(self):
-        self.write("status-by-core.json", {self.new: {"backend_state": "NeedsLogin", "have_node_key": False}})
-        result = self.shell("ts_lock; ts_job_begin 115; ts_core_update", check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(os.readlink(self.data / "current"), self.old)
-        self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
-        self.assertEqual(json.loads((self.web / "tailscale3_115.json").read_text())["state"], "rolled_back")
+        for state in ("NeedsLogin", "NeedsMachineAuth"):
+            with self.subTest(state=state):
+                self.write("status-by-core.json", {self.new: {"backend_state": state, "have_node_key": False}})
+                result = self.shell("ts_lock; ts_job_begin 115; ts_core_update", check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(os.readlink(self.data / "current"), self.old)
+                self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+                self.assertEqual(json.loads((self.web / "tailscale3_115.json").read_text())["state"], "rolled_back")
+                self.assertIn("已授权设备需要重新登录或批准", (self.run / "events.log").read_text())
 
     def test_atomic_pointer_failure_recovers_without_state_loss(self):
         self.write("fault.json", "switch-link")

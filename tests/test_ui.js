@@ -188,8 +188,12 @@ test('busy rejection releases controls and preserves draft settings', () => {
     assert.equal(h.storage.tailscale3_pending, undefined);
 });
 
-test('switch submits config once and rapid apply cannot start another operation', () => {
+test('switch only edits the draft; Apply submits once and locks concurrent changes', () => {
     const h = harness(); h.boot(); h.change('tailscale_enable', false);
+    assert.equal(h.requests.length, 0);
+    assert.match(h.nodes.settings_notice.textContent, /尚未应用/);
+    h.click('apply_settings');
+    assert.equal(h.nodes.settings_notice.textContent, '正在提交设置…');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
     assert.deepEqual(write.body.params, ['web_submit', '0110001']);
@@ -414,4 +418,146 @@ test('rejected settings explain the next step and keep machine phases out of use
     h.finishJob(h.next('tailscale_job'), 'failed', { message: '', phase: 'internal_phase' });
     assert.match(h.nodes.job_message.textContent, /操作日志/);
     assert.doesNotMatch(h.nodes.job_message.textContent, /internal_phase/);
+});
+
+// Advance ordinary polling while retaining deterministic control of the endpoint
+// under test. Every write is still explicitly accepted by the test itself.
+function reach(h, method) {
+    for (let attempts = 0; attempts < 40; attempts++) {
+        if (!h.requests.length) { h.advance(500); continue; }
+        const request = h.next();
+        if ((request.body && request.body.method === method) || request.settings.url === method) { return request; }
+        if (!request.body && request.settings.url.startsWith('/_temp/')) { request.finish(null, 'working'); }
+        else if (request.body && request.body.method === 'tailscale_job') { h.finishJob(request, 'running', { phase: 'accepted' }); }
+        else if (request.body && request.body.method === 'tailscale_fettle') { h.reply(request, h.status()); }
+        else if (request.body && request.body.method === 'tailscale_tsnets') { h.reply(request, { interfaces: [] }); }
+        else { assert.fail('Unexpected request while awaiting ' + method + ': ' + request.settings.url); }
+    }
+    assert.fail('Timed out awaiting ' + method);
+}
+function stoppedBoot(h) {
+    h.app.init(); h.reply(h.next(), [{ tailscale_enable: '0', tailscale_ipv4_enable: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ enabled: false, backend_state: 'Unavailable', online: null, error: 'local_api_unavailable' }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+}
+const unavailable = { enabled: true, backend_state: 'Unavailable', online: null, monitoring_available: false, error: 'local_api_unavailable' };
+
+test('all draft options including enable are applied in one snapshot and reverting edits clears the notice', () => {
+    const h = harness(); h.boot(); h.change('tailscale_enable', false);
+    h.change('tailscale_enable', true);
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    h.change('tailscale_enable', false); h.change('tailscale_exit_node', true);
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
+    assert.equal(h.nodes.daemon_state.textContent, '运行中');
+    h.click('apply_settings');
+    const write = h.next('tailscale_config');
+    assert.deepEqual(write.body.params, ['web_submit', '0110011']);
+    h.accept(write);
+    assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
+    assert.equal(h.nodes.daemon_state.textContent, '正在停止…');
+});
+
+test('accepted configuration transitions show lifecycle progress and failed applies restore the draft', () => {
+    for (const intent of ['start', 'stop', 'apply']) {
+        const h = harness();
+        if (intent === 'start') { stoppedBoot(h); h.change('tailscale_enable', true); }
+        else { h.boot(); if (intent === 'stop') { h.change('tailscale_enable', false); } else { h.change('tailscale_exit_node', true); } }
+        h.click('apply_settings'); h.accept(h.next('tailscale_config'));
+        h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+        assert.equal(h.nodes.connection_notice.textContent, '', intent);
+        assert.equal(h.nodes.daemon_state.textContent, { start: '正在启动…', stop: '正在停止…', apply: '正在应用设置…' }[intent]);
+        assert.equal(h.nodes.tailnet_state.textContent, '等待操作完成');
+        assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
+        h.finishJob(reach(h, 'tailscale_job'), 'failed');
+        assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+        const config = reach(h, '/_api/tailscale_');
+        assert.equal(config.settings.url, '/_api/tailscale_');
+        h.reply(config, [{ tailscale_enable: intent === 'start' ? '0' : '1' }]);
+        assert.equal(h.nodes.tailscale_enable.checked, intent !== 'stop');
+        assert.match(h.nodes.settings_notice.textContent, /尚未应用/);
+    }
+});
+
+test('completed lifecycle waits for a fresh status and does not hide a continuing LocalAPI failure', () => {
+    const h = harness(); stoppedBoot(h); h.change('tailscale_enable', true); h.click('apply_settings'); h.accept(h.next('tailscale_config'));
+    h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+    h.finishJob(reach(h, 'tailscale_job'), 'success');
+    assert.equal(h.nodes.connection_notice.textContent, '');
+    assert.equal(h.nodes.daemon_state.textContent, '正在刷新状态…');
+    h.reply(reach(h, '/_api/tailscale_'), [{ tailscale_enable: '1' }]);
+    h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+    assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    assert.equal(h.nodes.daemon_state.textContent, '暂时无法读取');
+});
+
+test('lifecycle progress does not hide HTTP or invalid configuration errors', () => {
+    const h = harness(); stoppedBoot(h); h.change('tailscale_enable', true); h.click('apply_settings'); h.accept(h.next('tailscale_config'));
+    reach(h, 'tailscale_fettle').finish('timeout');
+    assert.match(h.nodes.connection_notice.textContent, /读取状态超时/);
+    h.finishJob(reach(h, 'tailscale_job'), 'running');
+    assert.match(h.nodes.connection_notice.textContent, /读取状态超时/);
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ ...unavailable, error: 'invalid_configuration' }));
+    assert.match(h.nodes.connection_notice.textContent, /已保存的设置无效/);
+    assert.equal(h.nodes.daemon_state.textContent, '正在启动…');
+});
+
+test('diagnostics, update checks and downloads retain LocalAPI warnings; only core switching suppresses them', () => {
+    for (const button of ['run_diagnostics', 'core_check', 'core_update', 'core_rollback']) {
+        const h = harness(); h.boot(); h.click(button); h.accept(h.next());
+        h.finishJob(h.next('tailscale_job'), 'running', { phase: 'downloading' });
+        h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+        assert.match(h.nodes.connection_notice.textContent, /诊断摘要/, button);
+        h.finishJob(reach(h, 'tailscale_job'), 'running', { phase: 'switching' });
+        if (/^core_(update|rollback)$/.test(button)) {
+            assert.equal(h.nodes.connection_notice.textContent, '');
+            assert.equal(h.nodes.daemon_state.textContent, '正在切换核心…');
+        } else { assert.match(h.nodes.connection_notice.textContent, /诊断摘要/, button); }
+        h.finishJob(reach(h, 'tailscale_job'), 'rolled_back');
+        assert.match(h.nodes.connection_notice.textContent, /诊断摘要/, button);
+    }
+});
+
+test('reload recovers task intent and preserves a rejected draft even if intermediate settings matched it', () => {
+    const first = harness(); stoppedBoot(first); first.change('tailscale_enable', true); first.click('apply_settings'); first.accept(first.next('tailscale_config'));
+    const saved = JSON.parse(first.storage.tailscale3_pending);
+    assert.equal(saved.method, 'tailscale_config');
+    assert.equal(saved.intent, 'start');
+    assert.equal(saved.targetEnabled, true);
+    const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'running');
+    h.next().finish(null, 'starting');
+    h.reply(h.next(), [{ tailscale_enable: '1', tailscale_ipv4_enable: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status(unavailable));
+    assert.equal(h.nodes.daemon_state.textContent, '正在启动…');
+    assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+    h.finishJob(reach(h, 'tailscale_job'), 'failed');
+    h.reply(reach(h, '/_api/tailscale_'), [{ tailscale_enable: '0', tailscale_ipv4_enable: '1' }]);
+    assert.equal(h.nodes.tailscale_enable.checked, true);
+    assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
+});
+
+test('a queued Apply retains its lifecycle intent when an earlier status response arrives late', () => {
+    const h = harness(); stoppedBoot(h); h.advance(5000); const stale = h.next('tailscale_fettle');
+    h.change('tailscale_enable', true); h.click('apply_settings');
+    assert.equal(h.nodes.settings_notice.textContent, '正在提交设置…');
+    h.reply(stale, h.status(unavailable));
+    assert.equal(h.nodes.daemon_state.textContent, '正在启动…');
+    assert.equal(h.nodes.connection_notice.textContent, '');
+    h.reply(h.next('tailscale_config'), { accepted: false, error: 'busy' });
+    assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+    assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+});
+
+test('unconfirmed or expired jobs cannot continue suppressing service errors', () => {
+    const h = harness(); stoppedBoot(h); h.change('tailscale_enable', true); h.click('apply_settings'); h.accept(h.next('tailscale_config'));
+    h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+    const held = reach(h, 'tailscale_job'); h.advance(15 * 60 * 1000); held.finish('timeout'); h.advance();
+    assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+    assert.equal(h.nodes.settings_notice.textContent, '设置结果尚未确认');
+    h.click('job_resume');
+    assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
+    assert.equal(h.nodes.settings_notice.textContent, '正在确认设置结果…');
 });

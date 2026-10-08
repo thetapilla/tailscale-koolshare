@@ -608,7 +608,7 @@ ts_watchdog_run() {
 
 ts_status_json() {
     local file="$RUN/status-query.$$" backend=Unavailable online=null codes='[]' messages='[]'
-    local auth= monitoring=false version= installed= available= rollback=false error= now statusok=false
+    local auth= monitoring=false version= version_long= installed= available= rollback=false error= now statusok=false
     ts_config_read || { ENABLE=0; WATCHDOG=0; error=invalid_configuration; }
     if ts_status_file "$file"; then
         statusok=$(ts_get "$file" ok)
@@ -620,6 +620,7 @@ ts_status_json() {
         auth=$(ts_get "$file" auth_url)
         monitoring=$(ts_get "$file" monitoring_available)
         version=$(ts_get "$file" version)
+        version_long=$(ts_get "$file" version_long) || version_long=
     else error=local_api_unavailable; fi
     rm -f "$file"
     case $online in true|false|null) ;; *) online=null;; esac
@@ -633,8 +634,9 @@ ts_status_json() {
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.0.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"available":%s,"can_rollback":%s}' \
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.0.1","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"available":%s,"can_rollback":%s}' \
         "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$available")" "$rollback"
+    printf ',"core_version_long":%s' "$(ts_quote "$version_long")"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
     printf '}\n'
 }

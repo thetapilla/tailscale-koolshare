@@ -15,7 +15,7 @@
     var configReady = false, dirty = false, busy = false, pending = null, submitted = null, job = null, logTarget = null;
     var configDue = 0, statusDue = 0, interfacesDue = 0, jobDue = 0, logDue = 0;
     var canUpdate = false, canRollback = false, statusGood = false, lastStatus = null;
-    var configNotice = '', statusNotice = '';
+    var configNotice = '', statusNotice = '', statusReadNotice = '', baseline = '', refreshingStatus = false;
     var jobStarted = 0, jobPaused = false, JOB_WINDOW = 15 * 60 * 1000;
 
     function node(id) { return doc.getElementById(id); }
@@ -74,14 +74,36 @@
         };
         return labels[code] || (code ? '操作返回错误：' + code + '。请查看操作日志。' : '请查看操作日志，确认详情后重试。');
     }
+    function snapshot() {
+        return keys.map(function (key) { return node(key).checked ? '1' : '0'; }).join('');
+    }
+    function restoreDraft(task) {
+        if (task.method !== 'tailscale_config' || typeof task.draft !== 'string' || !/^[01]{7}$/.test(task.draft)) { return; }
+        keys.forEach(function (key, index) { node(key).checked = task.draft.charAt(index) === '1'; });
+        dirty = true;
+    }
+    function activeTask() { return pending || submitted || job; }
+    function transition() {
+        var task = activeTask();
+        if (!task || jobPaused || clock() - task.startedAt >= JOB_WINDOW || (task === job && !job.confirmed)) { return ''; }
+        if (task.method === 'tailscale_config') {
+            return task.intent === 'start' ? '正在启动…' : task.intent === 'stop' ? '正在停止…' : '正在应用设置…';
+        }
+        if (task.method === 'tailscale_core' && /^(update|rollback)$/.test(task.intent) && task.phase === 'switching') {
+            return '正在切换核心…';
+        }
+        return '';
+    }
+    function refreshStatus() { if (lastStatus) { renderStatus(lastStatus); } }
     function controls() {
-        var locked = busy || !configReady, i;
+        var locked = busy || !configReady, task = activeTask(), settingTask = task && task.method === 'tailscale_config', i;
         for (i = 0; i < keys.length; i++) { if (node(keys[i])) { node(keys[i]).disabled = locked; } }
         for (i = 0; i < buttons.length; i++) { if (node(buttons[i])) { node(buttons[i]).disabled = locked; } }
         if (node('core_update')) { node('core_update').disabled = locked || !statusGood || !canUpdate; }
         if (node('core_rollback')) { node('core_rollback').disabled = locked || !statusGood || !canRollback; }
         visible('job_resume', jobPaused);
-        text('settings_notice', !configReady ? (configNotice ? '读取设置失败，正在重试…' : '正在读取设置…') : dirty ? '设置尚未应用' : '');
+        text('settings_notice', settingTask ? (jobPaused ? '设置结果尚未确认' : pending || submitted ? '正在提交设置…' : job.confirmed ? '正在应用设置…' : '正在确认设置结果…') :
+            !configReady ? (configNotice ? '读取设置失败，正在重试…' : '正在读取设置…') : dirty ? '设置尚未应用' : '');
     }
     function schedule(delay) {
         if (stopped || !started) { return; }
@@ -126,6 +148,8 @@
                     if (node(keys[i])) { node(keys[i]).checked = data[keys[i]] === '1' || data[keys[i]] === 1 || data[keys[i]] === true; }
                 }
             }
+            baseline = keys.map(function (key) { return data[key] === '1' || data[key] === 1 || data[key] === true ? '1' : '0'; }).join('');
+            dirty = snapshot() !== baseline;
             configReady = true;
             configDue = Infinity;
             configNotice = '';
@@ -134,25 +158,23 @@
         });
     }
     function renderStatus(data) {
-        var core = data.core || {}, watchdog = data.watchdog || {};
+        var core = data.core || {}, watchdog = data.watchdog || {}, changing = transition();
         var labels = { Running: '运行中', NeedsLogin: '等待登录，请登录并授权', NeedsMachineAuth: '等待设备授权，请在管理控制台批准', Stopped: '已停止', Starting: '启动中', NoState: '尚未就绪', InUseOtherUser: '被其他用户占用', Unavailable: '暂时无法读取' };
         var health = Array.isArray(data.health_messages) ? data.health_messages.filter(function (item) { return typeof item === 'string'; }).slice(0, 12).join('\n') : '';
         var auth = safeAuth(data.auth_url), link = node('auth_link');
-        lastStatus = data;
-        statusGood = true;
         canUpdate = !!plain(core.available);
         canRollback = core.can_rollback === true;
         text('plugin_version', plain(data.plugin_version) || '版本未知');
         text('core_current', plain(data.core_version) || plain(core.installed) || '版本不可用');
         text('core_latest', plain(core.available) || '暂无检查结果');
-        text('daemon_state', data.enabled === false ? '未启用' : labels[data.backend_state] || '状态未知（' + plain(data.backend_state) + '）');
-        text('tailnet_state', data.online === true ? '已连接' : data.online === false ? '未连接' : '暂不可用');
-        text('monitoring_state', data.monitoring_available === true ? '可用' : '暂不可用');
+        text('daemon_state', changing || (refreshingStatus ? '正在刷新状态…' : data.enabled === false ? '未启用' : labels[data.backend_state] || '状态未知（' + plain(data.backend_state) + '）'));
+        text('tailnet_state', changing ? '等待操作完成' : refreshingStatus ? '正在刷新状态…' : data.online === true ? '已连接' : data.online === false ? '未连接' : '暂不可用');
+        text('monitoring_state', changing ? '等待操作完成' : refreshingStatus ? '正在刷新状态…' : data.monitoring_available === true ? '可用' : '暂不可用');
         text('watchdog_state', (watchdog.enabled === true ? '已启用' : '已关闭') + ' · 24 小时内尝试恢复 ' + (Number(watchdog.count_24h) >= 0 ? Math.floor(Number(watchdog.count_24h)) : 0) + ' 次');
         text('watchdog_recovery', recoveryTime(watchdog.last_recovery));
         text('health_messages', health);
         visible('health_row', !!health);
-        statusNotice = data.error && !(data.enabled === false && data.error === 'local_api_unavailable') ? errorMessage(data.error) : '';
+        statusNotice = statusReadNotice || (data.error && !(data.error === 'local_api_unavailable' && (data.enabled === false || changing || refreshingStatus)) ? errorMessage(data.error) : '');
         connectionNotice();
         if (link) {
             if (auth) { link.setAttribute('href', auth); }
@@ -167,9 +189,12 @@
             if (error || !data || data.schema !== 1 || typeof data.backend_state !== 'string') {
                 statusGood = false;
                 statusDue = clock() + 5000;
-                statusNotice = readError(error, response, '状态');
+                refreshingStatus = false;
+                statusReadNotice = readError(error, response, '状态');
+                statusNotice = statusReadNotice;
                 connectionNotice();
-                if (!lastStatus) {
+                if (lastStatus) { refreshStatus(); }
+                else {
                     ['plugin_version', 'core_current', 'daemon_state', 'tailnet_state', 'monitoring_state', 'watchdog_recovery'].forEach(function (field) {
                         text(field, '暂时无法读取');
                     });
@@ -179,6 +204,10 @@
                 controls();
                 return;
             }
+            lastStatus = data;
+            statusGood = true;
+            statusReadNotice = '';
+            refreshingStatus = false;
             renderStatus(data);
             statusDue = clock() + 5000;
         });
@@ -207,8 +236,11 @@
         });
     }
     function beginJob(action, uncertain) {
-        job = { id: action.id, title: action.title, reloadConfig: action.reloadConfig === true || action.method === 'tailscale_config' };
-        jobStarted = clock();
+        job = { id: action.id, title: action.title, method: action.method, intent: action.intent, targetEnabled: action.targetEnabled,
+            draft: action.draft, phase: action.phase || 'accepted', confirmed: !uncertain,
+            startedAt: typeof action.startedAt === 'number' && action.startedAt <= clock() ? action.startedAt : clock(),
+            reloadConfig: action.reloadConfig === true || action.method === 'tailscale_config' };
+        jobStarted = job.startedAt;
         jobPaused = false;
         jobDue = 0;
         logTarget = null;
@@ -219,12 +251,13 @@
         text('job_state', uncertain ? '正在确认操作是否已接收…' : '已接收，正在处理…');
         text('job_message', uncertain ? '连接暂时中断。正在查询同一任务，请勿重复提交。' : '');
         visible('task_panel', true);
+        refreshStatus();
         controls();
     }
     function submit(action) {
         pending = null;
         submitted = action;
-        savePending({ id: action.id, title: action.title, reloadConfig: action.method === 'tailscale_config' });
+        savePending(action);
         rpc(action.method, action.params, action.fields, action.id, function (error, response) {
             var result = unpack(response);
             submitted = null;
@@ -233,6 +266,7 @@
                 busy = false;
                 text('job_state', result.error === 'busy' ? '有其他操作正在进行，请稍后重试。' : '操作未被接收');
                 text('job_message', result.error === 'busy' ? '' : errorMessage(result.error));
+                refreshStatus();
                 controls();
                 return;
             }
@@ -252,7 +286,7 @@
             if (!error && data && data.schema === 1 && String(data.id) === expected && data.state === 'unknown' && data.operation_busy === false) {
                 // The backend checked the operation lock and rechecked the job
                 // record. Release tracking, without claiming a task result.
-                if (job.reloadConfig) { dirty = false; }
+                restoreDraft(job);
                 job = null;
                 busy = false;
                 jobPaused = false;
@@ -265,6 +299,7 @@
                 interfacesDue = 0;
                 text('job_state', '任务结果无法确认');
                 text('job_message', '未找到任务记录。当前没有操作正在运行，请核对设置和状态后按需重试。');
+                refreshStatus();
                 controls();
                 return;
             }
@@ -275,11 +310,15 @@
             }
             text('job_message', plain(data.message) || (data.state === 'failed' ? '请查看操作日志了解原因。' : ''));
             terminal = data.state !== 'running';
+            job.phase = plain(data.phase);
+            job.confirmed = true;
+            savePending(job);
             text('job_state', { running: '正在处理…', success: '操作完成', failed: '操作失败', rolled_back: '核心切换未完成，已恢复上一核心' }[data.state]);
             if (logTarget !== expected) { logDue = 0; }
             logTarget = expected;
             if (terminal) {
-                if (job.reloadConfig) { configDue = 0; configReady = false; dirty = false; }
+                if (job.reloadConfig) { configDue = 0; configReady = false; if (data.state === 'success') { dirty = false; } else { restoreDraft(job); } }
+                refreshingStatus = data.state === 'success' && (job.method === 'tailscale_config' || (job.method === 'tailscale_core' && /^(update|rollback)$/.test(job.intent)));
                 busy = false;
                 job = null;
                 jobPaused = false;
@@ -287,8 +326,9 @@
                 logDue = 0;
                 statusDue = 0;
                 interfacesDue = 0;
-                controls();
             }
+            refreshStatus();
+            controls();
         });
     }
     function readLog() {
@@ -314,6 +354,7 @@
         if (job && !jobPaused && now - jobStarted >= JOB_WINDOW) {
             jobPaused = true;
             text('job_message', '操作耗时较长，暂未确认结果。可继续查询任务进度。');
+            refreshStatus();
             controls();
         }
         // Select the oldest due read so a slow, failing endpoint cannot starve
@@ -329,7 +370,12 @@
     function action(method, params, title, fields) {
         if (busy || !configReady || stopped) { return false; }
         busy = true;
-        pending = { id: id(), method: method, params: params, title: title, fields: fields || {} };
+        pending = { id: id(), method: method, params: params, title: title, fields: fields || {}, startedAt: clock(), phase: 'queued' };
+        if (method === 'tailscale_config') {
+            pending.draft = params[1];
+            pending.targetEnabled = params[1].charAt(0) === '1';
+            pending.intent = baseline.charAt(0) === params[1].charAt(0) ? 'apply' : pending.targetEnabled ? 'start' : 'stop';
+        } else if (method === 'tailscale_core') { pending.intent = params[0]; }
         logTarget = null;
         logDue = Infinity;
         text('task_log', '');
@@ -341,16 +387,17 @@
         text('log_notice', '');
         visible('log_retry', false);
         visible('task_panel', true);
+        refreshStatus();
         controls();
         schedule(0);
         return true;
     }
     function apply() {
-        var bits = '', i;
+        var bits;
         if (busy || !configReady) { return false; }
         // httpdb writes fields before dispatch. Keep the snapshot in params so
         // only the locked backend operation can change persisted settings.
-        for (i = 0; i < keys.length; i++) { bits += node(keys[i]).checked ? '1' : '0'; }
+        bits = snapshot();
         return action('tailscale_config', ['web_submit', bits], '应用设置', {});
     }
     function bind(id, event, callback) { if (node(id)) { $(node(id)).on(event, callback); } }
@@ -362,9 +409,8 @@
         keys.forEach(function (key) {
             bind(key, 'change', function () {
                 if (busy || !configReady) { return; }
-                dirty = true;
+                dirty = snapshot() !== baseline;
                 controls();
-                if (key === 'tailscale_enable') { apply(); }
             });
         });
         bind('apply_settings', 'click', apply);
@@ -378,10 +424,19 @@
         bind('run_status', 'click', function () { action('tailscale_status', [], '连接详情'); });
         bind('run_netcheck', 'click', function () { action('tailscale_ncheck', [], '网络检查'); });
         bind('run_diagnostics', 'click', function () { action('tailscale_diagnostics', [], '生成诊断摘要'); });
-        bind('job_resume', 'click', function () { if (job) { jobPaused = false; jobStarted = clock(); jobDue = 0; controls(); schedule(0); } });
+        bind('job_resume', 'click', function () { if (job) { jobPaused = false; jobStarted = clock(); job.startedAt = jobStarted; job.confirmed = false; job.phase = 'confirming'; jobDue = 0; savePending(job); refreshStatus(); controls(); schedule(0); } });
         bind('log_retry', 'click', function () { if (logTarget) { logDue = 0; visible('log_retry', false); schedule(0); } });
         try { saved = storage && JSON.parse(storage.getItem('tailscale3_pending')); } catch (ignored) { saved = null; }
-        if (saved && validId(saved.id)) { lastId = Math.max(lastId, Number(saved.id)); busy = true; beginJob({ id: String(saved.id), title: plain(saved.title) || '上次操作', reloadConfig: saved.reloadConfig === true }, true); }
+        if (saved && validId(saved.id)) {
+            lastId = Math.max(lastId, Number(saved.id));
+            busy = true;
+            if (saved.method === 'tailscale_config' && typeof saved.draft === 'string' && /^[01]{7}$/.test(saved.draft)) {
+                restoreDraft(saved);
+            }
+            beginJob({ id: String(saved.id), title: plain(saved.title) || '上次操作', method: plain(saved.method),
+                intent: plain(saved.intent), targetEnabled: saved.targetEnabled === true, draft: saved.draft,
+                phase: 'confirming', startedAt: saved.startedAt, reloadConfig: saved.reloadConfig === true }, true);
+        }
         controls();
         schedule(0);
     }

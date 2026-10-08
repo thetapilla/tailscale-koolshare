@@ -240,7 +240,7 @@ sys.exit(7)
                 raise RuntimeError("firmware database socket did not become ready")
             for key, value in {"tailscale_enable": "1", "tailscale_watchdog_enable": "1", "tailscale_ipv4_enable": "1",
                                "tailscale_ipv6_enable": "1", "tailscale_advertise_routes": "1", "tailscale_accept_routes": "1",
-                               "tailscale_exit_node": "0", "tailscale_version": "3.0.0"}.items():
+                               "tailscale_exit_node": "0", "tailscale_version": os.environ["TSKS_TEST_PLUGIN_VERSION"]}.items():
                 subprocess.run(["/koolshare/bin/dbus", "set", key + "=" + value], check=True, timeout=5, stdout=subprocess.DEVNULL)
 
     def request_http(path, body=None):
@@ -432,7 +432,7 @@ def main():
         if not (helper / "tsks-helper").is_file():
             helper = ROOT / "build/helpers" / arch
         command = ["docker", "run", "--rm", "--name", name, "--label", "tsks.httpdb_fixture=true", "--cap-drop=ALL", "--security-opt=no-new-privileges"]
-        command += ["--network=none"]
+        command += ["--network=none", "-e", "TSKS_TEST_PLUGIN_VERSION=" + (ROOT / "VERSION").read_text().strip()]
         for source, destination in ((firmware, "/firmware"), (plugin, "/plugin"), (ROOT / "tests", "/tests"),
                                     (ROOT / "tools", "/tools"), (helper, "/helper")):
             command += ["--mount", f"type=bind,src={source},dst={destination},readonly"]

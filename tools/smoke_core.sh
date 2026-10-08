@@ -34,6 +34,9 @@ grep -q '"Version": "'"$EXPECTED" /tmp/tsks-smoke/status.json
 /helper/tsks-helper status "$SOCKET" > /tmp/tsks-smoke/helper-status.json
 grep -q '"ok":true' /tmp/tsks-smoke/helper-status.json
 grep -q '"backend_state":"NeedsLogin"' /tmp/tsks-smoke/helper-status.json
+test "$(/helper/tsks-helper json-get /tmp/tsks-smoke/helper-status.json version)" = "$EXPECTED"
+test "$(/helper/tsks-helper json-get /tmp/tsks-smoke/helper-status.json version_long)" = \
+    "$(/helper/tsks-helper json-get /tmp/tsks-smoke/status.json Version)"
 "$CLI" --socket="$SOCKET" set --accept-routes=true --advertise-routes=192.0.2.0/24 --advertise-exit-node=true
 kill -0 "$PID"
 printf 'PASS: CLI, daemon, packed helper, LocalAPI, route flags, exit-node flags, netcheck CLI: %s\n' "$EXPECTED"

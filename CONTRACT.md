@@ -1,6 +1,6 @@
 # 架构与接口约定
 
-本文面向维护后台、前端、构建工具或第三方集成的开发者。用户操作见 [使用指南](docs/USER-GUIDE.md)，发布流程见 [构建与发布](docs/BUILD.md)。插件版本以 [VERSION](VERSION) 为准，核心和工具链的固定输入以 [构建配方](tools/core_recipe.json) 为准。
+本文面向维护后台、前端、构建工具或第三方集成的开发者。用户操作见 [使用指南](docs/USER-GUIDE.md)，发布流程见 [构建与发布](docs/BUILD.md)。插件版本以 [VERSION](VERSION) 为准，预装核心版本以 [预装核心配置](tools/bundled_core.json) 为准，核心编译选项见 [构建配方](tools/core_recipe.json)，精确源码和工具链见对应核心发布的依赖锁。
 
 ## 组件与运行环境
 
@@ -69,13 +69,15 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 查不到任务时，查询接口返回 `state: "unknown"`。后台尝试取得操作锁，并在锁内重新查询记录；确认任务仍不存在且没有正在执行的操作后，才返回 `operation_busy: false`。客户端核对任务 ID 后结束失效记录的跟踪，重新读取设置和状态；不把任务缺失判定为成功，也不自动重发变更。`operation_busy` 为 `true` 或缺失时继续跟踪。日志作为独立文本显示，不作为成功或失败的判据。
 
-状态接口返回 `schema`、`enabled`、`plugin_version`、`core_version`、`backend_state`、`online`、`health_codes`、`health_messages`、`auth_url`、`monitoring_available`，以及 `watchdog` 和 `core` 对象。`online` 可以是布尔值或 `null`。`watchdog` 包含 `enabled`、`last_recovery`、`count_24h`；恢复记录表示尝试次数。`core` 包含 `installed`、`available`、`can_rollback`。状态读取异常时可附带 `error`。
+状态接口返回 `schema`、`enabled`、`plugin_version`、`core_version`、`core_version_long`、`backend_state`、`online`、`health_codes`、`health_messages`、`auth_url`、`monitoring_available`，以及 `watchdog` 和 `core` 对象。`online` 可以是布尔值或 `null`。`watchdog` 包含 `enabled`、`last_recovery`、`count_24h`；恢复记录表示尝试次数。`core` 包含 `installed`、`available`、`can_rollback`。状态读取异常时可附带 `error`。
+
+`core_version` 是用于展示和发布版本比较的版本号；LocalAPI 不可用时回退到已安装描述符中的版本。`core_version_long` 保留 daemon 上报的完整版本字符串，用于诊断；尚未取得 LocalAPI 版本时为空字符串。版本规范化规则见下文辅助程序接口。
 
 接口流量响应为 `{"interfaces":[{"if":"tailscale0","ip":"...","rx":0,"tx":0}]}`。`rx`、`tx` 为字节计数。连接详情任务通过有时间上限的 CLI 调用生成状态文本，并经日志脱敏后显示。
 
 ## 配置提交
 
-前端通过 `GET /_api/tailscale_` 读取配置。保存时调用 `tailscale_config`，参数为 `["web_submit", "<七位配置快照>"]`，请求的 `fields` 保持为空对象。快照必须匹配 `^[01]{7}$`，位顺序如下：
+前端通过 `GET /_api/tailscale_` 读取配置。包括启用开关在内的所有选项先修改页面草稿，点击「应用设置」后才提交。保存时调用 `tailscale_config`，参数为 `["web_submit", "<七位配置快照>"]`，请求的 `fields` 保持为空对象。快照必须匹配 `^[01]{7}$`，位顺序如下：
 
 1. `tailscale_enable`
 2. `tailscale_ipv4_enable`
@@ -87,11 +89,15 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 后台取得生命周期锁后才应用配置，避免 httpdb 在脚本获取锁之前写入 DBus。无快照的旧式 `web_submit` 仍保留兼容。查询和核心更新请求不携带 DBus 写入字段。
 
+前端按任务 ID 保存方法、操作意图、目标启用状态和配置快照，刷新页面后继续查询同一任务。配置提交与执行期间显示处理进度；失败后保留已提交草稿，并重新读取持久配置进行比较。配置生命周期和已进入 `switching` 阶段的核心任务显示过渡状态，暂缓显示预期的 `local_api_unavailable`；HTTP 请求错误、配置错误、任务失败或结果长期无法确认仍显示相应提示。诊断、更新检查和下载阶段不采用此过渡状态。
+
 IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固件当前 LAN 地址及掩码。Tailscale 自身的 netfilter 保持启用。插件 NAT 链放在既有 Fullcone 等 POSTROUTING 钩子之后，地址变化和 NAT 事件由维护任务补充刷新。
 
 ## 核心事务与自动恢复
 
 更新依次执行签名校验、资源预检、下载解包、原子指针切换和本地健康检查。`DATA/update.txn` 记录事务阶段，`DATA/update.state` 保存切换前的身份快照。成功切换记录上一核心；失败时尝试恢复原指针和状态。显式生命周期或核心操作先恢复未完成事务；自动恢复任务遇到未完成事务时跳过，安装与卸载则拒绝继续。
+
+核心切换后的自检比较规范化后的发布版本，带源码提交后缀时另核对签名描述符中的源码提交前缀。自检对本地接口和设备信息的短暂不可用进行有限重试；已授权设备重新要求登录、已知身份改变、版本或源码不符仍判定失败。控制面尚未同步设备 ID，但原节点密钥仍存在且本地生命周期为 `Starting` 或 `Running` 时，可以完成切换并等待后续同步。
 
 自动恢复在服务启用期间按分钟检查。启动宽限期为 180 秒；本地服务连续三次检查失败，或控制连接异常持续至少 600 秒且 WAN 与经验证的 HTTPS 可达时，才进入恢复判断。恢复前再次确认本地状态。等待登录、设备审批、明确停用和关闭同步等状态豁免恢复。
 
@@ -107,7 +113,7 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 | `fifo PATH` | 创建权限为 `0600` 的日志管道，拒绝覆盖已有路径 |
 | `temp TEMPLATE` | 按以 `XXXXXX` 结尾的模板独占创建权限为 `0600` 的临时文件，输出路径 |
 | `timeout SECONDS COMMAND [ARGS...]` | 直接执行参数，不经过 shell；保留退出码，超时返回 `124` |
-| `version BINARY` | 设置 `TS_BE_CLI=1`，在 5 秒内读取并校验核心版本 |
+| `version BINARY` | 设置 `TS_BE_CLI=1`，在 5 秒内读取 CLI 输出的首个字段，要求为纯 `X.Y.Z` 发布版本 |
 | `status SOCKET` | 通过受限 LocalAPI 请求返回状态、健康信息和身份存在标志；不返回原始 state |
 | `fetch URL DEST MAX_BYTES` | 有大小和时间上限的 HTTPS 下载，仅接受允许的发布及 CDN 主机 |
 | `verify ENVELOPE PUBKEY ARCH` | 校验签名与清单，输出所选架构的扁平描述符 |
@@ -118,6 +124,8 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 | `quote STRING` | 输出 JSON 字符串编码 |
 | `atomic-link TARGET LINK` | 原子替换指向 `cores/...` 的相对链接，并同步父目录 |
 | `log PATH MAX_BYTES` | 从标准输入读取日志、脱敏凭据，并按上限轮转 |
+
+`status SOCKET` 的 `version_long` 原样保留 LocalAPI 的 `Version`；`version` 只将正式发布格式 `X.Y.Z-t<9 位小写十六进制>` 及可选的 `-g<9 位小写十六进制>` 后缀规范化为 `X.Y.Z`。例如 `1.104.1-t9a522a978` 对应 `1.104.1`。纯数字发布版本保持不变；带开发版、dirty 或其他未知后缀的版本保持原值，不能据此通过与纯数字发布版本的相等检查。
 
 ## 签名清单与核心归档
 
@@ -142,6 +150,8 @@ https://github.com/thetapilla/tailscale-koolshare/releases/download/core-v<VERSI
 带版本的核心 Release 及其资源保持不可变。`core-stable` 只承载可更新的签名清单。稳定源检查拒绝版本或构建号倒退；显式本地回退独立处理。
 
 ## 插件包约定
+
+`tools/bundled_core.json` 独立指定安装包预装的核心版本和构建号。`prepare_bundle.py` 从对应不可变核心 Release 读取原签名清单和两个架构归档，验证签名、哈希、结构、架构及共同来源后导入打包输入。插件打包复用原签名封装，不重新签名核心；安装器升级时仍优先保留已有有效核心。
 
 安装包只有一个 `tailscale/` 根目录，包含插件文件、版本、公钥、签名核心清单、`manifest.sha256` 和 `payload/<arch>/`。每个架构 payload 包含核心、辅助程序和描述符。通用包包含两种架构及五个平台标记，平台包仅含相应架构，安装器只安装所选架构。
 

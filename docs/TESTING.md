@@ -4,15 +4,16 @@
 
 ## 自动化检查
 
-在仓库根目录执行。Go 辅助程序与真实核心测试需要先完成 [核心及辅助程序构建](BUILD.md#构建与验证)。
+在仓库根目录执行。先按 [构建与发布](BUILD.md) 准备相应的辅助程序、核心产物或正式安装包。
 
 | 命令 | 验证范围 |
 | --- | --- |
 | `python3 -m unittest discover -s tests -p 'test_*.py' -v` | 后台生命周期、配置和防火墙；安装迁移；更新事务；打包与发布逻辑 |
-| `node tests/test_ui.js` | 异步请求、超时、任务关联、轮询、按钮状态和文本渲染 |
+| `node tests/test_ui.js` | 配置草稿与统一应用、生命周期进度、失败恢复、异步请求、超时、任务关联、轮询及文本渲染 |
 | `python3 tools/test_helper.py` | Linux 上的签名与哈希、归档路径和文件类型、架构、LocalAPI、超时、原子链接及日志脱敏 |
 | `python3 tools/test_busybox.py` | BusyBox 1.25.1 ash 的脚本语法与后台、安装、核心更新回归测试；安装测试使用受限 applet 命令目录 |
 | `python3 tools/smoke_core.py` | 两种目标架构的真实压缩程序、daemon、辅助程序及 LocalAPI 冒烟测试 |
+| `python3 tools/smoke_core_update.py --previous-release /path/to/previous-release` | 两种架构的已签名真实核心之间，服务启用更新、手动回退、停用更新及后续启动 |
 | `python3 tools/smoke_install.py --lifecycle` | 六份正式安装包的安装、重装、迁移及平台一致性；真实 ARM 核心、辅助程序、签名、userspace 服务启动与页面任务写入 |
 
 构建依赖相关回归覆盖上游 Go 要求提升、精确版本选择、工具链与源码缓存损坏、发布锁的签名绑定、跨阶段输入一致性，以及辅助程序独立构建。测试位于 `test_toolchain.py`、`test_core_lock.py`、`test_helper_toolchain.py` 和打包发布测试中。
@@ -21,7 +22,26 @@
 
 安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。
 
-真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon 和未登录状态，不需要加入 Tailnet。
+真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon 和未登录状态，不需要加入 Tailnet。辅助程序与事务单元测试还覆盖带源码提交后缀的版本、错误源码、未知版本后缀、本地接口短暂不可用、已授权身份丢失及控制面尚未同步的状态。
+
+## 真实核心更新事务
+
+准备两个不同版本的不可变核心 Release。每个目录都需包含原 `manifest.json` 和清单所列的 ARM32、ARM64 归档；候选版本必须高于旧版本。构建辅助程序后运行：
+
+```sh
+python3 tools/smoke_core_update.py \
+  --previous-release /path/to/previous-release \
+  --candidate-release build/core-release
+```
+
+默认依次测试 ARM64 和 ARM32，也可用 `--arch arm` 或 `--arch arm64` 单独运行。测试容器没有外部网络，根文件系统只读，可写状态放在临时内存目录；输入核心与源码均以只读方式挂载。辅助程序实际验证签名并解包，使用原更新事务函数、真实 combined 核心及 LocalAPI 执行以下路径：
+
+- 服务启用时切换到新核心，核对实际短版本和带构建后缀的完整版本，并确认运行意图及临时生成的机器身份保留。
+- 服务启用时手动回退，验证上一核心能够启动并通过自检。
+- 停用服务后更新，确认更新不会启动 daemon 或修改已停止的 state；随后手动启动并再次验证。
+- 每次成功切换后确认当前和上一核心指针正确，事务记录及本次快照已清理。
+
+测试要求 daemon 真实返回带构建后缀的完整版本，并将其与原始 CLI JSON 对照，避免用清单短版本替代真实响应而漏掉格式差异。DBus、NVRAM、防火墙和定时任务由测试替身提供；仅 daemon 入口增加 userspace TUN 参数。测试使用全新的未登录身份，不接入 Tailnet。已授权状态及身份异常通过单元测试的固定输入验证；真实 Tailnet 身份延续、硬件 TUN、防火墙及流量转发按设备检查执行。
 
 ## 固件组件与浏览器集成
 
@@ -41,20 +61,20 @@ python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root --serve --po
 node tools/smoke_ui.js --firmware-root /path/to/runtime-root --upstream http://127.0.0.1:33030
 ```
 
-浏览器加载固件自带的 jQuery、软件中心资源和插件原始页面，覆盖初始显示、设置保存、诊断、核心检查、异常响应后的恢复及页面刷新后的任务跟踪。路由器导航与硬件相关模板值使用测试替身。`--chromium` 可指定已有浏览器；Playwright 可通过 `NODE_PATH` 使用已有安装。
+浏览器加载固件自带的 jQuery、软件中心资源和插件原始页面，覆盖初始显示、设置保存、诊断、核心检查、异常响应后的恢复及页面刷新后的任务跟踪。额外的生命周期场景由本地代理注入延迟 HTTP 响应，检查启用开关只修改草稿、应用后的启动和停止进度，以及失败后恢复草稿和错误提示。该部分验证浏览器交互；实际核心切换由上述真实核心事务测试覆盖。路由器导航与硬件相关模板值使用测试替身。`--chromium` 可指定已有浏览器；Playwright 可通过 `NODE_PATH` 使用已有安装。
 
 打包后，为上述两个工具都增加 `--plugin-root build/packages/universal/tailscale`，可检查归档暂存区内的实际页面、脚本、缓存标识和辅助程序。截图保存在 `build/ui-smoke/`，表示隔离测试数据；完整固件启动、硬件网络与流量转发仍按下节设备检查执行。固件及提取资源作为本地测试输入，不随源码和插件 Release 分发。
 
 ## 发布产物检查
 
-完成构建、签名和打包后，检查同批安装包及核心元数据：
+完成核心准备和插件打包后，检查同批安装包及核心元数据：
 
 - 六个标准插件包和 `SHA256SUMS` 齐全，文件名及包内版本与 [VERSION](../VERSION) 一致。
 - 每个插件包只有一个 `tailscale/` 根目录，普通文件与 `manifest.sha256` 一致，权限和平台标记正确。
 - 通用包和对应平台包中的脚本、资源及同架构 payload 字节一致。
-- 包内核心与签名描述符的大小、哈希和 ELF 架构一致，两个架构使用相同版本、源码提交和配方。
+- 包内核心与 `bundled_core.json` 的版本、构建号一致，并符合原签名描述符的大小、哈希和 ELF 架构；两个架构使用相同源码提交和配方。
 - 安装脚本完整文本满足软件中心的保护规则，包括注释内容。
-- 相同输入及元数据的重复打包结果一致；重新生成签名封装时使用原 `created_at`。
+- 相同输入及元数据的重复打包结果一致；导入预装核心时保留原签名清单字节。
 - 发布后下载资源，复核文件名、大小和同批校验清单；核心稳定源只能指向已验证的不可变资源。
 
 归档和安全相关回归测试位于 [test_packaging.py](../tests/test_packaging.py)、[test_pack_release.py](../tests/test_pack_release.py) 及 [辅助程序测试](../cmd/tsks-helper/security_test.go)。

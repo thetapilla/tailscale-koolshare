@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.0.0"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.0.1"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -117,7 +117,7 @@ function init() {
 </table></div>
 <div class="apply_gen ts_actions"><input id="apply_settings" class="button_gen" type="button" value="应用设置" disabled="disabled" />
 <span id="settings_notice" class="ts_notice" aria-live="polite"></span></div>
-<div class="SimpleNote ts_help">点击“应用设置”保存更改；切换启用状态也会保存当前所有设置。应用设置、更新或回退核心可能短暂中断 Tailscale 连接。</div>
+<div class="SimpleNote ts_help">调整启用状态和其他选项后，点击“应用设置”统一生效。应用设置、更新或回退核心可能短暂中断 Tailscale 连接。</div>
 <div id="tailscale_core" class="ts_box ts_section">
 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable">
 <thead><tr><td colspan="2">核心管理</td></tr></thead>
