@@ -15,6 +15,8 @@
 | `python3 tools/smoke_core.py` | 两种目标架构的真实压缩程序、daemon、辅助程序及 LocalAPI 冒烟测试 |
 | `python3 tools/smoke_install.py --lifecycle` | 六份正式安装包的安装、重装、迁移及平台一致性；真实 ARM 核心、辅助程序、签名、userspace 服务启动与页面任务写入 |
 
+构建依赖相关回归覆盖上游 Go 要求提升、精确版本选择、工具链与源码缓存损坏、发布锁的签名绑定、跨阶段输入一致性，以及辅助程序独立构建。测试位于 `test_toolchain.py`、`test_core_lock.py`、`test_helper_toolchain.py` 和打包发布测试中。
+
 脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。回归测试仅允许显式列出的命令，禁用 `command` 内置命令，且不提供 `od`、`mkfifo`、`mktemp`、`sha256sum` 和外部 `timeout`。安装清单与核心校验、日志管道、临时文件及命令超时由随包辅助程序处理；防火墙测试覆盖旧版无等待参数和新版支持等待参数的分支。
 
 安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。

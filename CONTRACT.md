@@ -129,6 +129,8 @@ payload 包含：
 - `version`、`build`、`source_commit`、`recipe_sha256`、RFC 3339 格式的 `created_at`。
 - `artifacts.arm` 和 `artifacts.arm64`，各包含 `url`、`size`、`sha256`、`unpacked_size` 和 `binary_sha256`。
 
+采用依赖锁的构建将完整源码与工具链锁的哈希写入 `recipe_sha256`，锁本身随 `build-metadata.json` 发布。锁包含源码归档和官方 Go 归档的 SHA-256，以及静态构建配方哈希。签名前校对锁、总体元数据、每架构构建记录和实际文件；重用已发布锁时先验证签名描述符，防止未认证的元数据改变重建输入。
+
 验证后描述符将所选 artifact 与 `version`、`build`、`arch`、`source_commit`、`recipe_sha256` 合并。核心文件 URL 使用以下格式：
 
 ```text

@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 
-from build_core import RECIPE, json_url, source_commit
+from build_core import RECIPE, json_url, recipe_hash, source_commit
 from publish_core import STABLE_URL, identity, remote_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,10 +39,11 @@ def main():
         version = release["TarballsVersion"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version) or int(version.split(".")[1]) % 2:
         raise ValueError("expected stable numeric Tailscale version")
-    source_commit(version)  # A matching official stable GitHub source tag must exist.
+    commit = source_commit(version)
     tag = f'core-v{version}-{RECIPE["build"]}'
     needed = update_needed(version, args.helper)
-    result = {"version": version, "tag": tag, "needed": str(needed).lower()}
+    result = {"version": version, "tag": tag, "needed": str(needed).lower(),
+              "source_commit": commit, "build": RECIPE["build"], "recipe_key": recipe_hash()}
     print(json.dumps(result))
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:

@@ -7,14 +7,23 @@ from pathlib import Path
 import subprocess
 import sys
 
-arch, host, source_name, version, commit, recipe_sha256, jobs = sys.argv[1:]
+arch, host, source_name, jobs, go, upx = sys.argv[1:]
 recipe = json.loads(Path("/repo/tools/core_recipe.json").read_text())
-toolchain = Path("/cache/toolchains") / host
-go = str(toolchain / "go/bin/go")
-upx = str(toolchain / f'upx-{recipe["upx_version"]}-{host}_linux/upx')
+metadata = json.loads(Path("/out/core-build.json").read_text())
+from resolve_core import validate_lock, lock_hash
+from toolchain import toolchain_dir
+lock = validate_lock(metadata["dependency_lock"], check_recipe=True)
+version, commit, recipe_sha256 = lock["version"], lock["source"]["commit"], lock_hash(lock)
+expected_go = str(toolchain_dir("/cache", "core", lock["go"], host) / "go/bin/go")
+if go != expected_go or metadata["recipe_sha256"] != recipe_sha256 or source_name != "tailscale-" + commit:
+    raise ValueError("container build does not match dependency lock")
 env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH=arch, GOARM="7", GOARM64="v8.0",
-           GOTOOLCHAIN="local", GOENV="off", GOTELEMETRY="off", GOMODCACHE="/cache/gomod", GOCACHE="/cache/gobuild-" + arch,
+           GOTOOLCHAIN="local", GOENV="off", GOWORK="off", GOFLAGS="", GOEXPERIMENT="", GOTELEMETRY="off", GOMODCACHE="/cache/gomod", GOCACHE="/cache/gobuild-" + arch,
            GOPROXY="https://proxy.golang.org", GOSUMDB="sum.golang.org", SOURCE_DATE_EPOCH="0")
+env["GOCACHE"] = f'/cache/gobuild/{recipe_sha256}/{arch}'
+actual_go = subprocess.check_output([go, "env", "GOVERSION"], env=env, cwd="/tmp", text=True).strip()
+if actual_go != "go" + lock["go"]["version"]:
+    raise ValueError("actual Go compiler differs from dependency lock")
 output = Path("/out/cores") / arch
 output.mkdir(parents=True, exist_ok=True)
 binary = output / "tailscale.combined"
@@ -33,6 +42,7 @@ if binary.stat().st_size > recipe["max_binary_size"]:
     raise RuntimeError("combined binary exceeds 12 MiB gate")
 binary.chmod(0o755)
 result = {"arch": arch, "version": version, "build": recipe["build"], "source_commit": commit,
+          "go_version": lock["go"]["version"], "source_sha256": lock["source"]["sha256"],
           "recipe_sha256": recipe_sha256, "uncompressed_size": raw_size, "uncompressed_sha256": raw_sha,
           "binary_size": binary.stat().st_size, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
 (output / "build.json").write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")

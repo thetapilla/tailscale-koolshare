@@ -76,46 +76,66 @@ def extract(archive, dest):
 
 def recipe_hash():
     digest = hashlib.sha256()
-    for name in ("core_recipe.json", "build_core.py", "container_build.py"):
+    for name in ("core_recipe.json", "build_core.py", "container_build.py", "resolve_core.py", "toolchain.py"):
         digest.update(name.encode() + b"\0" + (ROOT / "tools" / name).read_bytes() + b"\0")
     return digest.hexdigest()
 
 
 def main():
+    from resolve_core import lock_hash, resolve, source_requirements, validate_lock
+    from toolchain import provision_go
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default=RECIPE["initial_version"])
+    parser.add_argument("--version")
+    parser.add_argument("--lock", type=Path, help="resolved source/toolchain lock carried from discovery")
     parser.add_argument("--arch", choices=("arm", "arm64", "all"), default="all")
     parser.add_argument("--jobs", type=int, default=6, help="Go compiler parallelism per architecture")
     args = parser.parse_args()
     host = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "AMD64": "amd64"}[platform.machine()]
-    commit = source_commit(args.version)
-    if args.version == RECIPE["initial_version"] and commit != RECIPE["initial_source_commit"]:
-        raise ValueError("pinned upstream tag moved")
     cache, build = ROOT / ".cache", ROOT / "build"
+    build.mkdir(exist_ok=True)
+    if args.lock:
+        lock = validate_lock(json.loads(args.lock.read_text()), check_recipe=True)
+        if args.version and args.version != lock["version"]:
+            raise ValueError("requested version differs from dependency lock")
+    else:
+        version = args.version or RECIPE["initial_version"]
+        commit = source_commit(version)
+        path = cache / "locks" / f'core-{version}-{RECIPE["build"]}-{recipe_hash()}.json'
+        lock = resolve(version, commit, path, reuse_published=False)
+    version, commit = lock["version"], lock["source"]["commit"]
+    if lock["build"] != RECIPE["build"]:
+        raise ValueError("locked build differs from current recipe")
     source_name = "tailscale-" + commit
     source_archive = cache / "downloads" / (source_name + ".tar.gz")
-    source_sha = download("https://codeload.github.com/tailscale/tailscale/tar.gz/" + commit, source_archive,
-                          RECIPE["initial_source_sha256"] if args.version == RECIPE["initial_version"] else None)
+    download(lock["source"]["url"], source_archive, lock["source"]["sha256"])
+    go_mod, preferred, revision = source_requirements(source_archive, version, commit)
+    from toolchain import _requirements
+    if _requirements(go_mod, preferred) != lock["go"]["requirements"] or revision != lock["upstream_toolchain_rev"]:
+        raise ValueError("locked Go requirements differ from the source archive")
     source = cache / "source" / source_name
     if source.exists():
         shutil.rmtree(source)
     extract(source_archive, cache / "source")
-    if (source / "VERSION.txt").read_text().strip() != args.version:
-        raise ValueError("source VERSION.txt disagrees with release tag")
-    for kind in ("go", "upx"):
-        version = RECIPE[kind + "_version"]
-        filename = f"go{version}.linux-{host}.tar.gz" if kind == "go" else f"upx-{version}-{host}_linux.tar.xz"
-        url = "https://go.dev/dl/" + filename if kind == "go" else f"https://github.com/upx/upx/releases/download/v{version}/" + filename
-        archive = cache / "downloads" / filename
-        download(url, archive, RECIPE[kind + "_sha256"][host])
-        extract(archive, cache / "toolchains" / host)
-    build.mkdir(exist_ok=True)
-    metadata = {"schema": 1, "version": args.version, "build": RECIPE["build"], "source_commit": commit,
-                "source_sha256": source_sha, "recipe_sha256": recipe_hash(), "go_version": RECIPE["go_version"],
-                "upx_version": RECIPE["upx_version"], "tags": RECIPE["tags"], "host_arch": host,
-                "source_date_epoch": 0}
+    go_dir = provision_go(lock["go"], host, cache, "core", download, extract)
+    upx_version = RECIPE["upx_version"]
+    filename = f"upx-{upx_version}-{host}_linux.tar.xz"
+    archive = cache / "downloads" / filename
+    download(f"https://github.com/upx/upx/releases/download/v{upx_version}/{filename}", archive, RECIPE["upx_sha256"][host])
+    upx_dir = cache / "toolchains/upx" / upx_version / (host + "-" + RECIPE["upx_sha256"][host][:16])
+    if upx_dir.exists():
+        shutil.rmtree(upx_dir)
+    extract(archive, upx_dir)
+    metadata = {"schema": 2, "version": version, "build": lock["build"], "source_commit": commit,
+                "source_sha256": lock["source"]["sha256"], "recipe_sha256": lock_hash(lock),
+                "recipe_source_sha256": lock["recipe_source_sha256"], "go_version": lock["go"]["version"],
+                "upx_version": upx_version, "tags": RECIPE["tags"], "host_arch": host,
+                "source_date_epoch": 0, "dependency_lock": lock}
+    (build / "core-lock.json").write_text(json.dumps(lock, sort_keys=True, indent=2) + "\n")
     (build / "core-build.json").write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n")
     arches = ("arm", "arm64") if args.arch == "all" else (args.arch,)
+    go_executable = "/cache/" + (go_dir / "go/bin/go").relative_to(cache).as_posix()
+    upx_executable = "/cache/" + (upx_dir / filename.removesuffix(".tar.xz") / "upx").relative_to(cache).as_posix()
 
     def build_one(arch):
         command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -123,7 +143,7 @@ def main():
                    "--mount", f"type=bind,src={cache},dst=/cache",
                    "--mount", f"type=bind,src={build},dst=/out",
                    RECIPE["container"], "python3", "/repo/tools/container_build.py",
-                   arch, host, source_name, args.version, commit, metadata["recipe_sha256"], str(args.jobs)]
+                   arch, host, source_name, str(args.jobs), go_executable, upx_executable]
         subprocess.run(command, check=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(arches)) as pool:

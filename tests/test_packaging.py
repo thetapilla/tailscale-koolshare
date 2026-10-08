@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import json
@@ -10,8 +11,10 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from artifact_utils import archive_tree, check_elf
+from build_core import RECIPE, recipe_hash
 from package import PLATFORMS, build_packages
 from release_core import validated_core
+from resolve_core import lock_hash
 
 
 def elf(arch):
@@ -212,6 +215,125 @@ class PackagingTests(unittest.TestCase):
         (core / "build.json").write_text(json.dumps(record))
         with self.assertRaisesRegex(ValueError, "successful build record"):
             validated_core(self.root, "arm", meta)
+
+
+class CoreReleaseProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        version = "1.27.1"
+        lock = {"schema": 1, "version": "1.104.1", "build": "r1",
+                "source": {"commit": "a" * 40,
+                           "url": "https://codeload.github.com/tailscale/tailscale/tar.gz/" + "a" * 40,
+                           "sha256": "b" * 64},
+                "go": {"version": version,
+                       "requirements": {"go": version, "toolchain": None, "upstream": version},
+                       "archives": {}},
+                "upstream_toolchain_rev": None, "recipe_source_sha256": recipe_hash()}
+        for arch in ("amd64", "arm64"):
+            filename = f"go{version}.linux-{arch}.tar.gz"
+            lock["go"]["archives"][arch] = {
+                "filename": filename, "url": "https://go.dev/dl/" + filename,
+                "sha256": "c" * 64, "size": 1234}
+        self.metadata = {"schema": 2, "version": lock["version"], "build": lock["build"],
+                         "source_commit": lock["source"]["commit"],
+                         "source_sha256": lock["source"]["sha256"],
+                         "go_version": version, "recipe_source_sha256": lock["recipe_source_sha256"],
+                         "recipe_sha256": lock_hash(lock), "dependency_lock": lock,
+                         "upx_version": RECIPE["upx_version"], "tags": list(RECIPE["tags"])}
+        for arch in ("arm", "arm64"):
+            core = self.root / "build/cores" / arch
+            core.mkdir(parents=True)
+            binary = elf(arch)
+            (core / "tailscale.combined").write_bytes(binary)
+            record = {key: self.metadata[key] for key in
+                      ("version", "build", "source_commit", "source_sha256", "recipe_sha256", "go_version")}
+            record.update(arch=arch, binary_size=len(binary), binary_sha256=hashlib.sha256(binary).hexdigest())
+            (core / "build.json").write_text(json.dumps(record))
+
+    def test_complete_dependency_lock_binds_both_architectures(self):
+        for arch in ("arm", "arm64"):
+            binary, size, digest = validated_core(self.root, arch, self.metadata)
+            self.assertEqual(binary.read_bytes(), elf(arch))
+            self.assertEqual(size, len(elf(arch)))
+            self.assertEqual(digest, hashlib.sha256(elf(arch)).hexdigest())
+
+    def test_new_metadata_requires_lock_and_cannot_downgrade_its_schema(self):
+        for lock in (None, [], "unresolved"):
+            metadata = dict(self.metadata, dependency_lock=lock)
+            with self.subTest(lock=lock), self.assertRaisesRegex(ValueError, "requires a dependency lock"):
+                validated_core(self.root, "arm", metadata)
+        metadata = dict(self.metadata)
+        del metadata["dependency_lock"]
+        with self.assertRaisesRegex(ValueError, "requires a dependency lock"):
+            validated_core(self.root, "arm", metadata)
+        for schema in (None, 1, 3, True):
+            metadata = dict(self.metadata)
+            if schema is None:
+                del metadata["schema"]
+            else:
+                metadata["schema"] = schema
+            with self.subTest(schema=schema), self.assertRaises(ValueError):
+                validated_core(self.root, "arm", metadata)
+
+    def test_metadata_identity_source_and_toolchain_must_match_lock(self):
+        changes = {"version": "1.104.2", "build": "r2", "source_commit": "d" * 40,
+                   "source_sha256": "d" * 64, "go_version": "1.26.6",
+                   "recipe_source_sha256": "d" * 64, "recipe_sha256": "d" * 64}
+        for field, value in changes.items():
+            metadata = dict(self.metadata, **{field: value})
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "differs from its dependency lock"):
+                validated_core(self.root, "arm", metadata)
+
+    def test_signed_recipe_hash_covers_source_and_toolchain_archive(self):
+        for field in ("source", "go"):
+            metadata = copy.deepcopy(self.metadata)
+            if field == "source":
+                metadata["dependency_lock"]["source"]["sha256"] = "e" * 64
+                metadata["source_sha256"] = "e" * 64
+            else:
+                metadata["dependency_lock"]["go"]["archives"]["amd64"]["sha256"] = "e" * 64
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "differs from its dependency lock"):
+                validated_core(self.root, "arm", metadata)
+
+    def test_metadata_must_describe_the_locked_compressor_and_tags(self):
+        for field, value in (("upx_version", "4.2.0"), ("tags", [])):
+            metadata = dict(self.metadata, **{field: value})
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "locked build recipe"):
+                validated_core(self.root, "arm", metadata)
+
+    def test_stale_recipe_source_is_rejected_even_with_recomputed_lock_hash(self):
+        metadata = copy.deepcopy(self.metadata)
+        metadata["dependency_lock"]["recipe_source_sha256"] = "f" * 64
+        metadata["recipe_source_sha256"] = "f" * 64
+        metadata["recipe_sha256"] = lock_hash(metadata["dependency_lock"])
+        with self.assertRaises(ValueError):
+            validated_core(self.root, "arm", metadata)
+
+    def test_architecture_record_must_include_actual_source_and_go_version(self):
+        for arch in ("arm", "arm64"):
+            path = self.root / "build/cores" / arch / "build.json"
+            original = json.loads(path.read_text())
+            for field, value in (("go_version", "1.26.6"), ("source_sha256", "d" * 64)):
+                for missing in (False, True):
+                    record = dict(original)
+                    if missing:
+                        del record[field]
+                    else:
+                        record[field] = value
+                    path.write_text(json.dumps(record))
+                    with self.subTest(arch=arch, field=field, missing=missing), self.assertRaisesRegex(ValueError, "build provenance"):
+                        validated_core(self.root, arch, self.metadata)
+            path.write_text(json.dumps(original))
+
+    def test_legacy_schema_one_release_metadata_remains_supported(self):
+        for schema in (None, 1):
+            metadata = {key: self.metadata[key] for key in ("version", "build", "source_commit", "recipe_sha256")}
+            if schema is not None:
+                metadata["schema"] = schema
+            with self.subTest(schema=schema):
+                validated_core(self.root, "arm", metadata)
 
 
 if __name__ == "__main__":

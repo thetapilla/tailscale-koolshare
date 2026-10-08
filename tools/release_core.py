@@ -10,15 +10,46 @@ import subprocess
 import tempfile
 
 from artifact_utils import MAX_BINARY, archive_tree, check_elf, sha256
+from resolve_core import lock_hash, validate_lock
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def validate_metadata(metadata):
+    """Bind the signing input to the dependencies resolved before compilation."""
+    schema = metadata.get("schema", 1)
+    if type(schema) is not int or schema not in (1, 2):
+        raise ValueError("unsupported core build metadata schema")
+    if schema == 1:
+        if "dependency_lock" in metadata:
+            raise ValueError("dependency lock requires core build metadata schema 2")
+        return
+    lock = metadata.get("dependency_lock")
+    if not isinstance(lock, dict):
+        raise ValueError("core build metadata requires a dependency lock")
+    validate_lock(lock, check_recipe=True)
+    expected = {"version": lock["version"], "build": lock["build"],
+                "source_commit": lock["source"]["commit"],
+                "source_sha256": lock["source"]["sha256"],
+                "go_version": lock["go"]["version"],
+                "recipe_source_sha256": lock["recipe_source_sha256"],
+                "recipe_sha256": lock_hash(lock)}
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        raise ValueError("core build metadata differs from its dependency lock")
+    recipe = json.loads((ROOT / "tools/core_recipe.json").read_text())
+    if any(metadata.get(key) != recipe[key] for key in ("upx_version", "tags")):
+        raise ValueError("core build metadata differs from the locked build recipe")
+
+
 def validated_core(root, arch, metadata):
+    validate_metadata(metadata)
     binary = root / "build/cores" / arch / "tailscale.combined"
     size, digest = check_elf(binary, arch, MAX_BINARY)
     built = json.loads((binary.parent / "build.json").read_text())
-    if any(built.get(key) != metadata[key] for key in ("version", "build", "source_commit", "recipe_sha256")):
+    keys = ("version", "build", "source_commit", "recipe_sha256")
+    if metadata.get("schema") == 2:
+        keys += ("go_version", "source_sha256")
+    if any(built.get(key) != metadata[key] for key in keys):
         raise ValueError("architecture build provenance differs from release metadata: " + arch)
     if built.get("arch") != arch or built.get("binary_size") != size or built.get("binary_sha256") != digest:
         raise ValueError("architecture binary differs from its successful build record: " + arch)
