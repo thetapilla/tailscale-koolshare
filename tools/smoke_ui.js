@@ -42,7 +42,8 @@ const calls = [], scriptErrors = [];
 // Delayed lifecycle responses isolate the browser's transition semantics. The
 // ordinary scenarios below still exercise the extracted firmware's real httpdb.
 const lifecycle = { config: { tailscale_enable: '0', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1',
-    tailscale_advertise_routes: '0', tailscale_accept_routes: '0', tailscale_exit_node: '0', tailscale_watchdog_enable: '0' },
+    tailscale_advertise_routes: '0', tailscale_accept_routes: '0', tailscale_exit_node: '0', tailscale_watchdog_enable: '0',
+    tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_custom_routes: '' },
     task: null, failNext: false, unavailableReads: 0 };
 // Status overlays cover signed-descriptor identities and delayed authorization
 // without downloading cores or registering a device on a real tailnet.
@@ -57,13 +58,16 @@ function lifecycleResponse(url, body) {
     const task = lifecycle.task;
     let data;
     if (call.method === 'tailscale_config') {
-        lifecycle.task = { id: String(call.id), started: Date.now(), bits: call.params[1], fail: lifecycle.failNext, state: 'running' };
+        lifecycle.task = { id: String(call.id), started: Date.now(), bits: call.params[1], routes: Buffer.from(call.params[2].slice(4), 'base64url').toString('utf8'), fail: lifecycle.failNext, state: 'running' };
         lifecycle.failNext = false;
         data = { accepted: true, job_id: String(call.id) };
     } else if (call.method === 'tailscale_job') {
         if (task && Date.now() - task.started >= 8500) {
             task.state = task.fail ? 'failed' : 'success';
-            if (!task.fail) { Object.keys(lifecycle.config).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; }); }
+            if (!task.fail) {
+                Object.keys(lifecycle.config).slice(0, 9).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; });
+                lifecycle.config.tailscale_custom_routes = task.routes;
+            }
         }
         data = { schema: 1, id: task.id, state: task.state, phase: task.state === 'running' ? 'accepted' : 'complete',
             message: task.fail && task.state === 'failed' ? '服务启动失败' : '' };
@@ -86,9 +90,9 @@ const server = http.createServer((req, res) => {
         req.on('data', c => chunks.push(c));
         req.on('end', () => {
             const body = Buffer.concat(chunks);
-            let method = '';
-            try { method = JSON.parse(body.toString()).method; } catch (_) { /* GET */ }
-            calls.push({ method, path: req.url, contentType: req.headers['content-type'] });
+            let method = '', requestData;
+            try { requestData = JSON.parse(body.toString()); method = requestData.method; } catch (_) { /* GET */ }
+            calls.push({ method, path: req.url, contentType: req.headers['content-type'], params: requestData && requestData.params, fields: requestData && requestData.fields });
             const scenario = new URL(req.headers.referer || 'http://127.0.0.1').searchParams.get('scenario');
             if (scenario === 'lifecycle') {
                 res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -218,6 +222,74 @@ const server = http.createServer((req, res) => {
         await page.locator('#tailscale_accept_routes').uncheck();
         await job('apply_settings', /^操作完成$/);
         await page.waitForFunction(() => !document.getElementById('tailscale_accept_routes').checked && !document.getElementById('apply_settings').disabled);
+        const routesAt = calls.length;
+        await page.locator('#tailscale_advertise_routes').uncheck();
+        await page.locator('#tailscale_accept_dns').check();
+        await page.locator('#tailscale_custom_routes_enable').check();
+        await page.locator('#custom_routes_editor').waitFor({ state: 'visible' });
+        const routeInputs = page.locator('.ts_route_input');
+        while (await routeInputs.count() > 1) { await page.locator('.ts_route_delete').last().click(); }
+        await routeInputs.nth(0).fill(' 192.168.60.0/24 ');
+        await page.locator('#custom_routes_add').click();
+        await routeInputs.nth(1).fill('2001:DB8:1::/64');
+        await page.locator('#custom_routes_add').click();
+        assert.equal(await routeInputs.count(), 3);
+        await job('apply_settings', /^操作完成$/);
+        const routeSave = calls.slice(routesAt).find(call => call.method === 'tailscale_config');
+        assert.match(routeSave.params[1], /^[01]{7}11$/);
+        assert.equal(routeSave.params[1][3], '0');
+        assert.equal(routeSave.params[2], 'b64.' + Buffer.from('192.168.60.0/24,2001:DB8:1::/64').toString('base64url'));
+        assert.deepEqual(routeSave.fields, {});
+        assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), ['192.168.60.0/24', '2001:db8:1::/64']);
+        await page.screenshot({ path: path.join(screenshots, 'custom-routes.png'), fullPage: true });
+        await page.locator('#custom_routes_add').click();
+        await page.locator('#custom_routes_add').click();
+        await routeInputs.nth(3).fill('192.168.60.1/24');
+        await page.locator('#apply_settings').click();
+        await page.waitForFunction(() => document.getElementById('settings_notice').textContent.includes('192.168.60.1/24'));
+        assert.equal(await routeInputs.nth(3).getAttribute('aria-invalid'), 'true');
+        assert.equal(await routeInputs.nth(2).getAttribute('aria-invalid'), null);
+        assert.equal(await routeInputs.nth(3).inputValue(), '192.168.60.1/24');
+        assert.equal(await page.locator('#apply_settings').isDisabled(), false);
+        await page.screenshot({ path: path.join(screenshots, 'route-error.png'), fullPage: true });
+        await routeInputs.nth(3).fill('1'.repeat(2048));
+        const oversizedAt = calls.length;
+        await page.locator('#apply_settings').click();
+        await page.waitForFunction(() => /过长.*未接收/.test(document.getElementById('settings_notice').textContent));
+        assert.equal(await page.locator('#apply_settings').isDisabled(), false);
+        assert.equal(await text('job_state'), '操作未被接收');
+        assert.equal(await routeInputs.nth(3).inputValue(), '1'.repeat(2048));
+        assert.equal(await routeInputs.nth(3).getAttribute('aria-invalid'), null);
+        assert.equal(calls.slice(oversizedAt).filter(call => call.method === 'tailscale_job').length, 0);
+        await page.locator('.ts_route_delete').nth(3).click();
+        await page.locator('.ts_route_delete').nth(2).click();
+        assert.equal(await routeInputs.count(), 2);
+        assert.equal(await text('settings_notice'), '');
+        for (let count = 2; count < 32; count++) { await page.locator('#custom_routes_add').click(); }
+        assert.equal(await routeInputs.count(), 32);
+        assert.equal(await page.locator('#custom_routes_add').isDisabled(), true);
+        await page.locator('.ts_route_delete').nth(31).click();
+        assert.equal(await page.locator('#custom_routes_add').isDisabled(), false);
+        await page.locator('#tailscale_custom_routes_enable').uncheck();
+        assert.equal(await page.locator('#custom_routes_editor').isVisible(), false);
+        await job('apply_settings', /^操作完成$/);
+        await page.reload(); await ready();
+        assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), true);
+        assert.equal(await page.locator('#tailscale_custom_routes_enable').isChecked(), false);
+        assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), ['192.168.60.0/24', '2001:db8:1::/64']);
+        for (const oldDraft of [false, true]) {
+            const task = { id: oldDraft ? '999999999999998' : '999999999999997', title: '应用设置', method: 'tailscale_config',
+                draft: oldDraft ? '0100000' : '010000001', routes: oldDraft ? undefined : '10.20.0.0/16', reloadConfig: true };
+            await page.evaluate(task => sessionStorage.setItem('tailscale3_pending', JSON.stringify(task)), task);
+            await page.reload(); await ready();
+            assert.equal(await text('job_state'), '任务结果无法确认');
+            assert.equal(await text('settings_notice'), '设置尚未应用');
+            assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), oldDraft);
+            assert.equal(await page.locator('#tailscale_custom_routes_enable').isChecked(), !oldDraft);
+            assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), oldDraft ? ['192.168.60.0/24', '2001:db8:1::/64'] : ['10.20.0.0/16']);
+        }
+        await page.reload(); await ready();
+        console.log(JSON.stringify({ phase: 'DNS and custom routes: save, normalization, validation, row limit, disabled preservation, old/new draft recovery', result: 'passed' }));
         await job('core_check', /^(操作完成|操作失败)$/);
         assert.equal(await page.locator('#core_update').isDisabled(), true, 'An offline fixture must not offer an unverified update');
         const required = ['tailscale_fettle', 'tailscale_tsnets', 'tailscale_diagnostics', 'tailscale_status', 'tailscale_ncheck', 'tailscale_config', 'tailscale_core', 'tailscale_job'];
@@ -308,7 +380,7 @@ const server = http.createServer((req, res) => {
         assert.ok(calls.slice(resumeAt).every(call => !call.method || ['tailscale_job', 'tailscale_fettle', 'tailscale_tsnets'].includes(call.method)));
         await page.screenshot({ path: path.join(screenshots, 'recovered.png'), fullPage: true });
         assert.deepEqual(scriptErrors, []);
-        await report(['initial state', 'settings', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery', 'core build identities', 'backend update eligibility', 'delayed authorization link'], initialLoadMs);
+        await report(['initial state', 'settings', 'DNS setting', 'custom route normalization', 'route validation and error rows', 'oversized request rejection', '32 row limit', 'disabled route preservation', 'old and new route draft recovery', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery', 'core build identities', 'backend update eligibility', 'delayed authorization link'], initialLoadMs);
     } catch (error) {
         await page.screenshot({ path: path.join(screenshots, 'failure.png'), fullPage: true }).catch(() => {});
         console.error(JSON.stringify({ script_errors: scriptErrors, requests: calls, page_state: await page.evaluate(() => ({

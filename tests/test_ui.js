@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const create = require('../plugin/res/tailscale3.js');
 const html = fs.readFileSync(path.join(__dirname, '../plugin/webs/Module_tailscale.asp'), 'utf8');
+const wire = value => 'b64.' + Buffer.from(value, 'utf8').toString('base64url');
 const source = fs.readFileSync(path.join(__dirname, '../plugin/res/tailscale3.js'), 'utf8');
 
 function element(tag = 'div') {
@@ -69,16 +70,19 @@ function harness(initialStorage = {}) {
     }
     function click(id) { assert.equal(nodes[id].disabled, false, id + ' is disabled'); nodes[id].events.click(); advance(); }
     function change(id, value) { nodes[id].checked = value; nodes[id].events.change(); advance(); }
+    function rows() { return nodes.custom_routes_rows.children.map(row => ({ input: row.children[0], remove: row.children[1], hint: row.children[2] })); }
+    function editRoute(index, value) { const input = rows()[index].input; assert.equal(input.disabled, false); input.value = value; input.events.input(); advance(); }
+    function removeRoute(index) { const button = rows()[index].remove; assert.equal(button.disabled, false); button.events.click(); advance(); }
     function accept(request, string = false) { reply(request, { accepted: true, job_id: String(request.body.id) }, string); }
     function finishJob(request, state, extra = {}) { reply(request, { schema: 1, id: request.body.params[0], state, phase: 'done', message: 'Result', ...extra }); }
-    return { app, nodes, requests, history, storage, confirmations, advance, next, reply, status, boot, click, change, accept, finishJob,
+    return { app, nodes, requests, history, storage, confirmations, advance, next, reply, status, boot, click, change, rows, editRoute, removeRoute, accept, finishJob,
         maxSimultaneous: () => maxSimultaneous, timers };
 }
 
-test('native page keeps menu, all four skins, seven options, and unique HTML IDs', () => {
+test('native page keeps menu, all four skins, nine options, and unique HTML IDs', () => {
     const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
     assert.equal(ids.length, new Set(ids).size);
-    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable']) { assert.ok(ids.includes('tailscale_' + key)); }
+    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable', 'accept_dns', 'custom_routes_enable']) { assert.ok(ids.includes('tailscale_' + key)); }
     for (const skin of ['ASUSWRT', 'ROG', 'TUF', 'TS']) { assert.ok(html.includes('[skin=' + skin + ']')); }
     assert.match(html, /show_menu\(menu_hook\)/);
     assert.doesNotMatch(html + source, /vx\.link|innerHTML|\.html\(|async\s*:\s*false|eval\(|document\.write/);
@@ -244,7 +248,7 @@ test('busy rejection releases controls and preserves draft settings', () => {
     const h = harness(); h.boot(); h.change('tailscale_accept_routes', true); h.click('apply_settings');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '1110101']);
+    assert.deepEqual(write.body.params, ['web_submit', '111010100', 'b64.']);
     h.reply(write, { accepted: false, error: 'busy' }); h.advance();
     assert.equal(h.nodes.apply_settings.disabled, false);
     assert.equal(h.nodes.tailscale_accept_routes.checked, true);
@@ -260,7 +264,7 @@ test('switch only edits the draft; Apply submits once and locks concurrent chang
     assert.equal(h.nodes.settings_notice.textContent, '正在提交设置…');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '0110001']);
+    assert.deepEqual(write.body.params, ['web_submit', '011000100', 'b64.']);
     assert.equal(h.app.apply(), false);
     h.accept(write); h.finishJob(h.next('tailscale_job'), 'success'); h.advance();
     const log = h.next(); log.finish(null, 'stopped');
@@ -425,7 +429,7 @@ test('core management remains available when structured status says the daemon i
 });
 
 
-test('queued save snapshots all seven settings without exposing DBus fields to httpdb', () => {
+test('queued save snapshots all nine settings without exposing DBus fields to httpdb', () => {
     const h = harness(); h.boot(); h.advance(5000);
     const inFlight = h.next('tailscale_fettle');
     h.change('tailscale_advertise_routes', true);
@@ -437,7 +441,7 @@ test('queued save snapshots all seven settings without exposing DBus fields to h
     h.reply(inFlight, h.status());
     const save = h.next('tailscale_config');
     assert.deepEqual(save.body.fields, {});
-    assert.deepEqual(save.body.params, ['web_submit', '1111010']);
+    assert.deepEqual(save.body.params, ['web_submit', '111101000', 'b64.']);
     assert.ok(h.history.filter(r => r.body).every(r => Object.keys(r.body.fields).length === 0));
 });
 
@@ -515,7 +519,7 @@ test('all draft options including enable are applied in one snapshot and reverti
     assert.equal(h.nodes.daemon_state.textContent, '运行中');
     h.click('apply_settings');
     const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '0110011']);
+    assert.deepEqual(write.body.params, ['web_submit', '011001100', 'b64.']);
     h.accept(write);
     assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
     assert.equal(h.nodes.daemon_state.textContent, '正在停止…');
@@ -624,4 +628,171 @@ test('unconfirmed or expired jobs cannot continue suppressing service errors', (
     h.click('job_resume');
     assert.match(h.nodes.connection_notice.textContent, /诊断摘要/);
     assert.equal(h.nodes.settings_notice.textContent, '正在确认设置结果…');
+});
+
+test('DNS and custom routes are independent draft settings in a nine-bit submission', () => {
+    const h = harness(); h.boot();
+    assert.equal(h.nodes.tailscale_accept_dns.checked, false);
+    assert.equal(h.nodes.custom_routes_editor.style.display, 'none');
+    assert.equal(h.rows().length, 1);
+    h.change('tailscale_accept_dns', true); h.change('tailscale_custom_routes_enable', true);
+    assert.equal(h.nodes.tailscale_advertise_routes.checked, false);
+    assert.equal(h.nodes.custom_routes_editor.style.display, '');
+    h.editRoute(0, ' 192.168.60.0/24 '); h.click('custom_routes_add');
+    h.editRoute(1, '2001:db8:1::/64'); h.click('custom_routes_add');
+    h.editRoute(2, '   ');
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
+    h.click('apply_settings'); const write = h.next('tailscale_config');
+    assert.deepEqual(write.body.params, ['web_submit', '111000111', wire('192.168.60.0/24,2001:db8:1::/64')]);
+    assert.deepEqual(write.body.fields, {});
+    assert.ok(h.rows().every(row => row.input.disabled && row.remove.disabled));
+    assert.equal(h.nodes.custom_routes_add.disabled, true);
+    h.accept(write);
+    assert.equal(JSON.parse(h.storage.tailscale3_pending).routes, '192.168.60.0/24,2001:db8:1::/64');
+});
+
+test('route edits compare the trimmed nonempty list, preserve collapsed rows, and retain one empty row', () => {
+    const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    h.editRoute(0, '192.168.60.0/24'); h.change('tailscale_custom_routes_enable', false);
+    assert.equal(h.nodes.custom_routes_editor.style.display, 'none');
+    assert.equal(h.rows()[0].input.value, '192.168.60.0/24');
+    assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+    h.change('tailscale_custom_routes_enable', true);
+    assert.equal(h.rows()[0].input.value, '192.168.60.0/24');
+    h.click('custom_routes_add'); h.editRoute(1, '2001:db8::/64'); h.removeRoute(0);
+    assert.equal(h.rows()[0].input.value, '2001:db8::/64');
+    h.removeRoute(0); assert.equal(h.rows().length, 1); assert.equal(h.rows()[0].input.value, '');
+    h.change('tailscale_custom_routes_enable', false);
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    h.editRoute(0, ' \t'); h.click('custom_routes_add');
+    assert.equal(h.nodes.settings_notice.textContent, '');
+});
+
+test('at most 32 editable rows are available and deleting a row re-enables adding', () => {
+    const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    for (let i = 1; i < 32; i++) { h.click('custom_routes_add'); }
+    assert.equal(h.rows().length, 32); assert.equal(h.nodes.custom_routes_add.disabled, true);
+    h.nodes.custom_routes_add.events.click(); assert.equal(h.rows().length, 32);
+    h.removeRoute(10); assert.equal(h.rows().length, 31); assert.equal(h.nodes.custom_routes_add.disabled, false);
+    h.click('custom_routes_add'); assert.equal(h.rows().length, 32);
+});
+
+test('format hints do not block backend validation and invalid detail is safe text on the submitted row', () => {
+    const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    h.editRoute(0, '192.168.60.0/24'); h.click('custom_routes_add'); h.click('custom_routes_add');
+    const unsafe = '<img src=x onerror=alert(1)>';
+    h.editRoute(2, unsafe);
+    assert.match(h.rows()[2].hint.textContent, /CIDR/);
+    h.click('apply_settings'); const write = h.next('tailscale_config');
+    assert.equal(write.body.params[2], wire('192.168.60.0/24,' + unsafe));
+    const detail = '2 ' + unsafe + '：不是有效的 CIDR';
+    h.reply(write, { accepted: false, error: 'invalid_custom_routes', detail }); h.advance();
+    assert.equal(h.nodes.settings_notice.textContent, detail);
+    assert.equal(h.nodes.job_message.textContent, detail);
+    assert.equal(h.rows()[2].input.attrs['aria-invalid'], 'true');
+    assert.equal(h.rows()[1].input.attrs['aria-invalid'], undefined);
+    assert.equal(h.rows()[2].input.value, unsafe);
+    assert.equal(h.rows()[2].hint.textContent, detail);
+    assert.equal(h.nodes.apply_settings.disabled, false);
+    h.editRoute(2, '119.188.240.179/32');
+    assert.equal(h.rows()[2].input.attrs['aria-invalid'], undefined);
+    assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+});
+
+test('reloading a nine-bit task restores its route draft through failure and config reload', () => {
+    const saved = { id: '64531', method: 'tailscale_config', draft: '111000111', routes: '192.168.60.0/24,2001:db8::/64', intent: 'apply' };
+    const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'running'); h.next().finish(null, 'applying');
+    h.reply(h.next(), [{ tailscale_enable: '1', tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_custom_routes: '10.20.0.0/16' }]);
+    h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+    assert.equal(h.nodes.tailscale_accept_dns.checked, true);
+    assert.equal(h.nodes.tailscale_custom_routes_enable.checked, true);
+    assert.deepEqual(h.rows().map(row => row.input.value), ['192.168.60.0/24', '2001:db8::/64']);
+    h.finishJob(reach(h, 'tailscale_job'), 'failed');
+    h.reply(reach(h, '/_api/tailscale_'), [{ tailscale_enable: '1', tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_custom_routes: '10.20.0.0/16' }]);
+    assert.equal(h.nodes.tailscale_accept_dns.checked, true);
+    assert.deepEqual(h.rows().map(row => row.input.value), ['192.168.60.0/24', '2001:db8::/64']);
+    assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+});
+
+test('legacy seven-bit task drafts preserve the new configuration values read from the backend', () => {
+    const saved = { id: '64532', method: 'tailscale_config', draft: '1110001', intent: 'apply' };
+    const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'running'); h.next().finish(null, 'applying');
+    const persisted = { tailscale_enable: '0', tailscale_accept_dns: '1', tailscale_custom_routes_enable: '1', tailscale_custom_routes: '10.20.0.0/16' };
+    h.reply(h.next(), [persisted]); h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+    assert.equal(h.nodes.tailscale_enable.checked, true);
+    assert.equal(h.nodes.tailscale_accept_dns.checked, true);
+    assert.equal(h.nodes.tailscale_custom_routes_enable.checked, true);
+    assert.equal(h.rows()[0].input.value, '10.20.0.0/16');
+    h.finishJob(reach(h, 'tailscale_job'), 'failed'); h.reply(reach(h, '/_api/tailscale_'), [persisted]);
+    assert.equal(h.nodes.tailscale_accept_dns.checked, true);
+    assert.equal(h.rows()[0].input.value, '10.20.0.0/16');
+    h.click('apply_settings'); const write = reach(h, 'tailscale_config');
+    assert.deepEqual(write.body.params, ['web_submit', '111000111', wire('10.20.0.0/16')]);
+});
+
+test('route baseline loads saved rows and successful normalization replaces the draft', () => {
+    const h = harness(); h.app.init();
+    const persisted = { tailscale_custom_routes_enable: '1', tailscale_custom_routes: '2001:db8::/64' };
+    h.reply(h.next(), [persisted]); h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    h.editRoute(0, ' 2001:db8::/64 '); assert.equal(h.nodes.settings_notice.textContent, '');
+    h.editRoute(0, '2001:DB8::/64'); assert.equal(h.nodes.settings_notice.textContent, '设置尚未应用');
+    h.click('apply_settings'); h.accept(h.next('tailscale_config')); h.finishJob(h.next('tailscale_job'), 'success');
+    h.reply(reach(h, '/_api/tailscale_'), [persisted]);
+    assert.equal(h.rows()[0].input.value, '2001:db8::/64'); assert.equal(h.nodes.settings_notice.textContent, '');
+});
+
+test('route status states what is advertised and primary without guessing approval', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+    h.reply(h.next('tailscale_fettle'), h.status({ routes: { advertised: ['192.168.60.0/24', '<script>route</script>'], primary: [] } }));
+    assert.equal(h.nodes.routes_advertised.textContent, '192.168.60.0/24、<script>route</script>');
+    assert.equal(h.nodes.routes_primary.textContent, '无');
+    assert.equal(h.nodes.routes_status.style.display, '');
+    assert.doesNotMatch(h.nodes.routes_status.textContent, /待批准|未批准/);
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance(5000);
+    h.reply(h.next('tailscale_fettle'), h.status()); assert.equal(h.nodes.routes_status.style.display, 'none');
+});
+
+test('a backend error inside a pasted comma-separated row highlights the original input', () => {
+    const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    h.editRoute(0, '192.168.60.0/24,192.168.60.1/24');
+    h.click('apply_settings'); h.reply(h.next('tailscale_config'), { accepted: false, error: 'invalid_custom_routes', detail: '2\t192.168.60.1/24\t含主机位' });
+    assert.equal(h.rows()[0].input.attrs['aria-invalid'], 'true');
+    assert.equal(h.rows()[0].input.value, '192.168.60.0/24,192.168.60.1/24');
+});
+
+test('route transport uses UTF-8 base64url for invalid Unicode text and a nonempty empty-list marker', () => {
+    const h = harness(); h.boot(); h.editRoute(0, '中文😀网段/32'); h.click('apply_settings');
+    const write = h.next('tailscale_config');
+    assert.equal(write.body.params[2], wire('中文😀网段/32'));
+    h.reply(write, { accepted: false, error: 'invalid_custom_routes', detail: '1 中文😀网段/32：不是有效的 CIDR' });
+    assert.match(h.nodes.settings_notice.textContent, /中文😀网段/);
+    h.editRoute(0, ''); h.click('apply_settings');
+    assert.equal(h.next('tailscale_config').body.params[2], 'b64.');
+});
+
+test('an oversized rejected draft is preserved for correction within the editor row limit', () => {
+    const routes = Array.from({ length: 34 }, (_, index) => '192.168.' + index + '.0/24').join(',');
+    const h = harness({ tailscale3_pending: JSON.stringify({ id: '64325', method: 'tailscale_config', draft: '111000111', routes }) });
+    h.app.init();
+    assert.equal(h.rows().length, 32);
+    assert.equal(h.rows().map(row => row.input.value).join(','), routes);
+});
+
+test('httpdb explicitly rejects an oversized settings request without creating an unknown task', () => {
+    const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    const draft = '1'.repeat(2048); h.editRoute(0, draft); h.click('apply_settings');
+    const write = h.next('tailscale_config'); assert.equal(write.body.params[2], wire(draft));
+    write.finish(null, { result: -6 }); h.advance();
+    assert.equal(h.nodes.apply_settings.disabled, false);
+    assert.equal(h.nodes.job_state.textContent, '操作未被接收');
+    assert.match(h.nodes.settings_notice.textContent, /过长.*未接收/);
+    assert.equal(h.rows()[0].input.value, draft);
+    assert.equal(h.rows()[0].input.attrs['aria-invalid'], undefined);
+    assert.equal(h.storage.tailscale3_pending, undefined);
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_job').length, 0);
+    h.editRoute(0, '192.168.60.0/24'); h.click('apply_settings');
+    assert.equal(h.next('tailscale_config').body.params[2], wire('192.168.60.0/24'));
 });

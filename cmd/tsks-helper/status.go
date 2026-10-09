@@ -14,23 +14,24 @@ import (
 )
 
 type statusResult struct {
-	OK          bool     `json:"ok"`
-	Version     string   `json:"version"`
-	VersionLong string   `json:"version_long"`
-	Backend     string   `json:"backend_state"`
-	Online      *bool    `json:"online"`
-	Codes       []string `json:"health_codes"`
-	Messages    []string `json:"health_messages"`
-	AuthURL     string   `json:"auth_url"`
-	IPs         []string `json:"ips"`
-	NodeID      string   `json:"node_id"`
-	HaveNodeKey *bool    `json:"have_node_key"`
-	WantRunning *bool    `json:"want_running"`
-	LoggedOut   *bool    `json:"logged_out"`
-	Sync        *bool    `json:"sync_enabled"`
-	HealthReady bool     `json:"health_available"`
-	Monitoring  bool     `json:"monitoring_available"`
-	Error       string   `json:"error,omitempty"`
+	OK          bool        `json:"ok"`
+	Version     string      `json:"version"`
+	VersionLong string      `json:"version_long"`
+	Backend     string      `json:"backend_state"`
+	Online      *bool       `json:"online"`
+	Codes       []string    `json:"health_codes"`
+	Messages    []string    `json:"health_messages"`
+	AuthURL     string      `json:"auth_url"`
+	IPs         []string    `json:"ips"`
+	Routes      routeStatus `json:"routes"`
+	NodeID      string      `json:"node_id"`
+	HaveNodeKey *bool       `json:"have_node_key"`
+	WantRunning *bool       `json:"want_running"`
+	LoggedOut   *bool       `json:"logged_out"`
+	Sync        *bool       `json:"sync_enabled"`
+	HealthReady bool        `json:"health_available"`
+	Monitoring  bool        `json:"monitoring_available"`
+	Error       string      `json:"error,omitempty"`
 }
 
 func localClient(socket string) *http.Client {
@@ -71,7 +72,7 @@ func redact(s string) string {
 	return keyPattern.ReplaceAllString(authPattern.ReplaceAllString(s, "[authorization link redacted]"), "[credential redacted]")
 }
 func readStatus(socket string) statusResult {
-	out := statusResult{Codes: []string{}, Messages: []string{}, IPs: []string{}, Backend: "Unavailable"}
+	out := statusResult{Codes: []string{}, Messages: []string{}, IPs: []string{}, Routes: routeStatus{Advertised: []string{}, Primary: []string{}}, Backend: "Unavailable"}
 	c := localClient(socket)
 	var s struct {
 		Version      string
@@ -80,9 +81,10 @@ func readStatus(socket string) statusResult {
 		AuthURL      string
 		HaveNodeKey  *bool
 		Self         *struct {
-			ID           string
-			Online       *bool
-			TailscaleIPs []string
+			ID            string
+			Online        *bool
+			TailscaleIPs  []string
+			PrimaryRoutes json.RawMessage
 		}
 	}
 	if e := localJSON(c, "status?peers=false", &s); e != nil {
@@ -95,6 +97,7 @@ func readStatus(socket string) statusResult {
 	out.Backend = s.BackendState
 	out.HaveNodeKey = s.HaveNodeKey
 	if s.Self != nil {
+		out.Routes.Primary = statusRoutes(s.Self.PrimaryRoutes)
 		out.NodeID = s.Self.ID
 		out.Online = s.Self.Online
 		for _, s := range s.Self.TailscaleIPs {
@@ -110,11 +113,13 @@ func readStatus(socket string) statusResult {
 		out.AuthURL = s.AuthURL
 	}
 	var p struct {
-		WantRunning *bool
-		LoggedOut   *bool
-		Sync        json.RawMessage
+		WantRunning     *bool
+		LoggedOut       *bool
+		Sync            json.RawMessage
+		AdvertiseRoutes json.RawMessage
 	}
 	if e := localJSON(c, "prefs", &p); e == nil {
+		out.Routes.Advertised = statusRoutes(p.AdvertiseRoutes)
 		out.WantRunning = p.WantRunning
 		out.LoggedOut = p.LoggedOut
 		yes := true

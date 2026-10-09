@@ -144,7 +144,7 @@ def write_executable(path, text):
     path.chmod(0o755)
 
 
-def inside(serve, ids_only=False):
+def inside(serve, ids_only=False, params_only=False):
     sys.path.insert(0, "/tests")
     import test_backend
 
@@ -292,6 +292,24 @@ sys.exit(7)
         raise AssertionError("job did not reach a terminal state: " + method)
 
     try:
+        write_executable(Path("/koolshare/scripts/tailscale_args_probe"), '#!/bin/sh\n. /koolshare/scripts/tailscale_lib.sh\nts_init || exit 1\nID=$1\nbody=$(printf \'{"argc":%s,"bits":%s,"routes":%s}\' "$#" "$(ts_quote "${2-}")" "$(ts_quote "${3-}")")\nts_reply "$body"\n')
+        route_params = ("", "192.0.2.0/24", "2001:db8:abcd::/48,198.51.100.10/32", ",".join(f"2001:0db8:1111:2222:3333:4444:5555:{i:04x}/128" for i in range(32)), "非法网段")
+        for routes in route_params:
+            wire = "b64." + base64.urlsafe_b64encode(routes.encode()).decode().rstrip("=")
+            _, actual = rpc("tailscale_args_probe", ["011110101", wire])
+            assert actual == {"argc": 3, "bits": "011110101", "routes": wire}, actual
+        subprocess.run(["/koolshare/bin/dbus", "set", "tailscale_probe_newline=one"], env=env, check=True)
+        stored = subprocess.check_output(["/koolshare/bin/dbus", "get", "tailscale_probe_newline"], env=env)
+        assert stored in (b"one", b"one\n"), repr(stored)
+        oversized_wire = "b64." + base64.urlsafe_b64encode(b"1" * 2048).decode().rstrip("=")
+        large_reply = json.loads(request_http("/_api/", {"id": 98765432, "method": "tailscale_args_probe", "params": ["011110101", oversized_wire], "fields": {}}))
+        if large_reply.get("result") != -6:
+            assert json.loads(large_reply["result"])["routes"] == oversized_wire
+        if params_only:
+            print(json.dumps({"ok": True, "mode": "route-parameter-transport", "encoding": "b64-prefix", "empty_argument_preserved": True, "dbus_get_trailing_newline": stored.endswith(b"\n"),
+                              "oversized_wire_rejected": large_reply.get("result") == -6,
+                              "cases": len(route_params), "httpdb_sha256": hashlib.sha256((firmware / "rom/etc/koolshare/bin/httpdb").read_bytes()).hexdigest()}), flush=True)
+            return
         if Path("/plugin/manifest.sha256").is_file():
             subprocess.run(["/koolshare/bin/tsks-helper", "check-tree", "/plugin"], check=True, timeout=20)
         else:
@@ -350,6 +368,23 @@ sys.exit(7)
         job("tailscale_config", ["web_submit", "0111101"])
         config = json.loads(request_http("/_api/tailscale_"))["result"][0]
         assert config["tailscale_enable"] == "0", config
+        def wire_routes(value):
+            return "b64." + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+        job("tailscale_config", ["web_submit", "011110111", wire_routes("192.0.2.0/24,2001:0DB8:ABCD::/48")])
+        config = json.loads(request_http("/_api/tailscale_"))["result"][0]
+        assert config["tailscale_accept_dns"] == "1" and config["tailscale_custom_routes_enable"] == "1", config
+        assert config["tailscale_custom_routes"] == "192.0.2.0/24,2001:db8:abcd::/48", config
+        job("tailscale_config", ["web_submit", "0111101"])
+        assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
+        jobs_before = sorted(p.name for p in Path("/tmp/upload").glob("*.json"))
+        _, bad_routes = rpc("tailscale_config", ["web_submit", "011110111", wire_routes("192.0.2.1/24")])
+        assert bad_routes["accepted"] is False and bad_routes["error"] == "invalid_custom_routes", bad_routes
+        assert "192.0.2.0/24" in bad_routes["detail"], bad_routes
+        assert sorted(p.name for p in Path("/tmp/upload").glob("*.json")) == jobs_before
+        assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
+        job("tailscale_config", ["web_submit", "011110100", wire_routes("")])
+        cleared = json.loads(request_http("/_api/tailscale_"))["result"][0]
+        assert not cleared.get("tailscale_custom_routes"), cleared
 
         # The preceding stop removes the socket, providing the real missing-
         # daemon path. Recreate only the test LocalAPI service afterwards.
@@ -411,11 +446,12 @@ def main():
     parser.add_argument("--image", default="tailscale-firmware-test:bookworm")
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--ids-only", action="store_true", help="only verify actual transport request-ID boundaries")
+    parser.add_argument("--params-only", action="store_true", help="only verify CIDR and empty parameter transport")
     parser.add_argument("--port", type=int, default=33030)
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.inside:
-        inside(args.serve, args.ids_only)
+        inside(args.serve, args.ids_only, args.params_only)
         return
     roots = args.firmware_root or sorted((ROOT / "build/firmware").glob("*/root"))
     if not roots or (args.serve and len(roots) != 1):
@@ -441,6 +477,8 @@ def main():
             command += ["--serve"]
         if args.ids_only:
             command += ["--ids-only"]
+        if args.params_only:
+            command += ["--params-only"]
         print("Checking extracted firmware transport:", firmware.parent.name, flush=True)
         relay = None
         try:

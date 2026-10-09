@@ -32,7 +32,7 @@ get() { "$HELPER" json-get "$CASE/prefs.json" "$1"; }
 prefs() { "$CLI" --socket="$SOCKET" debug prefs >"$CASE/prefs.json"; }
 managed_set() {
     set -- set --netfilter-mode=on --accept-routes=true --advertise-exit-node=true \
-        --advertise-routes=192.0.2.0/24 --auto-update=false --update-check=false "$@"
+        --advertise-routes=192.0.2.0/24,198.51.100.27/32,2001:db8:60::/64 --auto-update=false --update-check=false "$@"
     "$CLI" --socket="$SOCKET" "$@"
 }
 check_managed() {
@@ -42,7 +42,7 @@ check_managed() {
     [ "$(get WantRunning)" = true ] || fail 'connect did not retain running intent'
     [ "$(get AutoUpdate.Apply)" = false ] && [ "$(get AutoUpdate.Check)" = false ] || fail 'updater preferences not disabled'
     routes=$(get AdvertiseRoutes)
-    for route in '"0.0.0.0/0"' '"::/0"' '"192.0.2.0/24"'; do
+    for route in '"0.0.0.0/0"' '"::/0"' '"192.0.2.0/24"' '"198.51.100.27/32"' '"2001:db8:60::/64"'; do
         printf '%s\n' "$routes" | grep -Fq "$route" || fail 'advertised route lost'
     done
     ! grep -Fq 'reason: [opts.UpdatePrefs]' "$CASE/daemon.log" || fail 'preferences were replaced through Start'
@@ -63,7 +63,19 @@ check_managed false
 "$HELPER" status "$SOCKET" >"$CASE/helper-status.json"
 [ "$("$HELPER" json-get "$CASE/helper-status.json" version)" = "$EXPECTED" ]
 case $("$HELPER" json-get "$CASE/helper-status.json" version_long) in "$EXPECTED"-t*) ;; *) fail 'missing real source stamp';; esac
+advertised=$("$HELPER" json-get "$CASE/helper-status.json" routes.advertised)
+for route in '"192.0.2.0/24"' '"198.51.100.27/32"' '"2001:db8:60::/64"'; do
+    printf '%s\n' "$advertised" | grep -Fq "$route" || fail 'helper omitted advertised subnet'
+done
+! printf '%s\n' "$advertised" | grep -Fq '"0.0.0.0/0"' || fail 'helper included IPv4 exit-node default'
+! printf '%s\n' "$advertised" | grep -Fq '"::/0"' || fail 'helper included IPv6 exit-node default'
 printf 'PASS: first set/connect preserves DNS, routes, exit node, updater and unmanaged preferences: %s\n' "$EXPECTED"
+managed_set --accept-dns=true
+check_managed true
+managed_set --accept-dns=false
+check_managed false
+[ "$(get Hostname)" = unmanaged-host ] || fail 'DNS toggle reset an unmanaged preference'
+printf 'PASS: explicit DNS true/false retains merged IPv4/IPv6 subnets and exit-node defaults\n'
 if [ "$OMIT_UPDATE" = 1 ]; then
     if "$CLI" update --help >"$CASE/update-help" 2>&1; then fail 'omitted update command remains available'; fi
     if "$CLI" --socket="$SOCKET" set --auto-update=true >"$CASE/enable-update.log" 2>&1; then fail 'omitted auto updater accepted Apply=true'; fi
@@ -108,11 +120,15 @@ migration() {
         if "$CLI" --socket="$SOCKET" set --accept-routes=true >"$CASE/old-set.log" 2>&1; then fail 'unsafe migration negative control unexpectedly succeeded'; fi
         grep -Fq 'Auto-update support is disabled in this build' "$CASE/old-set.log"
     fi
-    # Exactly one production-style set simultaneously fixes Apply and changes
-    # the managed flags, preserving the authenticated profile's DNS choice.
-    managed_set
+    # Exactly one production-style set fixes Apply and applies the configured
+    # DNS choice, including identities which previously enabled CorpDNS.
+    managed_set --accept-dns=false
     "$HELPER" connect "$SOCKET" >/dev/null
+    check_managed false
+    managed_set --accept-dns=true
     check_managed true
+    managed_set --accept-dns=false
+    check_managed false
     [ "$(get Hostname)" = core-smoke ] || fail 'existing unmanaged hostname changed'
     [ "$("$HELPER" json-get "$STATE" _machinekey)" = "$key_before" ] || fail 'synthetic machine identity changed'
     printf 'PASS: %s synthetic logged-in Apply=true migration via one managed set\n' "$name"

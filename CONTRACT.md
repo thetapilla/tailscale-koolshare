@@ -77,9 +77,11 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 接口流量响应为 `{"interfaces":[{"if":"tailscale0","ip":"...","rx":0,"tx":0}]}`。`rx`、`tx` 为字节计数。连接详情任务通过有时间上限的 CLI 调用生成状态文本，并经日志脱敏后显示。
 
+状态还包含 `routes: {"advertised": [], "primary": []}`。辅助程序从偏好中的 `AdvertiseRoutes` 及状态 `Self.PrimaryRoutes` 读取，过滤非法前缀、主机位和默认路由，规范化并去重。`primary` 表示控制面选定由本机承担的网段，缺失不等于未批准。
+
 ## 配置提交
 
-前端通过 `GET /_api/tailscale_` 读取配置。包括启用开关在内的所有选项先修改页面草稿，点击「应用设置」后才提交。保存时调用 `tailscale_config`，参数为 `["web_submit", "<七位配置快照>"]`，请求的 `fields` 保持为空对象。快照必须匹配 `^[01]{7}$`，位顺序如下：
+前端通过 `GET /_api/tailscale_` 读取配置。所有选项和网段列表先修改页面草稿，点击「应用设置」才提交。保存时调用 `tailscale_config`，参数为 `["web_submit", "<九位配置快照>", "<编码网段列表>"]`，请求的 `fields` 保持为空对象。快照匹配 `^[01]{9}$`，位顺序如下：
 
 1. `tailscale_enable`
 2. `tailscale_ipv4_enable`
@@ -88,12 +90,18 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 5. `tailscale_accept_routes`
 6. `tailscale_exit_node`
 7. `tailscale_watchdog_enable`
+8. `tailscale_accept_dns`（默认 `0`）
+9. `tailscale_custom_routes_enable`（默认 `0`）
 
-后台取得生命周期锁后才应用配置，避免 httpdb 在脚本获取锁之前写入 DBus。无快照的旧式 `web_submit` 仍保留兼容。查询和核心更新请求不携带 DBus 写入字段。
+`tailscale_custom_routes` 保存规范 CIDR 的逗号分隔明文，默认空；关闭自定义开关会保留列表。列表最多 32 项、2048 UTF-8 字节。线上第三参数为 `b64.` 加无填充 base64url 编码的 UTF-8 列表；空列表为 `b64.`。真实固件 httpdb 会丢弃空参数，因此不能直接传空字符串。最长合法 32 条 IPv6 输入已通过实际传输验证。部分固件会将过长的编码请求拒绝为 `result: -6`，前端将其作为明确拒绝显示，保留草稿并解锁，不查询不存在的任务。
 
-前端按任务 ID 保存方法、操作意图、目标启用状态和配置快照，刷新页面后继续查询同一任务。配置提交与执行期间显示处理进度；失败后保留已提交草稿，并重新读取持久配置进行比较。配置生命周期和已进入 `switching` 阶段的核心任务显示过渡状态，暂缓显示预期的 `local_api_unavailable`；HTTP 请求错误、配置错误、任务失败或结果长期无法确认仍显示相应提示。诊断、更新检查和下载阶段不采用此过渡状态。
+九位快照必须带编码列表；七位快照必须只有快照参数，仅更新原有七个开关，三个新键保持原值。无快照的旧式 `web_submit` 仍保留兼容。格式、参数个数和列表先同步校验，失败返回 `{"accepted":false,"error":"invalid_custom_routes","detail":"序号 条目：原因"}`，不创建任务、不写 DBus。快照格式错误使用 `invalid_config_snapshot`。
 
-IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固件当前 LAN 地址及掩码。Tailscale 自身的 netfilter 保持启用。插件 NAT 链放在既有 Fullcone 等 POSTROUTING 钩子之后，地址变化和 NAT 事件由维护任务补充刷新。
+后台取得生命周期锁后才应用配置。备份和恢复包括路由字符串，空值删除相应键。字符串保存在独立的私有文件，按实际 DBus 协议仅去掉一个记录终止换行。正常恢复会重新校验；若旧值原本已损坏，允许合法新提交修复，失败时仅原样恢复这份不可信数据并明确告警，启动仍拒绝使用它。路由值从不作为 Shell 源码执行。查询和核心更新请求不携带 DBus 写入字段。
+
+前端按任务 ID 保存方法、操作意图、目标启用状态、配置快照和明文网段草稿，刷新后继续查询同一任务。脏检查比较九位快照与网段列表；旧七位草稿只恢复原开关，其余字段来自当前配置。配置提交与执行期间显示进度，失败后保留草稿；网段错误详情以文本显示并定位相应行。配置生命周期和已进入 `switching` 阶段的核心任务显示过渡状态，暂缓显示预期的 `local_api_unavailable`；HTTP 请求错误、配置错误、任务失败或结果长期无法确认仍显示提示。诊断、更新检查和下载阶段不采用此过渡状态。
+
+IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则。宣告列表由启用的本机 LAN 网段和启用的自定义列表合并、保序去重；两者均关闭时传空列表。LAN 加 32 个独立自定义网段可合并为 33 条，出口节点默认路由由独立选项控制。Tailscale 自身的 netfilter 保持启用；自定义网段复用现有转发和 NAT 路径。插件 NAT 链放在既有 Fullcone 等 POSTROUTING 钩子之后。
 
 ## 核心事务与自动恢复
 
@@ -105,7 +113,7 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 
 恢复尝试先写入持久记录，再重启插件服务。自动恢复沿用 daemon 持久化的连接意图，保留主动断开、登出或等待登录状态；手动启动在应用托管偏好后通过辅助程序 `connect` 请求连接。尝试间隔至少 1800 秒，任意连续 24 小时最多两次。地址与防火墙维护独立于自动恢复开关。
 
-启动时用同一次 `tailscale set` 应用网络托管偏好及 `--auto-update=false --update-check=false`。这一原子偏好修改可迁移已有的 `AutoUpdate.Apply=true`，适配已移除 clientupdate 的核心，也兼容旧核心回退。LocalAPI 的 `have_node_key != true` 表示当前身份尚未完成登录，此时追加 `--accept-dns=false`；身份存在后保留其 DNS 偏好。状态文件可能仅含 `{}`，文件大小不用于身份判定。自动启动不调用 `connect`；手动连接失败会使任务失败并进入原有配置恢复流程。
+启动时用同一次 `tailscale set` 应用路由等托管偏好、页面指定的 `--accept-dns=true|false` 及 `--auto-update=false --update-check=false`。DNS 默认关闭，既有身份也按开关执行；CLI 临时改动会在下次应用或启动时被托管配置覆盖。其他未托管偏好保留。自动更新偏好在同次编辑中归一，兼容核心切换和回退。`have_node_key` 继续用于身份与健康检查，状态文件大小不用于身份判定。自动启动不调用 `connect`；手动连接失败进入原有配置恢复流程。
 
 离线冷启动可能在取得控制面信息前保持 `NoState`。启动与核心自检仅在 LocalAPI 正常、节点密钥存在、运行意图为真、未登出且结构化健康信息可读，并且没有 `state-store-health` 警告时，将其视为等待控制同步。其余 `NoState` 不作为启动成功。这个判断不改变看门狗对监测能力的要求。
 
@@ -122,6 +130,8 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 | `version BINARY` | 设置 `TS_BE_CLI=1`，在 5 秒内读取 CLI 输出的首个字段，要求为纯 `X.Y.Z` 发布版本 |
 | `status SOCKET` | 通过受限 LocalAPI 请求返回状态、健康信息和身份存在标志；不返回原始 state |
 | `connect SOCKET` | 读取 prefs，必要时只 PATCH `WantRunning`，再读取状态；仅 `NeedsLogin` 时请求交互式登录。请求失败则非零退出 |
+| `routes LIST` | 校验逗号分隔 CIDR，规范化、去重并保序输出；最多 32 项和 2048 字节，失败输出单条 TSV 原因 |
+| `routes-wire ENCODED` | 严格解码 `b64.` + 无填充 base64url UTF-8 数据，再执行相同网段校验 |
 | `fetch URL DEST MAX_BYTES` | 有大小和时间上限的 HTTPS 下载，仅接受允许的发布及 CDN 主机 |
 | `verify ENVELOPE PUBKEY ARCH` | 校验签名与清单，输出所选架构的扁平描述符 |
 | `extract ARCHIVE DESCRIPTOR DEST` | 校验归档与核心哈希、大小、结构及 ELF 架构，安全解包 |
@@ -137,6 +147,8 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 辅助程序的 `health_available` 仅表示结构化健康快照读取成功；它不依赖控制面提供的 `Self` 信息。`monitoring_available` 继续要求完整的连接状态和运行意图数据，供自动恢复判定使用。结构化健康信息不可读时，不能仅凭密钥存在将 `NoState` 认定为正常等待。
 
 `connect` 仅访问固定端点：`GET /localapi/v0/prefs`、必要的 `PATCH /localapi/v0/prefs`、`GET /localapi/v0/status?peers=false` 和按状态选择的 `POST /localapi/v0/login-interactive`。PATCH 请求体固定为 `{"WantRunning":true,"WantRunningSet":true}`，要求 HTTP 200；登录请求要求 2xx。每次请求限时 3 秒，不接受调用者提供路径或请求体。输出包含 `ok`、`want_running_set`、`login_requested`、`backend_state`。
+
+`routes` 不接受空白、主机位、默认路由，以及与 Tailscale 地址空间（含 4via6）、环回、组播、链路本地、未指定和 IPv4 映射 IPv6 范围重叠的前缀。主机位错误给出建议网络地址，不自动更正。错误为 `序号<TAB>条目<TAB>原因` 单条记录，控制字符可见转义，超长错误条目截断；经 JSON 转义后由页面以文本显示。
 
 ## 签名清单与核心归档
 

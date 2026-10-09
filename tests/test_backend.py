@@ -4,6 +4,7 @@ Every command with a router side effect is replaced in PATH; all writable roots
 are TemporaryDirectory children. Set TSKS_TEST_SHELL to an ash-compatible shell
 to run the identical suite on Linux/BusyBox in CI.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get("TSKS_TEST_SHELL", "/bin/sh")
 FIRMWARE_TOOLS = ("awk", "cat", "chmod", "cp", "date", "df", "grep", "ln", "ls", "mkdir",
                   "mv", "readlink", "rm", "sleep", "tail", "tr", "uname", "wc", "which")
+
+def routes_wire(value):
+    return "b64." + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+
 
 MOCK = r'''#!/usr/bin/env python3
 import fcntl,json,os,shlex,sys
@@ -40,7 +45,13 @@ if name=='dbus':
         if os.environ.get('DBUS_FAIL_ONCE_KEY')==key and not (root/'dbus-failed').exists():
             (root/'dbus-failed').touch();sys.exit(1)
         data[key]=value;write('config.json',data)
-    elif args[0]=='remove':data.pop(args[1],None);write('config.json',data)
+    elif args[0]=='remove':
+        if os.environ.get('REQUIRE_CONFIG_LOCK')=='1':
+            with open(Path(os.environ['TSKS_RUN'])/'operation.lock','a') as lock:
+                try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:pass
+                else:sys.exit(90)
+        data.pop(args[1],None);write('config.json',data)
 elif name=='nvram':print(read('nvram.json',{}).get(args[1],''))
 elif name=='flock':
     try:fcntl.flock(int(args[-1]),fcntl.LOCK_UN if '-u' in args else fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -63,6 +74,34 @@ elif name=='curl':
         sys.exit(code)
 elif name=='tsks-helper':
     if args[0]=='quote':print(json.dumps(args[1],ensure_ascii=False))
+    elif args[0] in ('routes','routes-wire'):
+        if args[0]=='routes-wire':
+            import base64,re
+            wire=args[1]
+            try:
+                if not wire.startswith('b64.') or re.fullmatch('[A-Za-z0-9_-]*',wire[4:]) is None:raise ValueError()
+                decoded=base64.b64decode(wire[4:]+'='*(-len(wire[4:])%4),altchars=b'-_',validate=True)
+                if base64.urlsafe_b64encode(decoded).decode().rstrip('=')!=wire[4:]:raise ValueError()
+                args[1]=decoded.decode()
+            except (ValueError,UnicodeError):
+                print('1\t(encoded)\t无效的网段传输编码',file=sys.stderr);sys.exit(1)
+        # The Go suite owns CIDR parsing. These explicit fixtures exercise the
+        # shell's protocol, ordering, rollback and error escaping only.
+        fixtures={'':'', '192.168.50.0/24':'192.168.50.0/24',
+                  '192.168.60.0/24':'192.168.60.0/24', '119.188.240.179/32':'119.188.240.179/32',
+                  '2001:db8::/64':'2001:db8::/64', '2001:0DB8:0:0::/64':'2001:db8::/64'}
+        fixtures.update(read('route-fixtures.json',{}))
+        values=args[1].split(',')
+        if all(value in fixtures for value in values):
+            print(','.join(dict.fromkeys(fixtures[value] for value in values)))
+        else:
+            errors=read('route-errors.json',{})
+            error=errors.get(args[1])
+            if error is None:
+                index=next(i for i,value in enumerate(values,1) if value not in fixtures)
+                entry=json.dumps(values[index-1],ensure_ascii=False)[1:-1] or '(empty)'
+                error=str(index)+'\t'+entry+'\t无效的 CIDR 网段'
+            print(error,file=sys.stderr);sys.exit(1)
     elif args[0]=='fifo':os.mkfifo(args[1],0o600)
     elif args[0]=='temp':
         import tempfile
@@ -388,7 +427,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn("--netfilter-mode=on", args)
         self.assertIn("--auto-update=false", args)
         self.assertIn("--update-check=false", args)
-        self.assertNotIn("--accept-dns=false", args)
+        self.assertIn("--accept-dns=false", args)
         self.assertFalse(any("--reset" in a for a in args))
         self.assertEqual(self.calls("tailscaled"), [])
         self.assertIn("* * * * *", self.calls("cru")[-1][-1])
@@ -418,7 +457,7 @@ class BackendTests(unittest.TestCase):
                     self.assertEqual(args[1], "set")
                     for flag in ("--auto-update=false", "--update-check=false", "--advertise-exit-node=true"):
                         self.assertIn(flag, args)
-                    self.assertEqual("--accept-dns=false" in args, have_key is not True)
+                    self.assertIn("--accept-dns=false", args)
                     sequence = [json.loads(line) for line in (self.mock / "calls.jsonl").read_text().splitlines()]
                     connect = [i for i, (name, argv) in enumerate(sequence) if name == "tsks-helper" and argv[0] == "connect"]
                     self.assertEqual(len(connect), 1 if startup == "manual" else 0)
@@ -426,6 +465,77 @@ class BackendTests(unittest.TestCase):
                         set_index = next(i for i, (name, argv) in enumerate(sequence) if name == "tailscale")
                         self.assertLess(set_index, connect[0])
                         self.assertEqual(sequence[connect[0]][1], ["connect", str(self.run / "tailscaled.sock")])
+
+    def test_dns_setting_is_applied_for_new_and_existing_identities(self):
+        for have_key in (False, True):
+            for setting in ("0", "1"):
+                with self.subTest(have_key=have_key, setting=setting):
+                    (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                    self.write("status.json", dict(self.status, have_node_key=have_key))
+                    self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_dns": setting})
+                    self.shell("ts_pid_alive() { return 0; }; ts_start automatic")
+                    calls = self.calls("tailscale")
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn("--accept-dns=" + ("true" if setting == "1" else "false"), calls[0])
+                    self.assertIn("--auto-update=false", calls[0])
+                    self.assertIn("--update-check=false", calls[0])
+                    self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+
+    def test_advertised_routes_merge_lan_and_custom_without_duplicates(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_custom_routes_enable": "1",
+            "tailscale_custom_routes": "119.188.240.179/32,192.168.50.0/24,2001:0DB8:0:0::/64,119.188.240.179/32"})
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertIn("--advertise-routes=192.168.50.0/24,119.188.240.179/32,2001:db8::/64", self.calls("tailscale")[0])
+        log = (self.run / "events.log").read_text()
+        self.assertIn("已宣告 3 条网段", log)
+        self.assertNotIn("2001:0DB8:0:0::/64", log)
+        self.assertIn("请在管理控制台批准", log)
+
+    def test_custom_route_limit_allows_lan_as_additional_route(self):
+        routes = [f"192.168.{60 + i}.0/24" for i in range(32)]
+        self.write("route-fixtures.json", {value: value for value in routes})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_custom_routes_enable": "1",
+                                  "tailscale_custom_routes": ",".join(routes)})
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertIn("--advertise-routes=192.168.50.0/24," + ",".join(routes), self.calls("tailscale")[0])
+        self.assertIn("已宣告 33 条网段", (self.run / "events.log").read_text())
+
+    def test_custom_routes_work_without_reading_lan_configuration(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_advertise_routes": "0",
+            "tailscale_custom_routes_enable": "1", "tailscale_custom_routes": "119.188.240.179/32,2001:db8::/64"})
+        self.write("nvram.json", {})
+        self.shell("ts_pid_alive() { return 0; }; ts_lan() { return 99; }; ts_start")
+        self.assertIn("--advertise-routes=119.188.240.179/32,2001:db8::/64", self.calls("tailscale")[0])
+
+    def test_disabled_custom_routes_are_retained_but_not_advertised(self):
+        original = {"tailscale_enable": "1", "tailscale_advertise_routes": "0",
+            "tailscale_custom_routes_enable": "0", "tailscale_custom_routes": "119.188.240.179/32"}
+        self.write("config.json", original)
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertIn("--advertise-routes=", self.calls("tailscale")[0])
+        self.assertEqual(self.read("config.json"), original)
+
+    def test_corrupt_saved_routes_block_start_even_when_disabled(self):
+        for value in ("192.168.60.1/24", "119.188.240.179/32\n", "119.188.240.179/32\nother=value"):
+            with self.subTest(value=value):
+                self.write("config.json", {"tailscale_enable": "1", "tailscale_custom_routes_enable": "0",
+                                          "tailscale_custom_routes": value})
+                result = self.shell("ts_pid_alive() { return 0; }; ts_start", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls("tailscale"), [])
+                self.assertEqual(self.calls("tailscaled"), [])
+                self.assertIn("设置值无效", (self.run / "events.log").read_text())
+
+    def test_route_status_is_copied_as_one_structured_object(self):
+        routes = {"advertised": ["119.188.240.179/32", "2001:db8::/64"], "primary": ["119.188.240.179/32"]}
+        self.write("status.json", dict(self.status, routes=routes))
+        result = json.loads(self.shell("ts_status_json").stdout)
+        self.assertEqual(result["routes"], routes)
+        fields = [args[2] for args in self.calls("tsks-helper") if args[0] == "json-get"]
+        self.assertEqual(fields.count("routes"), 1)
+        self.assertFalse(any(field.startswith("routes.") for field in fields))
+        self.write("status.json", None)
+        self.assertEqual(json.loads(self.shell("ts_status_json").stdout)["routes"], {"advertised": [], "primary": []})
 
     def test_running_manual_start_does_not_connect(self):
         self.shell("ts_pid_alive() { return 0; }; ts_start manual")
@@ -787,6 +897,126 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.read("config.json"), dict(zip(keys, "0101010")))
         self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "200"})
         self.assertEqual(json.loads((self.web / "tailscale3_200.json").read_text())["state"], "success")
+
+    def test_nine_bit_submission_normalizes_routes_and_writes_under_lock(self):
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        self.entry("tailscale_config", "210", "web_submit", "010101011",
+                   routes_wire("119.188.240.179/32,2001:0DB8:0:0::/64,119.188.240.179/32"))
+        keys = ["tailscale_enable", "tailscale_ipv4_enable", "tailscale_ipv6_enable", "tailscale_advertise_routes",
+                "tailscale_accept_routes", "tailscale_exit_node", "tailscale_watchdog_enable",
+                "tailscale_accept_dns", "tailscale_custom_routes_enable"]
+        expected = dict(zip(keys, "010101011"))
+        expected["tailscale_custom_routes"] = "119.188.240.179/32,2001:db8::/64"
+        self.assertEqual(self.read("config.json"), expected)
+        self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "210"})
+        self.assertEqual(json.loads((self.web / "tailscale3_210.json").read_text())["state"], "success")
+
+    def test_seven_bit_submission_preserves_new_settings(self):
+        new = {"tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
+               "tailscale_custom_routes": "119.188.240.179/32"}
+        self.write("config.json", dict(self.read("config.json"), **new))
+        self.entry("tailscale_config", "211", "web_submit", "0000000")
+        result = self.read("config.json")
+        self.assertEqual({key: result[key] for key in new}, new)
+        self.assertFalse(any(args[1].split("=", 1)[0] in new for args in self.calls("dbus") if args[0] != "get"))
+
+    def test_failed_seven_bit_submission_does_not_write_new_keys(self):
+        new = {"tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
+               "tailscale_custom_routes": "119.188.240.179/32"}
+        original = dict(self.read("config.json"), **new)
+        self.write("config.json", original)
+        self.env["DBUS_FAIL_ONCE_KEY"] = "tailscale_accept_routes"
+        self.assertNotEqual(self.entry("tailscale_config", "220", "web_submit", "0000000", check=False).returncode, 0)
+        self.assertEqual(self.read("config.json"), original)
+        self.assertFalse(any(args[1].split("=", 1)[0] in new for args in self.calls("dbus") if args[0] != "get"))
+
+    def test_legacy_submission_without_snapshot_preserves_all_settings(self):
+        original = {"tailscale_enable": "0", "tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
+                    "tailscale_custom_routes": "119.188.240.179/32"}
+        self.write("config.json", original)
+        self.entry("tailscale_config", "221", "web_submit")
+        self.assertEqual(self.read("config.json"), original)
+        self.assertEqual([args for args in self.calls("dbus") if args[0] != "get"], [])
+
+    def test_snapshot_argument_count_must_match_snapshot_width(self):
+        original = self.read("config.json")
+        for args in (("000000000",), ("0000000", ""), ("000000000", "", "extra")):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.entry("tailscale_config", "212", "web_submit", *args, check=False).returncode, 0)
+                self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_config_snapshot"})
+                self.assertEqual(self.read("config.json"), original)
+                self.assertFalse((self.web / "tailscale3_212.json").exists())
+        self.assertEqual([args for args in self.calls("dbus") if args[0] != "get"], [])
+
+    def test_invalid_routes_are_rejected_before_job_with_escaped_detail(self):
+        original = self.read("config.json")
+        value = '119.188.240.179/32,\"bad\"'
+        self.write("route-errors.json", {value: '2\t\"bad\"\t无效的 CIDR 网段'})
+        self.assertNotEqual(self.entry("tailscale_config", "213", "web_submit", "000000001", routes_wire(value), check=False).returncode, 0)
+        self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_custom_routes",
+                                                 "detail": '2 \"bad\"：无效的 CIDR 网段'})
+        self.assertEqual(self.read("config.json"), original)
+        self.assertFalse((self.web / "tailscale3_213.json").exists())
+        self.assertEqual([args for args in self.calls("dbus") if args[0] != "get"], [])
+        self.assertEqual(list(self.run.glob(".routes-check.*")), [])
+
+    def test_nine_bit_submission_requires_encoded_routes_on_wire(self):
+        original = self.read("config.json")
+        for value in ("", "119.188.240.179/32", "b64.@@@@", "b64.YQ=="):
+            with self.subTest(value=value):
+                self.assertNotEqual(self.entry("tailscale_config", "219", "web_submit", "000000001", value, check=False).returncode, 0)
+                reply = self.read("reply.json")
+                self.assertEqual(reply["error"], "invalid_custom_routes")
+                self.assertFalse(reply["accepted"])
+                self.assertEqual(self.read("config.json"), original)
+                self.assertFalse((self.web / "tailscale3_219.json").exists())
+
+    def test_empty_route_submission_removes_key_under_lock(self):
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        self.write("config.json", dict(self.read("config.json"), tailscale_custom_routes="119.188.240.179/32"))
+        self.entry("tailscale_config", "214", "web_submit", "000000000", routes_wire(""))
+        self.assertNotIn("tailscale_custom_routes", self.read("config.json"))
+        self.assertIn(["remove", "tailscale_custom_routes"], self.calls("dbus"))
+
+    def test_failed_apply_restores_custom_routes_and_dns(self):
+        original = dict(self.read("config.json"), tailscale_accept_dns="1", tailscale_custom_routes_enable="1",
+                        tailscale_custom_routes="119.188.240.179/32")
+        self.write("config.json", original)
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        self.env["DBUS_FAIL_ONCE_KEY"] = "tailscale_custom_routes"
+        result = self.entry("tailscale_config", "215", "web_submit", "000000000", routes_wire("2001:db8::/64"), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.read("config.json"), original)
+
+    def test_failed_service_action_restores_absent_route_key(self):
+        original = self.read("config.json")
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        result = self.shell('ts_pid_alive() { return 1; }; ts_restart() { return 1; }; ts_stop() { return 0; }; '
+                            'ID=216; ts_mutation web_submit 100000001 b64.MTE5LjE4OC4yNDAuMTc5LzMy', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.read("config.json"), original)
+        self.assertIn(["remove", "tailscale_custom_routes"], self.calls("dbus"))
+
+    def test_valid_submission_can_repair_invalid_saved_routes(self):
+        self.write("config.json", dict(self.read("config.json"), tailscale_custom_routes="bad\ntailscale_enable=1\n"))
+        self.entry("tailscale_config", "217", "web_submit", "000000001", routes_wire("119.188.240.179/32"))
+        result = self.read("config.json")
+        self.assertEqual(result["tailscale_custom_routes"], "119.188.240.179/32")
+        self.assertEqual(result["tailscale_enable"], "0")
+        self.assertEqual(list(self.run.glob("config.*previous")), [])
+        self.assertFalse((self.run / "config.routes.invalid").exists())
+
+    def test_failed_repair_restores_original_untrusted_routes_as_data(self):
+        original = dict(self.read("config.json"), tailscale_custom_routes='bad\ntailscale_enable=0\n$(touch /tmp/never-run)\n')
+        self.write("config.json", original)
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        result = self.shell('ts_pid_alive() { return 1; }; ts_restart() { return 1; }; ts_stop() { return 0; }; '
+                            'ID=218; ts_mutation web_submit 100000001 b64.MTE5LjE4OC4yNDAuMTc5LzMy', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.read("config.json"), original)
+        self.assertIn("已恢复原无效网段设置", (self.run / "events.log").read_text())
+        self.assertNotEqual(self.shell("ts_start", check=False).returncode, 0)
+        self.assertEqual(self.calls("tailscale"), [])
 
     def test_invalid_snapshots_never_write_dbus(self):
         original = self.read("config.json")

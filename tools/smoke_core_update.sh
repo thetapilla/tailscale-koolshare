@@ -98,6 +98,12 @@ fi
 "$HELPER" atomic-link "$old" "$DATA/current"
 printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_enable"
 printf '0' >"$TSKS_SMOKE_CONFIG/tailscale_advertise_routes"
+if [ "$mode" = update ]; then
+    printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_accept_dns"
+    printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_advertise_routes"
+    printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_custom_routes_enable"
+    printf '%s' '198.51.100.27/32,2001:db8:60::/64,192.0.2.0/24' >"$TSKS_SMOKE_CONFIG/tailscale_custom_routes"
+fi
 
 check_live() {
     expected=$1
@@ -126,6 +132,16 @@ check_identity() {
     # never emit raw state or credentials in test output.
     [ "$(ts_get "$STATE" _machinekey)" = "$machine_key" ] || fail 'generated machine identity changed'
 }
+check_preferences() {
+    ts_cli debug prefs >"$RUN/checked-prefs.json"
+    [ "$(ts_get "$RUN/checked-prefs.json" CorpDNS)" = true ] || fail 'DNS did not follow the enabled plugin setting'
+    [ "$(ts_get "$RUN/checked-prefs.json" Hostname)" = core-smoke ] || fail 'unmanaged hostname changed'
+    # ipn.Prefs.Persist is serialized under its historical JSON key Config.
+    [ "$(ts_get "$RUN/checked-prefs.json" Config.NodeID)" = nTEST ] || fail 'synthetic node identity changed'
+    [ "$(ts_get "$RUN/checked-prefs.json" AutoUpdate.Apply)" = false ] && [ "$(ts_get "$RUN/checked-prefs.json" AutoUpdate.Check)" = false ] || fail 'updater preferences not normalized'
+    [ "$(ts_get "$RUN/checked-prefs.json" RouteAll)" = true ] || fail 'accept-routes preference changed'
+    [ "$(ts_get "$RUN/checked-prefs.json" AdvertiseRoutes)" = '["192.0.2.0/24","198.51.100.27/32","2001:db8:60::/64"]' ] || fail 'LAN and custom IPv4/IPv6 route union changed'
+}
 check_committed() {
     [ "$(ts_core_target "$DATA/current")" = "$1" ] || fail 'transaction selected wrong core'
     [ "$(ts_core_target "$DATA/previous")" = "$2" ] || fail 'previous core was not retained'
@@ -140,11 +156,20 @@ ts_start
 check_live "$old_version"
 machine_key=$(ts_get "$STATE" _machinekey)
 [ -n "$machine_key" ] && [ "$machine_key" != null ] || fail 'fixture did not create a machine identity'
+if [ "$mode" = update ]; then
+    check_preferences
+    # The managed setting, rather than an old daemon preference, must win
+    # after each restart involved in a transaction.
+    ts_cli set --accept-dns=false --advertise-routes=
+fi
 # Seed the old running core with a real persisted Apply=true. This reproduces
 # the tailnet default adopted by older plugin versions before the transaction.
 ts_cli set --auto-update=true --update-check=true
 ts_cli debug prefs >"$RUN/before-prefs.json"
 [ "$(ts_get "$RUN/before-prefs.json" AutoUpdate.Apply)" = true ] || fail 'migration fixture did not retain Apply=true'
+if [ "$mode" = update ]; then
+    [ "$(ts_get "$RUN/before-prefs.json" CorpDNS)" = false ] || fail 'DNS negative control did not differ from the configured setting'
+fi
 if [ "$mode" = legacy-rollback ]; then
     # The previous plugin cannot cold-start a connected profile without a
     # control map. Keep the daemon/service enabled but deliberately disconnect
@@ -167,16 +192,17 @@ fi
 ts_core_switch "$new" || fail 'enabled update rejected a healthy real daemon'
 check_committed "$new" "$old"
 check_live "$new_version"
-ts_cli debug prefs >"$RUN/migrated-prefs.json"
-[ "$(ts_get "$RUN/migrated-prefs.json" AutoUpdate.Apply)" = false ] && [ "$(ts_get "$RUN/migrated-prefs.json" AutoUpdate.Check)" = false ] || fail 'candidate did not normalize updater preferences'
-[ "$(ts_get "$RUN/migrated-prefs.json" CorpDNS)" = true ] && [ "$(ts_get "$RUN/migrated-prefs.json" Hostname)" = core-smoke ] || fail 'candidate changed unowned preferences'
-printf 'PASS %s: enabled %s-%s -> %s-%s migrates Apply=true and preserves identity and preferences\n' "$arch" "$old_version" "$old_build" "$new_version" "$new_build"
+check_preferences
+printf 'PASS %s: enabled %s-%s -> %s-%s applies configured DNS/routes and preserves identity and hostname\n' "$arch" "$old_version" "$old_build" "$new_version" "$new_build"
 
+ts_cli set --accept-dns=false --advertise-routes=
 ts_core_rollback || fail 'manual rollback failed'
 check_committed "$old" "$new"
 check_live "$old_version"
-printf 'PASS %s: enabled manual rollback validates the previous real daemon\n' "$arch"
+check_preferences
+printf 'PASS %s: enabled manual rollback restores configured DNS/routes on the previous real daemon\n' "$arch"
 
+ts_cli set --accept-dns=false --advertise-routes=
 ts_stop
 ! ts_pid_alive || fail 'daemon survived explicit stop'
 printf '0' >"$TSKS_SMOKE_CONFIG/tailscale_enable"
@@ -189,6 +215,7 @@ printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_enable"
 ts_start
 check_live "$new_version"
 check_identity
+check_preferences
 ts_stop
 ! ts_pid_alive || fail 'candidate daemon survived final stop'
-printf 'PASS %s: disabled update leaves state unchanged; subsequent manual start succeeds\n' "$arch"
+printf 'PASS %s: disabled update leaves state unchanged; manual start applies configured DNS/routes\n' "$arch"

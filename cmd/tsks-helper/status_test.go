@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -17,10 +18,10 @@ func TestSanitizedLocalAPI(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/localapi/v0/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"Version":"1.104.1-t9a522a978","BackendState":"Running","Self":{"Online":false,"TailscaleIPs":["100.1.2.3"]},"Health":["warning"],"AuthURL":"javascript:alert(1)","PrivateKey":"never-export-me"}`))
+		w.Write([]byte(`{"Version":"1.104.1-t9a522a978","BackendState":"Running","Self":{"Online":false,"TailscaleIPs":["100.1.2.3"],"PrimaryRoutes":["192.0.2.0/24","2001:DB8::/64","::/0","0.0.0.0/0","invalid",null,17]},"Health":["warning"],"AuthURL":"javascript:alert(1)","PrivateKey":"never-export-me"}`))
 	})
 	mux.HandleFunc("/localapi/v0/prefs", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"WantRunning":true,"LoggedOut":false,"Sync":null,"Persist":{"PrivateNodeKey":"never-export-me"}}`))
+		w.Write([]byte(`{"WantRunning":true,"LoggedOut":false,"Sync":null,"AdvertiseRoutes":["192.0.2.0/24","2001:db8::/64","198.51.100.0/24","::/0","0.0.0.0/0","192.0.2.1/24","<script>",{}],"Persist":{"PrivateNodeKey":"never-export-me"}}`))
 	})
 	mux.HandleFunc("/localapi/v0/watch-ipn-bus", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("mask") != "130" {
@@ -37,6 +38,9 @@ func TestSanitizedLocalAPI(t *testing.T) {
 	}
 	if s.Version != "1.104.1" || s.VersionLong != "1.104.1-t9a522a978" {
 		t.Fatalf("version contract: %+v", s)
+	}
+	if !reflect.DeepEqual(s.Routes.Advertised, []string{"192.0.2.0/24", "2001:db8::/64", "198.51.100.0/24"}) || !reflect.DeepEqual(s.Routes.Primary, []string{"192.0.2.0/24", "2001:db8::/64"}) {
+		t.Fatalf("route contract: %+v", s.Routes)
 	}
 	b, _ := json.Marshal(s)
 	if strings.Contains(string(b), "never-export") {
@@ -72,6 +76,10 @@ func TestUnavailableSocket(t *testing.T) {
 	s := readStatus(filepath.Join(t.TempDir(), "missing"))
 	if s.OK || s.Monitoring || s.Online != nil || s.Backend != "Unavailable" {
 		t.Fatalf("%+v", s)
+	}
+	b, _ := json.Marshal(s)
+	if !strings.Contains(string(b), `"routes":{"advertised":[],"primary":[]}`) {
+		t.Fatalf("unavailable routes must be empty arrays: %s", b)
 	}
 }
 

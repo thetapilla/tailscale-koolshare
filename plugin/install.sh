@@ -30,7 +30,7 @@ check_package_paths() {
 
 check_package() {
     "$VERIFIED_HELPER" check-tree "$PKG" || fail '安装包文件校验失败'
-    [ "$(cat "$PKG/version")" = 3.1.0 ] || fail '插件版本无效'
+    [ "$(cat "$PKG/version")" = 3.2.0 ] || fail '插件版本无效'
 }
 
 verify_helper() {
@@ -206,7 +206,7 @@ prepare_files() {
             mkdir -p "$STAGE/backup/${rel%/*}" && cp -a "$path" "$STAGE/backup/$rel" || fail '无法备份现有文件'
         fi
     done <"$STAGE/files"
-    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
+    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_accept_dns tailscale_custom_routes_enable tailscale_custom_routes tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
         dbus get "$key" >"$STAGE/dbus/$key" || fail '无法备份插件设置'
     done
 }
@@ -270,7 +270,12 @@ restore() {
         done <"$STAGE/files"
         [ -z "$NEW_CORE" ] || rm -rf "$DATA/$NEW_CORE"
         for key in "$STAGE"/dbus/*; do
-            value=$(cat "$key")
+            value=$(cat "$key" && printf '.') || { rc=1; continue; }
+            value=${value%.}
+            # dbus get appends one record terminator; preserve any newline
+            # already present in the original value for an exact rollback.
+            case $value in *'
+') value=${value%?};; esac
             if [ -n "$value" ]; then dbus set "${key##*/}=$value" || rc=1; else dbus remove "${key##*/}" || rc=1; fi
         done
     fi
@@ -346,15 +351,15 @@ while IFS= read -r rel; do
     fi
 done <"$STAGE/files"
 "$VERIFIED_HELPER" atomic-link "$SELECTED" "$DATA/current" || fail '无法切换核心链接'
-for pair in tailscale_enable:0 tailscale_ipv4_enable:1 tailscale_ipv6_enable:1 tailscale_advertise_routes:1 tailscale_accept_routes:1 tailscale_exit_node:0 tailscale_watchdog_enable:1; do
+for pair in tailscale_enable:0 tailscale_ipv4_enable:1 tailscale_ipv6_enable:1 tailscale_advertise_routes:1 tailscale_accept_routes:1 tailscale_exit_node:0 tailscale_watchdog_enable:1 tailscale_accept_dns:0 tailscale_custom_routes_enable:0; do
     key=${pair%:*}; value=${pair#*:}
     [ -n "$(dbus get "$key")" ] || dbus set "$key=$value" || fail '无法设置默认参数'
 done
 HELPER=$KSROOT/bin/tsks-helper
 ts_start || fail '服务就绪检查失败'
 # Registration follows successful readiness, including disabled fresh installs.
-for pair in tailscale_version=3.1.0 softcenter_module_tailscale_version=3.1.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
+for pair in tailscale_version=3.2.0 softcenter_module_tailscale_version=3.2.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
     dbus set "$pair" || fail '无法注册插件'
 done
 COMMITTED=1
-say "Tailscale 3.1.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"
+say "Tailscale 3.2.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"

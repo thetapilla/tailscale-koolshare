@@ -33,6 +33,20 @@ func run(a []string) error {
 		return errors.New("command required")
 	}
 	switch a[0] {
+	case "routes", "routes-wire":
+		if len(a) != 2 {
+			return fmt.Errorf("%s LIST", a[0])
+		}
+		parse := customRoutes
+		if a[0] == "routes-wire" {
+			parse = wireRoutes
+		}
+		list, e := parse(a[1])
+		if e != nil {
+			return e
+		}
+		fmt.Println(list)
+		return nil
 	case "sha256":
 		if len(a) != 2 {
 			return errors.New("sha256 FILE")

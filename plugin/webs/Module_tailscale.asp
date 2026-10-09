@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.1.0"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.2.0"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -33,6 +33,13 @@
 .ts_actions input { margin:3px 5px 3px 0; }
 .ts_actions a { display:inline-block; margin:3px 5px 3px 0; }
 .ts_badge { font-size:12px; color:#ddd; margin-left:8px; }
+.ts_advanced { display:inline-block; margin-left:12px; }
+.ts_route_row { margin:8px 0; }
+.ts_route_input { box-sizing:border-box; width:calc(100% - 76px); min-width:180px; }
+.ts_route_input::placeholder { color:#c4d0d4; opacity:1; }
+.ts_route_delete { min-width:60px; width:60px; margin-left:6px; }
+.ts_route_hint { font-size:12px; }
+.ts_route_input[aria-invalid=true] { border:1px solid #ffb95c; outline:1px solid #ffb95c; }
 #return_btn { cursor:pointer; float:right; margin:0 10px; }
 #task_log { box-sizing:border-box; width:100%; min-height:180px; resize:vertical; background:rgba(0,0,0,.25); color:#fff; border:1px solid #818181; padding:10px; font:12px/1.6 monospace; }
 #task_panel { padding:12px; border:1px solid #818181; }
@@ -104,9 +111,23 @@ function init() {
 <label for="tailscale_ipv6_enable" style="margin-left:12px;">IPv6</label> <input id="tailscale_ipv6_enable" type="checkbox" disabled="disabled" />
 <div class="ts_help">允许 Tailscale 通过所选协议进行直连通信（UDP 41641）。关闭可能影响设备直连。</div></td></tr>
 <tr><th><label for="tailscale_advertise_routes">共享本地局域网</label></th><td><input id="tailscale_advertise_routes" type="checkbox" disabled="disabled" />
-<div class="ts_help">允许 Tailnet 中的其他设备访问本机局域网。启用后，需在管理控制台批准此子网路由。</div></td></tr>
+<label class="ts_advanced" for="tailscale_custom_routes_enable"><input id="tailscale_custom_routes_enable" type="checkbox" disabled="disabled" /> 高级：自定义网段</label>
+<div class="ts_help">允许 Tailnet 中的其他设备访问本机局域网。启用后，需在管理控制台批准此子网路由。</div>
+<div id="custom_routes_editor" style="display:none;">
+<div id="custom_routes_rows"></div>
+<input id="custom_routes_add" class="button_gen" type="button" value="添加网段" disabled="disabled" />
+<div class="ts_help">向 Tailnet 宣告额外的网段，例如其他 VLAN，或需要经本机访问的单个地址。每条都需要在管理控制台批准。多台路由器的局域网网段相同时，不要同时共享局域网。不支持 0.0.0.0/0，请使用「提供互联网出口」。</div>
+<div class="ts_help">最多 32 条。自定义网段可独立启用；关闭后保留列表，点击“应用设置”撤下宣告。</div>
+</div>
+<div id="routes_status" class="ts_help" style="display:none;">
+<div>已宣告：<span id="routes_advertised" class="ts_value"></span></div>
+<div>本机主路由：<span id="routes_primary" class="ts_value"></span></div>
+<div>本机主路由表示当前由本机承担的网段。批准状态请在管理控制台查看。</div>
+</div></td></tr>
 <tr><th><label for="tailscale_accept_routes">访问远程局域网</label></th><td><input id="tailscale_accept_routes" type="checkbox" disabled="disabled" />
 <div class="ts_help">允许本机和局域网设备访问其他设备共享的子网。各处局域网应使用不同网段，避免路由冲突。</div></td></tr>
+<tr><th><label for="tailscale_accept_dns">使用 Tailscale DNS</label></th><td><input id="tailscale_accept_dns" type="checkbox" disabled="disabled" />
+<div class="ts_help">开启后，路由器自身的域名解析经过 Tailscale，可解析 Tailnet 设备名；局域网设备的解析不受影响。默认关闭，此时使用固件的 DNS 设置。</div></td></tr>
 <tr><th><label for="tailscale_exit_node">提供互联网出口</label></th><td><input id="tailscale_exit_node" type="checkbox" disabled="disabled" />
 <div class="ts_help">允许其他设备通过此路由器访问互联网。需先在管理控制台批准，再由其他设备选择此出口节点。</div></td></tr>
 <tr><th><label for="tailscale_watchdog_enable">自动恢复连接</label></th><td><input id="tailscale_watchdog_enable" type="checkbox" disabled="disabled" />

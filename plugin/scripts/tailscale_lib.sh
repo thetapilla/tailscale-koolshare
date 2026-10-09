@@ -150,6 +150,15 @@ ts_read_bool() {
     case $value in 0|1) printf '%s' "$value";; '') printf '%s' "$2";; *) return 1;; esac
 }
 
+ts_routes_read() {
+    # dbus get terminates its output with one newline. A sentinel preserves
+    # any whitespace belonging to the value so validation cannot trim it.
+    CUSTOM_ROUTES=$(dbus get tailscale_custom_routes 2>/dev/null && printf '.') || return 1
+    CUSTOM_ROUTES=${CUSTOM_ROUTES%.}
+    CUSTOM_ROUTES=${CUSTOM_ROUTES%"
+"}
+}
+
 ts_config_read() {
     ENABLE=$(ts_read_bool tailscale_enable 0) &&
     IPV4=$(ts_read_bool tailscale_ipv4_enable 1) &&
@@ -157,43 +166,104 @@ ts_config_read() {
     ADVERTISE=$(ts_read_bool tailscale_advertise_routes 1) &&
     ACCEPT=$(ts_read_bool tailscale_accept_routes 1) &&
     EXIT_NODE=$(ts_read_bool tailscale_exit_node 0) &&
-    WATCHDOG=$(ts_read_bool tailscale_watchdog_enable 1)
+    WATCHDOG=$(ts_read_bool tailscale_watchdog_enable 1) &&
+    ACCEPT_DNS=$(ts_read_bool tailscale_accept_dns 0) &&
+    CUSTOM=$(ts_read_bool tailscale_custom_routes_enable 0) || return 1
+    ts_routes_read || return 1
+    # Validate even a disabled list: keep it available for later use, never
+    # conceal a corrupt saved value by treating it as an empty list.
+    [ -z "$CUSTOM_ROUTES" ] || CUSTOM_ROUTES=$("$HELPER" routes "$CUSTOM_ROUTES" 2>/dev/null) || return 1
 }
 
-ts_bits_valid() { [ "${#1}" = 7 ] && { case $1 in *[!01]*) return 1;; esac; }; }
+ts_bits_valid() {
+    case ${#1} in 7|9) ;; *) return 1;; esac
+    case $1 in *[!01]*) return 1;; esac
+}
+
+# Complete all untrusted request validation before acquiring a task ID or
+# writing configuration. The helper owns CIDR parsing and safe error text.
+ts_routes_validate() {
+    local error_file index entry reason
+    ROUTES_VALUE=; ROUTES_DETAIL=
+    error_file=$(ts_temp "$RUN/.routes-check.XXXXXX") || return 1
+    if ROUTES_VALUE=$("$HELPER" routes-wire "$1" 2>"$error_file"); then
+        rm -f "$error_file"
+        return 0
+    fi
+    IFS="$(printf '\t')" read -r index entry reason <"$error_file"
+    rm -f "$error_file"
+    case $index in ''|*[!0-9]*) ROUTES_DETAIL='无法校验网段，请检查插件文件是否完整';;
+        *) ROUTES_DETAIL="$index $entry：$reason";; esac
+    return 1
+}
 
 ts_config_keys() {
     printf '%s\n' tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable \
-        tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable
+        tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable \
+        tailscale_accept_dns tailscale_custom_routes_enable
 }
 
 ts_config_snapshot() {
-    local key value
+    local key value count=0 bits=${1:-000000000}
+    [ "$TS_LOCKED" = 1 ] || return 1
     : >"$RUN/config.previous"
+    rm -f "$RUN/config.routes.previous" "$RUN/config.routes.invalid"
     for key in $(ts_config_keys); do
+        count=$((count + 1))
+        [ "${#bits}" != 7 ] || [ "$count" -le 7 ] || break
         value=$(dbus get "$key" 2>/dev/null) || return 1
         case $value in ''|0|1) ;; *) return 1;; esac
         printf '%s=%s\n' "$key" "$value" >>"$RUN/config.previous" || return 1
     done
+    [ "${#bits}" != 7 ] || return 0
+    ts_routes_read || return 1
+    printf '%s' "$CUSTOM_ROUTES" >"$RUN/config.routes.previous" || return 1
+    if ! "$HELPER" routes "$CUSTOM_ROUTES" >/dev/null 2>&1; then
+        # Permit a valid new submission to repair corrupt saved data. Keep the
+        # original bytes separately; no route value is ever shell source.
+        : >"$RUN/config.routes.invalid"
+    fi
 }
 
 ts_config_bits_apply() {
     local remaining=$1 key bit
     [ "$TS_LOCKED" = 1 ] && ts_bits_valid "$remaining" || return 1
+    [ "${#remaining}" != 9 ] || [ "$#" = 2 ] || return 1
     for key in $(ts_config_keys); do
+        [ -n "$remaining" ] || break
         bit=${remaining%"${remaining#?}"}; remaining=${remaining#?}
         dbus set "$key=$bit" >/dev/null 2>&1 || return 1
     done
+    if [ "${#1}" = 9 ]; then
+        [ "$#" = 2 ] || return 1
+        if [ -n "$2" ]; then dbus set "tailscale_custom_routes=$2" >/dev/null 2>&1
+        else dbus remove tailscale_custom_routes >/dev/null 2>&1; fi
+    fi
 }
 
 ts_config_restore() {
-    local key value failed=0
+    local key value routes normalized failed=0 invalid_routes=0
     [ "$TS_LOCKED" = 1 ] && [ -f "$RUN/config.previous" ] || return 1
+    if [ -f "$RUN/config.routes.previous" ]; then
+        routes=$(cat "$RUN/config.routes.previous" && printf '.') || return 1
+        routes=${routes%.}
+        if normalized=$("$HELPER" routes "$routes" 2>/dev/null); then routes=$normalized
+        elif [ -f "$RUN/config.routes.invalid" ]; then
+            invalid_routes=1
+        else return 1; fi
+    fi
     while IFS='=' read -r key value; do
-        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable) ;; *) return 1;; esac
+        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable|tailscale_accept_dns|tailscale_custom_routes_enable) ;; *) return 1;; esac
         case $value in 0|1) dbus set "$key=$value" >/dev/null 2>&1 || failed=1;;
             '') dbus remove "$key" >/dev/null 2>&1 || failed=1;; *) return 1;; esac
     done <"$RUN/config.previous"
+    if [ -f "$RUN/config.routes.previous" ]; then
+        if [ -n "$routes" ]; then dbus set "tailscale_custom_routes=$routes" >/dev/null 2>&1 || failed=1
+        else dbus remove tailscale_custom_routes >/dev/null 2>&1 || failed=1; fi
+    fi
+    if [ "$failed" = 0 ] && [ "$invalid_routes" = 1 ]; then
+        ts_job_log '已恢复原无效网段设置，请在插件页面修正后重新应用；服务不会宣告无效网段'
+    fi
     return "$failed"
 }
 
@@ -406,7 +476,7 @@ ts_start() {
     [ -x "$DATA/current/tailscaled" ] && [ -x "$DATA/current/tailscale" ] || {
         ts_job_log '未找到已安装的核心，请重新安装插件'; return 1;
     }
-    local pid tries state want have_key
+    local pid tries state want routes= remaining route route_count=0
     rm -f "$RUN/manual-stop"
     # Explicit start also handles WAN restoration with an existing daemon.
     # Give control reconnection the same grace as a newly launched process.
@@ -432,20 +502,25 @@ ts_start() {
         sleep 1
     done
     if [ "$tries" -ge 15 ]; then ts_job_log '等待本机服务就绪超时，请查看诊断摘要'; return 1; fi
-    have_key=$(ts_get "$RUN/start-status.json" have_node_key)
     # Normalize the updater flags in the same edit as other managed settings:
     # clientupdate-free cores reject edits while a persisted Apply=true remains.
     set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")" \
-        --auto-update=false --update-check=false
+        "--accept-dns=$(ts_bool "$ACCEPT_DNS")" --auto-update=false --update-check=false
     if [ "$ADVERTISE" = 1 ]; then
         ts_lan || { ts_job_log '局域网地址或子网掩码无效，请检查路由器局域网设置'; return 1; }
-        set -- "$@" "--advertise-routes=$LAN_CIDR"
-    else
-        set -- "$@" --advertise-routes=
+        routes=$LAN_CIDR; route_count=1
     fi
-    # Pre-login preferences are not persisted; the state file can already
-    # contain {}. Reapply the DNS default until the identity has a node key.
-    [ "$have_key" = true ] || set -- "$@" --accept-dns=false
+    if [ "$CUSTOM" = 1 ]; then
+        remaining=$CUSTOM_ROUTES
+        while [ -n "$remaining" ]; do
+            route=${remaining%%,*}
+            case $remaining in *,*) remaining=${remaining#*,};; *) remaining=;; esac
+            case ,$routes, in *,"$route",*) continue;; esac
+            routes=${routes:+$routes,}$route
+            route_count=$((route_count + 1))
+        done
+    fi
+    set -- "$@" "--advertise-routes=$routes"
     ts_cli "$@" >/dev/null 2>&1 || { ts_job_log '无法应用 Tailscale 设置，请检查本机服务状态'; return 1; }
     want=$(ts_get "$RUN/start-status.json" want_running)
     state=$(ts_get "$RUN/start-status.json" backend_state)
@@ -465,6 +540,7 @@ ts_start() {
             }
             ts_job_log '本机服务已就绪，等待控制面同步';;
         *) ts_job_log '本机服务状态异常，请查看诊断摘要'; return 1;; esac
+    [ "$route_count" = 0 ] || ts_job_log "已宣告 $route_count 条网段：$routes；请在管理控制台批准"
 }
 
 ts_stop() {
@@ -642,11 +718,12 @@ ts_watchdog_run() {
 ts_status_json() {
     local file="$RUN/status-query.$$" backend=Unavailable online=null codes='[]' messages='[]'
     local auth= monitoring=false version= version_long= installed= available= rollback=false error= now statusok=false
+    local routes='{"advertised":[],"primary":[]}'
     local installed_build= available_build= update_available=false previous= previous_build= current_target= offered_target= available_arch=
     ts_config_read || { ENABLE=0; WATCHDOG=0; error=invalid_configuration; }
     if ts_status_file "$file"; then
         statusok=$(ts_get "$file" ok)
-        [ "$statusok" = true ] || error=local_api_unavailable
+        [ "$statusok" = true ] || [ -n "$error" ] || error=local_api_unavailable
         backend=$(ts_get "$file" backend_state)
         online=$(ts_get "$file" online)
         codes=$(ts_get "$file" health_codes)
@@ -655,7 +732,8 @@ ts_status_json() {
         monitoring=$(ts_get "$file" monitoring_available)
         version=$(ts_get "$file" version)
         version_long=$(ts_get "$file" version_long) || version_long=
-    else error=local_api_unavailable; fi
+        routes=$(ts_get "$file" routes) || routes='{"advertised":[],"primary":[]}'
+    else [ -n "$error" ] || error=local_api_unavailable; fi
     rm -f "$file"
     case $online in true|false|null) ;; *) online=null;; esac
     case $monitoring in true|false) ;; *) monitoring=false;; esac
@@ -693,9 +771,9 @@ ts_status_json() {
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.1.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.2.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
         "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback"
-    printf ',"core_version_long":%s' "$(ts_quote "$version_long")"
+    printf ',"core_version_long":%s,"routes":%s' "$(ts_quote "$version_long")" "$routes"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
     printf '}\n'
 }
@@ -707,12 +785,20 @@ ts_parse_request() {
 }
 
 ts_mutation() {
-    local action=$1 rc=0 bits= has_bits=0 old_running=0 old_manual=0 applied=0
+    local action=$1 rc=0 bits= has_bits=0 routes= old_running=0 old_manual=0 applied=0
     if [ "$action" = web_submit ] && [ "$#" -gt 1 ]; then
         bits=$2; has_bits=1
-        if [ "$#" != 2 ] || ! ts_bits_valid "$bits"; then
+        if ! ts_bits_valid "$bits" || { [ "${#bits}" = 7 ] && [ "$#" != 2 ]; } ||
+            { [ "${#bits}" = 9 ] && [ "$#" != 3 ]; }; then
             ts_reply '{"accepted":false,"error":"invalid_config_snapshot"}'
             return 1
+        fi
+        if [ "${#bits}" = 9 ]; then
+            if ! ts_routes_validate "$3"; then
+                ts_reply "{\"accepted\":false,\"error\":\"invalid_custom_routes\",\"detail\":$(ts_quote "$ROUTES_DETAIL")}"
+                return 1
+            fi
+            routes=$ROUTES_VALUE
         fi
     fi
     if ! ts_lock; then
@@ -736,13 +822,13 @@ ts_mutation() {
         return 1
     fi
     if [ "$has_bits" = 1 ]; then
-        if ! ts_config_snapshot; then
+        if ! ts_config_snapshot "$bits"; then
             ts_job_write failed configuration '无法备份当前设置，未应用更改；请检查存储空间后重试'
             return 1
         fi
         ts_pid_alive && old_running=1
         [ ! -f "$RUN/manual-stop" ] || old_manual=1
-        if ! ts_config_bits_apply "$bits"; then
+        if ! ts_config_bits_apply "$bits" "$routes"; then
             ts_config_restore || ts_job_log '未能完整恢复原设置，请在插件页面检查并重新应用设置'
             ts_job_write failed configuration '设置保存失败，已尝试恢复原设置；请检查操作日志和当前设置'
             return 1
@@ -756,7 +842,7 @@ ts_mutation() {
         web_submit)
             if ts_config_read; then
                 if [ "$ENABLE" = 1 ]; then ts_restart || rc=$?; else : >"$RUN/manual-stop"; ts_stop || rc=$?; fi
-            else ts_job_log '设置值必须为 0 或 1，请在插件页面重新应用设置'; rc=1; fi;;
+            else ts_job_log '设置值无效，请在插件页面重新应用设置'; rc=1; fi;;
         start_nat) ts_firewall_apply || rc=$?;;
         *) ts_job_log '无法识别操作请求，请刷新插件页面后重试'; rc=1;;
     esac
@@ -773,7 +859,7 @@ ts_mutation() {
             ts_job_log '原设置恢复失败，请在插件页面检查并重新应用设置'
         fi
     fi
-    [ "$has_bits" = 0 ] || rm -f "$RUN/config.previous"
+    [ "$has_bits" = 0 ] || rm -f "$RUN/config.previous" "$RUN/config.routes.previous" "$RUN/config.routes.invalid"
     if [ "$rc" = 0 ]; then ts_job_write success complete '操作已完成'; else ts_job_write failed failed '操作失败，请查看下方日志了解原因'; fi
     ts_unlock
     trap - EXIT

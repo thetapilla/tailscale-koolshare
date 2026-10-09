@@ -18,6 +18,8 @@
 
 构建依赖相关回归覆盖上游 Go 要求提升、精确版本选择、工具链与源码缓存损坏、发布锁的签名绑定、跨阶段输入一致性，以及辅助程序独立构建。测试位于 `test_toolchain.py`、`test_core_lock.py`、`test_helper_toolchain.py` 和打包发布测试中。
 
+DNS 与自定义网段回归包含：IPv4/IPv6 CIDR 边界及保留范围重叠、单条 TSV 错误、UTF-8/base64url 传输、九位提交与七位兼容、受理前拒绝、全部设置回滚、无效存量数据修复、关闭列表保留、LAN 合并去重及 DNS 双向切换。真实核心检查比较 `CorpDNS` 和 `AdvertiseRoutes`，保持设备身份、主机名、连接意图与核心更新回退行为。
+
 脚本测试将可写路径放入临时目录，用模拟命令替代固件服务、配置及防火墙操作。发布逻辑测试模拟 GitHub 操作。BusyBox 测试工具校验官方源码归档后构建兼容性环境，版本和校验值由 [测试脚本](../tools/test_busybox.py) 固定。回归测试仅允许显式列出的命令，禁用 `command` 内置命令，且不提供 `od`、`mkfifo`、`mktemp`、`sha256sum` 和外部 `timeout`。安装清单与核心校验、日志管道、临时文件及命令超时由随包辅助程序处理；防火墙测试覆盖旧版无等待参数和新版支持等待参数的分支。
 
 安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。
@@ -53,6 +55,8 @@ python3 tools/smoke_core_update.py \
 python3 tools/firmware_compat.py --build-image --export-runtime /path/to/firmware.pkgtb
 python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root
 ```
+
+可增加 `--params-only` 单独验证空列表、IPv4/IPv6、32 条最长合法输入、Unicode 和过长请求。传输使用带 `b64.` 前缀的 base64url；完整接口测试还验证新配置实际落入 DBus、七位提交保留新键，以及无效列表不创建任务、不写配置。
 
 接口测试运行固件中的 httpdb、skipd、DBus 客户端及 Shell，并执行实际辅助程序。覆盖请求 ID 边界、回复编码、状态与接口查询、设置、任务回执、操作锁、错误结果和失效任务恢复。NVRAM、网络、防火墙、外网下载及 LocalAPI 数据采用固定测试输入。
 
