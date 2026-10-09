@@ -23,14 +23,20 @@ def main():
     parser.add_argument("--arch", choices=("all", "arm", "arm64"), default="all")
     parser.add_argument("--legacy-plugin-root", type=Path,
                         help="also prove that a previous plugin safely rolls back an incompatible candidate")
+    parser.add_argument("--restore-only", action="store_true",
+                        help="only check that installer recovery preserves existing daemon preferences")
     args = parser.parse_args()
+    if args.restore_only and args.legacy_plugin_root:
+        parser.error("--restore-only cannot be combined with --legacy-plugin-root")
     subprocess.run([sys.executable, str(ROOT / "tools/build_core_fixture.py")], check=True)
     previous = args.previous_release.resolve(strict=True)
     candidate = args.candidate_release.resolve(strict=True)
     for release in (previous, candidate):
         if not (release / "manifest.json").is_file():
             parser.error(f"missing signed manifest: {release}")
-    cases = [(ROOT / "plugin", "update")]
+    cases = [(ROOT / "plugin", "restore-only")]
+    if not args.restore_only:
+        cases.insert(0, (ROOT / "plugin", "update"))
     if args.legacy_plugin_root:
         cases.append((args.legacy_plugin_root.resolve(strict=True), "legacy-rollback"))
     for arch, (plugin, mode) in ((arch, case) for arch in

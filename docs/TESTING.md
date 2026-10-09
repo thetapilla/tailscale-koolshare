@@ -47,6 +47,8 @@ python3 tools/smoke_core_update.py \
 
 测试要求 daemon 真实返回带构建后缀的完整版本，并将其与原始 CLI JSON 对照，避免用清单短版本替代真实响应而漏掉格式差异。DBus、NVRAM、防火墙和定时任务由测试替身提供；仅 daemon 入口增加 userspace TUN 参数。测试使用随机合成的已登录身份，保留旧的 `AutoUpdate.Apply=true` 来验证迁移，并比较设备密钥和未托管偏好。增加 `--legacy-plugin-root /path/to/old-plugin` 可验证旧插件遇到不兼容候选时安全回退。合成身份不接入 Tailnet；实际审批、硬件 TUN、防火墙和流量转发由设备检查覆盖。
 
+完整事务测试还包含安装回滚的无偏好启动路径，也可用 `--restore-only` 单独运行：在新 DBus DNS 默认关闭、已恢复 profile DNS 开启且连接意图为停用时，确认直接启动及就绪检查不修改偏好、身份或登录状态。此路径不调用 `tailscale set` 或 `connect`，正常启动仍按页面配置应用 DNS 和网段。
+
 ## 固件组件与浏览器集成
 
 对本地固件镜像执行以下命令，可在隔离容器中提取并运行其原始 BusyBox、Shell 和工具集。原镜像保持只读；报告按镜像 SHA-256 保存到 `build/firmware-compat/`，包含各组测试前后的源码哈希。`--export-runtime` 同时导出接口测试所需的最小运行目录。

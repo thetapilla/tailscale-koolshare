@@ -113,6 +113,10 @@ ts_start() {
  fi
  return 0
 }
+ts_daemon_start() { printf '%s\n' restore-daemon >>"$MOCK_ROOT/lifecycle"; }
+ts_restore_ready() { [ ! -f "$MOCK_ROOT/fail-restore-ready" ]; }
+ts_config_read() { return 0; }
+ts_cron() { printf '%s\n' cron >>"$MOCK_ROOT/lifecycle"; }
 ts_firewall_apply() { printf '%s\n' firewall >>"$MOCK_ROOT/lifecycle"; }
 '''
 
@@ -413,6 +417,37 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.ks / 'tailscale/current').exists())
         self.assertFalse((self.ks / 'res/tailscale3.js').exists())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
+
+    def test_enabled_upgrade_failure_restarts_restored_state_without_reapplying_preferences(self):
+        self.current()
+        original = dict(self.read('config.json'), tailscale_enable='1')
+        self.write('config.json', original)
+        state = self.ks / 'configs/tailscale/tailscaled.state'
+        # An older logged-in profile may have DNS enabled despite having no
+        # plugin DNS key. Rollback must preserve it and a stopped connection.
+        identity = b'{"CorpDNS":true,"WantRunning":false,"PrivateNodeKey":"fixture-identity"}'
+        state.write_bytes(identity)
+        (self.mock / 'fail-start').touch()
+        self.install(False)
+        self.assertEqual(self.read('config.json'), original)
+        self.assertEqual(state.read_bytes(), identity)
+        calls = (self.mock / 'lifecycle').read_text().splitlines()
+        self.assertEqual(len([value for value in calls if value.startswith('start version=')]), 1)
+        self.assertEqual(calls[-3:], ['restore-daemon', 'cron', 'firewall'])
+        self.assertNotIn('tailscale_accept_dns', self.read('config.json'))
+        self.assertEqual((self.ks / 'scripts/tailscale_config').read_text(), 'never execute old opaque control file')
+
+    def test_restore_readiness_failure_retains_install_backup(self):
+        self.current()
+        self.write('config.json', dict(self.read('config.json'), tailscale_enable='1'))
+        (self.mock / 'fail-start').touch()
+        (self.mock / 'fail-restore-ready').touch()
+        result = self.install(False)
+        self.assertIn('自动恢复未全部完成', result.stderr)
+        self.assertTrue(list(self.ks.glob('.tailscale-install.*')))
+        calls = (self.mock / 'lifecycle').read_text().splitlines()
+        self.assertEqual(calls[-1], 'restore-daemon')
+        self.assertEqual(len([value for value in calls if value.startswith('start version=')]), 1)
 
     def test_shared_lifecycle_lock_blocks_install_without_stopping_service(self):
         with (self.run / 'operation.lock').open('w') as lock:

@@ -285,7 +285,13 @@ restore() {
     if [ "$(dbus get tailscale_enable)" = 1 ]; then
         if [ "$OLD_KIND" = current ]; then
             HELPER=$VERIFIED_HELPER
-            ts_start >/dev/null 2>&1 || rc=1
+            # Restored state belongs to the previous plugin. Starting with
+            # candidate defaults would change its saved DNS/routes or login
+            # intent again. Recreate only the daemon, cron and network rules.
+            if ts_daemon_start >/dev/null 2>&1 && ts_restore_ready && ts_config_read; then
+                ts_cron
+                ts_firewall_apply >/dev/null 2>&1 || rc=1
+            else rc=1; fi
         elif [ "$OLD_KIND" = legacy ] && [ -x "$KSROOT/bin/tailscaled" ]; then
             set -- "$KSROOT/bin/tailscaled" "--state=$STATE" "--socket=$OLD_SOCKET"
             [ -z "$OLD_PORT" ] || set -- "$@" "--port=$OLD_PORT"

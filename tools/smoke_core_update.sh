@@ -151,6 +151,40 @@ check_committed() {
 }
 
 ts_job_begin 31001
+if [ "$mode" = restore-only ]; then
+    "$HELPER" atomic-link "$new" "$DATA/current"
+    /fixture/mkstate "$STATE" false
+    machine_key=$(ts_get "$STATE" _machinekey)
+    [ -n "$machine_key" ] && [ "$machine_key" != null ] || fail 'fixture did not create a machine identity'
+    # The restored profile deliberately disagrees with the new default. A
+    # managed start would change DNS and reconnect this disconnected identity.
+    printf '0' >"$TSKS_SMOKE_CONFIG/tailscale_accept_dns"
+    ts_cli() {
+        [ "$1" = debug ] && [ "$2" = prefs ] || fail 'pure daemon recovery issued a CLI mutation'
+        ts_bound 15 "$DATA/current/tailscale" --socket="$SOCKET" "$@"
+    }
+    for phase in initial restarted; do
+        ts_daemon_start || fail 'pure daemon startup failed'
+        ts_restore_ready || fail 'restored disconnected daemon failed readiness checks'
+        ts_cli debug prefs >"$RUN/restore-$phase-prefs.json"
+        restored="$RUN/restore-$phase-prefs.json"
+        [ "$(ts_get "$restored" CorpDNS)" = true ] || fail 'recovery applied the new DNS default'
+        [ "$(ts_get "$restored" WantRunning)" = false ] || fail 'recovery requested a connection'
+        [ "$(ts_get "$restored" Hostname)" = core-smoke ] || fail 'recovery changed the hostname'
+        [ "$(ts_get "$restored" Config.NodeID)" = nTEST ] || fail 'recovery changed the synthetic node identity'
+        [ "$(ts_get "$RUN/restore-status.json" have_node_key)" = true ] || fail 'recovery lost the synthetic node key'
+        check_identity
+        if [ "$phase" = initial ]; then
+            restored_prefs=$("$HELPER" sha256 "$restored")
+        else
+            [ "$("$HELPER" sha256 "$restored")" = "$restored_prefs" ] || fail 'pure recovery changed persisted preferences'
+        fi
+        ts_stop
+        ! ts_pid_alive || fail 'restored daemon survived stop'
+    done
+    printf 'PASS %s: pure daemon recovery preserves complete preferences, DNS=true, WantRunning=false and identity\n' "$arch"
+    exit 0
+fi
 /fixture/mkstate "$STATE" true
 ts_start
 check_live "$old_version"

@@ -466,6 +466,47 @@ class BackendTests(unittest.TestCase):
                         self.assertLess(set_index, connect[0])
                         self.assertEqual(sequence[connect[0]][1], ["connect", str(self.run / "tailscaled.sock")])
 
+    def test_daemon_only_restore_never_edits_preferences_or_connects(self):
+        state = self.ks / "configs/tailscale/tailscaled.state"
+        identity = b'{"CorpDNS":true,"WantRunning":false,"PrivateNodeKey":"fixture-identity"}'
+        state.write_bytes(identity)
+        for backend in ("Running", "Stopped", "NeedsLogin", "NoState"):
+            with self.subTest(backend=backend):
+                self.write("status.json", dict(self.status, backend_state=backend, want_running=False))
+                self.shell("ts_pid_alive() { return 0; }; ts_daemon_start; ts_config_read; ts_cron; ts_firewall_apply")
+                self.assertEqual(state.read_bytes(), identity)
+                self.assertEqual(self.calls("tailscale"), [])
+                self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+        self.assertFalse(any(args[0] != "get" for args in self.calls("dbus")))
+        self.assertTrue(self.calls("cru"))
+        self.assertTrue(self.calls("iptables"))
+
+    def test_restore_readiness_rejects_bad_state_and_allows_known_offline_profile(self):
+        for state in ("Running", "Starting", "Stopped", "NeedsLogin", "NeedsMachineAuth"):
+            with self.subTest(state=state):
+                self.write("status.json", dict(self.status, backend_state=state))
+                self.shell("ts_restore_ready")
+        offline = dict(self.status, backend_state="NoState", online=None, health_available=True)
+        self.write("status.json", offline)
+        self.shell("ts_restore_ready")
+        for delta in ({"health_codes": ["state-store-health"]}, {"have_node_key": False},
+                      {"want_running": False}, {"logged_out": True}, {"health_available": False},
+                      {"backend_state": "UnknownState"}):
+            with self.subTest(delta=delta):
+                self.write("status.json", dict(offline, **delta))
+                self.assertNotEqual(self.shell("sleep() { :; }; ts_restore_ready", check=False).returncode, 0)
+        self.write("status.json", dict(self.status, health_codes=["state-store-health"]))
+        self.assertNotEqual(self.shell("ts_restore_ready", check=False).returncode, 0)
+        self.assertEqual(self.calls("tailscale"), [])
+        self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+
+    def test_restore_readiness_resamples_transient_api_or_lifecycle(self):
+        self.write("status-queue.json", [None, dict(self.status, backend_state="NoState", have_node_key=None), self.status])
+        self.shell("sleep() { :; }; ts_restore_ready")
+        self.assertEqual(self.read("status-queue.json"), [])
+        self.assertEqual(self.calls("tailscale"), [])
+        self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+
     def test_dns_setting_is_applied_for_new_and_existing_identities(self):
         for have_key in (False, True):
             for setting in ("0", "1"):

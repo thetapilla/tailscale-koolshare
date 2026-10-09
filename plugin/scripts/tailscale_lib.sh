@@ -467,16 +467,14 @@ ts_waiting_for_control() {
     ! printf '%s\n' "$codes" | grep -q '"state-store-health"'
 }
 
-ts_start() {
-    local startup=${1:-manual}
-    case $startup in manual|automatic) ;; *) return 1;; esac
-    ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
-    ts_cron
-    [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
+# Start the daemon and wait for its LocalAPI. This primitive
+# never edits persisted preferences or requests a connection/login; installer
+# rollback uses it to preserve the configuration semantics of the old plugin.
+ts_daemon_start() {
+    local pid tries
     [ -x "$DATA/current/tailscaled" ] && [ -x "$DATA/current/tailscale" ] || {
         ts_job_log '未找到已安装的核心，请重新安装插件'; return 1;
     }
-    local pid tries state want routes= remaining route route_count=0
     rm -f "$RUN/manual-stop"
     # Explicit start also handles WAN restoration with an existing daemon.
     # Give control reconnection the same grace as a newly launched process.
@@ -502,6 +500,40 @@ ts_start() {
         sleep 1
     done
     if [ "$tries" -ge 15 ]; then ts_job_log '等待本机服务就绪超时，请查看诊断摘要'; return 1; fi
+}
+
+# Rollback restores a previous profile, so verify its lifecycle without
+# applying this release's managed preferences or initiating authentication.
+ts_restore_ready() {
+    local tries=0 state codes file="$RUN/restore-status.json"
+    while [ "$tries" -lt 5 ]; do
+        if ts_status_file "$file" && [ "$(ts_get "$file" ok)" = true ]; then
+            state=$(ts_get "$file" backend_state)
+            codes=$(ts_get "$file" health_codes) || codes=
+            if printf '%s\n' "$codes" | grep -q '"state-store-health"'; then
+                ts_job_log '恢复后的状态存储异常，请保留安装备份并查看诊断摘要'
+                return 1
+            fi
+            case $state in
+                Running|Starting|Stopped|NeedsLogin|NeedsMachineAuth) return 0;;
+                NoState) ts_waiting_for_control "$file" && return 0;;
+            esac
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 5 ] || sleep 1
+    done
+    ts_job_log '恢复后的服务尚未就绪，请保留安装备份并查看诊断摘要'
+    return 1
+}
+
+ts_start() {
+    local startup=${1:-manual}
+    case $startup in manual|automatic) ;; *) return 1;; esac
+    ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
+    ts_cron
+    [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
+    local state want routes= remaining route route_count=0
+    ts_daemon_start || return 1
     # Normalize the updater flags in the same edit as other managed settings:
     # clientupdate-free cores reject edits while a persisted Apply=true remains.
     set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")" \
