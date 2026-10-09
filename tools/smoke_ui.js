@@ -46,7 +46,8 @@ const lifecycle = { config: { tailscale_enable: '0', tailscale_ipv4_enable: '1',
     task: null, failNext: false, unavailableReads: 0 };
 // Status overlays cover signed-descriptor identities and delayed authorization
 // without downloading cores or registering a device on a real tailnet.
-const identity = { enabled: true, core_version: '1.104.1', auth_url: '', core: {
+const identity = { enabled: true, backend_state: 'Running', online: true, error: '', monitoring_available: true,
+    core_version: '1.104.1', auth_url: '', core: {
     installed: '1.104.1', installed_build: 'r1', available: '1.104.1', available_build: 'r2',
     update_available: true, can_rollback: true, previous: '1.102.4', previous_build: 'legacy'
 } };
