@@ -270,6 +270,23 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.data / "current"), self.old)
         self.assertIn("本机服务接口持续不可用", (self.run / "events.log").read_text())
 
+    def test_offline_nostate_health_checks_even_without_previous_node_id(self):
+        self.make_core(self.newdesc["version"], self.newdesc["build"], self.newdesc["source_commit"])
+        (self.data / "current").unlink()
+        (self.data / "current").symlink_to(self.new)
+        healthy = dict(self.status, backend_state="NoState", node_id="", have_node_key=True,
+                       want_running=True, logged_out=False, health_available=True,
+                       monitoring_available=False, health_codes=[])
+        self.write("status.json", healthy)
+        self.shell('CORE_NEW="' + self.new + '"; ts_core_health NoState ""')
+        for delta in ({"have_node_key": False}, {"want_running": False}, {"logged_out": True},
+                      {"health_available": False}, {"health_available": None},
+                      {"health_codes": ["state-store-health"]}):
+            with self.subTest(delta=delta):
+                self.write("status.json", dict(healthy, **delta))
+                result = self.shell('CORE_NEW="' + self.new + '"; ts_core_health NoState ""', check=False)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_control_plane_offline_does_not_roll_back_healthy_local_core(self):
         self.write("status-by-core.json", {self.new: {"online": False, "health_codes": ["mapresponse-timeout"]}})
         self.shell("ts_lock; ts_core_update")

@@ -22,11 +22,13 @@
 
 安装包冒烟测试从 `dist/` 解包，执行包内原始安装器与运行库，使用真实签名、辅助程序和核心校验安装结果。平台信息、软件中心配置、空间、防火墙和定时任务使用模拟环境；安装一致性检查保持服务停用。`--lifecycle` 另行启用 userspace daemon，验证日志管道、LocalAPI、设置应用和页面任务文件，无需 TUN 或加入 Tailnet。该测试使用容器 Shell，与 BusyBox 回归测试分别覆盖不同边界。
 
-真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon 和未登录状态，不需要加入 Tailnet。辅助程序与事务单元测试还覆盖带源码提交后缀的版本、错误源码、未知版本后缀、本地接口短暂不可用、已授权身份丢失及控制面尚未同步的状态。
+真实核心冒烟测试使用原生架构或 QEMU，在无网络的临时容器中运行。它覆盖 userspace daemon、未登录状态及随机生成的合成已登录身份，不需要加入 Tailnet。辅助程序与事务单元测试还覆盖带源码提交后缀的版本、错误源码、未知版本后缀、本地接口短暂不可用、已授权身份丢失及控制面尚未同步的状态。
+
+首次连接回归检查受限 LocalAPI 请求只修改运行意图，确认设置和未托管偏好完整保留；真实 `up` 作为反向对照复现旧的偏好覆盖。文件状态仅含 `{}` 时再次启动仍应用 DNS 默认值。核心功能检查包括更新命令移除、拒绝开启内置自动更新，以及持久化 `Apply=true` 时单次设置迁移成功。测试用状态生成器在 `tools/testdata/mkstate/`，由 `build_core_fixture.py` 按核心依赖锁离线编译，随机密钥仅保留在隔离测试目录。
 
 ## 真实核心更新事务
 
-准备两个不同版本的不可变核心 Release。每个目录都需包含原 `manifest.json` 和清单所列的 ARM32、ARM64 归档；候选版本必须高于旧版本。构建辅助程序后运行：
+准备两个不同版本或构建号的不可变核心 Release。每个目录都需包含原 `manifest.json` 和清单所列的 ARM32、ARM64 归档；候选的版本与构建号组合必须高于旧核心。构建辅助程序后运行：
 
 ```sh
 python3 tools/smoke_core_update.py \
@@ -41,7 +43,7 @@ python3 tools/smoke_core_update.py \
 - 停用服务后更新，确认更新不会启动 daemon 或修改已停止的 state；随后手动启动并再次验证。
 - 每次成功切换后确认当前和上一核心指针正确，事务记录及本次快照已清理。
 
-测试要求 daemon 真实返回带构建后缀的完整版本，并将其与原始 CLI JSON 对照，避免用清单短版本替代真实响应而漏掉格式差异。DBus、NVRAM、防火墙和定时任务由测试替身提供；仅 daemon 入口增加 userspace TUN 参数。测试使用全新的未登录身份，不接入 Tailnet。已授权状态及身份异常通过单元测试的固定输入验证；真实 Tailnet 身份延续、硬件 TUN、防火墙及流量转发按设备检查执行。
+测试要求 daemon 真实返回带构建后缀的完整版本，并将其与原始 CLI JSON 对照，避免用清单短版本替代真实响应而漏掉格式差异。DBus、NVRAM、防火墙和定时任务由测试替身提供；仅 daemon 入口增加 userspace TUN 参数。测试使用随机合成的已登录身份，保留旧的 `AutoUpdate.Apply=true` 来验证迁移，并比较设备密钥和未托管偏好。增加 `--legacy-plugin-root /path/to/old-plugin` 可验证旧插件遇到不兼容候选时安全回退。合成身份不接入 Tailnet；实际审批、硬件 TUN、防火墙和流量转发由设备检查覆盖。
 
 ## 固件组件与浏览器集成
 
@@ -54,12 +56,14 @@ python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root
 
 接口测试运行固件中的 httpdb、skipd、DBus 客户端及 Shell，并执行实际辅助程序。覆盖请求 ID 边界、回复编码、状态与接口查询、设置、任务回执、操作锁、错误结果和失效任务恢复。NVRAM、网络、防火墙、外网下载及 LocalAPI 数据采用固定测试输入。
 
-浏览器测试需要 Node.js、Playwright 和兼容的 Chromium。先启动回环地址上的隔离接口服务，再在另一终端运行浏览器检查：
+浏览器测试需要 Node.js、Playwright 和兼容的 Chromium。先启动回环地址上的隔离接口服务，等待其输出 `HTTPDB_READY`（初始化期间会执行配置和操作锁测试），再在另一终端运行浏览器检查：
 
 ```sh
 python3 tools/smoke_httpdb.py --firmware-root /path/to/runtime-root --serve --port 33030
 node tools/smoke_ui.js --firmware-root /path/to/runtime-root --upstream http://127.0.0.1:33030
 ```
+
+浏览器命令的 `--firmware-root` 需要包含完整 `www/` 样式、图片和软件中心资源；只导出 Shell/httpdb 的最小运行目录不适合作为网页资源输入。可以让 httpdb 使用最小运行目录，而浏览器使用同一固件的完整解压根目录。浏览器检查在缺少页面必需样式时会立即失败。
 
 浏览器加载固件自带的 jQuery、软件中心资源和插件原始页面，覆盖初始显示、设置保存、诊断、核心检查、异常响应后的恢复及页面刷新后的任务跟踪。额外的生命周期场景由本地代理注入延迟 HTTP 响应，检查启用开关只修改草稿、应用后的启动和停止进度，以及失败后恢复草稿和错误提示。该部分验证浏览器交互；实际核心切换由上述真实核心事务测试覆盖。路由器导航与硬件相关模板值使用测试替身。`--chromium` 可指定已有浏览器；Playwright 可通过 `NODE_PATH` 使用已有安装。
 

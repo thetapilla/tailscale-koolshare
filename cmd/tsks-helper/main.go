@@ -150,6 +150,15 @@ func run(a []string) error {
 			return errors.New("status SOCKET")
 		}
 		return emit(readStatus(a[1]))
+	case "connect":
+		if len(a) != 2 {
+			return errors.New("connect SOCKET")
+		}
+		result, err := connectLocal(localClient(a[1]))
+		if err != nil {
+			return err
+		}
+		return emit(result)
 	case "fetch":
 		if len(a) != 4 {
 			return errors.New("fetch URL DEST MAX_BYTES")

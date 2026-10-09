@@ -91,6 +91,8 @@ python3 tools/release_core.py --key .secrets/release.key
 
 插件 Release 对应 [VERSION](../VERSION) 中的版本，上传上述六个标准安装包及同批 `SHA256SUMS`。发布前按 [发布产物检查](TESTING.md#发布产物检查) 核对归档内容，并确认 README 的最新发布入口指向插件安装包。
 
+插件 Release 标题仅使用版本号，例如 `3.1.0`；核心 Release 标题使用 `core-<VERSION>-<BUILD>`，标签保持 `core-v<VERSION>-<BUILD>`。稳定索引标题为 `Core feed`。发布正文采用中文更新说明。
+
 同版本的文档或打包修正替换该插件 Release 中对应的标准文件及校验清单，保留统一的版本入口，并将插件标签更新到对应提交，使源码归档与安装包一致。只有需要发布新插件版本时才调整插件版本及更新记录。插件包内附带的核心仍遵守下述核心发布规则。
 
 ## 核心发布与稳定源
@@ -110,3 +112,5 @@ GITHUB_SHA="$(git rev-parse HEAD)" python3 tools/publish_core.py
 ```
 
 该命令使用当前提交作为新建 Release 的目标，需要可用的 GitHub CLI 认证和发布权限，会写入远端 Release。它遵循与 CI 相同的验证及不可变资源规则。详细格式见 [签名清单与核心归档](../CONTRACT.md#签名清单与核心归档)。
+
+核心需要新版插件迁移偏好时，可先用 `publish_core.py --release-only` 发布并验证不可变核心资源，再发布预装该核心的插件；插件公开可用后，使用不带该参数的同一命令推进稳定源。第二次运行复用远端签名封装并核对归档。`ts_omit_clientupdate` 核心需要插件 3.1.0 或更新版本在同次设置中关闭已有自动更新偏好。

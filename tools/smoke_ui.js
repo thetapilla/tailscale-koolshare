@@ -29,6 +29,14 @@ if (!['127.0.0.1', 'localhost', '[::1]'].includes(upstream.hostname)) {
 const jquery = fs.readFileSync(path.join(firmware, 'www/js/jquery.js'));
 const html = fs.readFileSync(path.join(plugin, 'webs/Module_tailscale.asp'), 'utf8')
     .replace(/<%\s*nvram_get\("sc_skin"\);\s*%>/g, 'ASUSWRT');
+// A minimal Shell/httpdb export is insufficient for visual interaction tests.
+// Missing styles can hide the switch while still allowing JavaScript tests to run.
+for (const match of html.matchAll(/href="(\/[^"?]+\.css)"/g)) {
+    const asset = path.join(firmware, match[1].startsWith('/res/') ? 'rom/etc/koolshare' : 'www', match[1]);
+    if (!fs.existsSync(asset) || !fs.statSync(asset).size) {
+        throw new Error('Missing required page stylesheet; use the full extracted firmware root: ' + match[1]);
+    }
+}
 let fault = '', faultUsed = false;
 const calls = [], scriptErrors = [];
 // Delayed lifecycle responses isolate the browser's transition semantics. The
@@ -36,6 +44,12 @@ const calls = [], scriptErrors = [];
 const lifecycle = { config: { tailscale_enable: '0', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1',
     tailscale_advertise_routes: '0', tailscale_accept_routes: '0', tailscale_exit_node: '0', tailscale_watchdog_enable: '0' },
     task: null, failNext: false, unavailableReads: 0 };
+// Status overlays cover signed-descriptor identities and delayed authorization
+// without downloading cores or registering a device on a real tailnet.
+const identity = { enabled: true, core_version: '1.104.1', auth_url: '', core: {
+    installed: '1.104.1', installed_build: 'r1', available: '1.104.1', available_build: 'r2',
+    update_available: true, can_rollback: true, previous: '1.102.4', previous_build: 'legacy'
+} };
 function lifecycleResponse(url, body) {
     if (url.pathname === '/_api/tailscale_') { return { result: [lifecycle.config] }; }
     const call = JSON.parse(body.toString());
@@ -88,6 +102,13 @@ const server = http.createServer((req, res) => {
                     let data = Buffer.concat(received);
                     let status = response.statusCode;
                     const scenario = new URL(req.headers.referer || 'http://127.0.0.1').searchParams.get('scenario');
+                    if (scenario === 'identity' && method === 'tailscale_fettle') {
+                        const wrapped = JSON.parse(data.toString());
+                        const statusData = JSON.parse(wrapped.result);
+                        Object.assign(statusData, identity);
+                        wrapped.result = JSON.stringify(statusData);
+                        data = Buffer.from(JSON.stringify(wrapped));
+                    }
                     if (fault && scenario === fault && !faultUsed && method === 'tailscale_fettle') {
                         faultUsed = true;
                         if (fault === 'malformed') {
@@ -158,6 +179,7 @@ const server = http.createServer((req, res) => {
             script_url: await page.locator('script[src*="tailscale3.js"]').getAttribute('src'),
             environment: 'isolated fixture with extracted firmware userspace', real_httpdb: upstream.origin, requests: calls.length, initial_load_ms: initialLoadMs,
             lifecycle_transport: checks.includes('delayed start/stop status') ? 'deterministic delayed HTTP responses at local proxy' : 'not exercised',
+            identity_transport: checks.includes('core build identities') ? 'status overlays on real HTTP/DBus replies at local proxy' : 'not exercised',
             result: 'passed', checks };
         fs.writeFileSync(path.join(screenshots, 'result.json'), JSON.stringify(result, null, 2) + '\n');
         console.log(JSON.stringify(result));
@@ -245,6 +267,37 @@ const server = http.createServer((req, res) => {
         await lifecycleApply(false, false);
         await lifecycleApply(true, true);
         console.log(JSON.stringify({ phase: 'delayed lifecycle responses: start, stop, failed start', result: 'passed' }));
+        const identityAt = calls.length;
+        await page.goto(url + '?scenario=identity'); await ready();
+        assert.equal(await text('core_current'), '1.104.1 (r1)');
+        assert.equal(await text('core_latest'), '1.104.1 (r2)');
+        assert.equal(await page.locator('#core_update').isDisabled(), false);
+        assert.equal(await text('core_rollback_target'), '将回退到 1.102.4（原版核心）');
+        identity.core.installed_build = 'r2';
+        identity.core.update_available = false;
+        identity.core.previous = '1.104.1';
+        identity.core.previous_build = 'r1';
+        await page.waitForFunction(() => document.getElementById('core_current').textContent === '1.104.1 (r2)');
+        assert.equal(await text('core_latest'), '1.104.1 (r2)（与当前核心相同）');
+        assert.equal(await page.locator('#core_update').isDisabled(), true);
+        assert.equal(await text('core_rollback_target'), '将回退到 1.104.1 (r1)');
+        await page.screenshot({ path: path.join(screenshots, 'core-builds.png'), fullPage: true });
+        identity.core_version = '1.102.4';
+        await page.waitForFunction(() => document.getElementById('core_current').textContent === '1.102.4');
+        identity.core.installed = '1.102.4';
+        identity.core.installed_build = 'legacy';
+        identity.core.update_available = true;
+        await page.waitForFunction(() => document.getElementById('core_current').textContent === '1.102.4（原版核心）');
+        assert.equal(await page.locator('#core_update').isDisabled(), false);
+        assert.equal(await page.locator('#auth_link').isVisible(), false);
+        identity.auth_url = 'https://login.tailscale.com/a/delayed-browser-test';
+        identity.backend_state = 'NeedsLogin';
+        identity.online = false;
+        await page.locator('#auth_link').waitFor({ state: 'visible', timeout: 15000 });
+        assert.equal(await page.locator('#auth_link').getAttribute('href'), identity.auth_url);
+        assert.ok(calls.slice(identityAt).every(call => !call.method || ['tailscale_fettle', 'tailscale_tsnets'].includes(call.method)),
+            'Identity changes and authorization links must arrive through read-only polling');
+        console.log(JSON.stringify({ phase: 'core build identities, update eligibility and delayed authorization', result: 'passed' }));
         await page.goto(url); await ready();
         await page.evaluate(() => sessionStorage.setItem('tailscale3_pending', JSON.stringify({ id: '999999999999999', title: '应用设置', reloadConfig: true })));
         const resumeAt = calls.length;
@@ -254,7 +307,7 @@ const server = http.createServer((req, res) => {
         assert.ok(calls.slice(resumeAt).every(call => !call.method || ['tailscale_job', 'tailscale_fettle', 'tailscale_tsnets'].includes(call.method)));
         await page.screenshot({ path: path.join(screenshots, 'recovered.png'), fullPage: true });
         assert.deepEqual(scriptErrors, []);
-        await report(['initial state', 'settings', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery'], initialLoadMs);
+        await report(['initial state', 'settings', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery', 'core build identities', 'backend update eligibility', 'delayed authorization link'], initialLoadMs);
     } catch (error) {
         await page.screenshot({ path: path.join(screenshots, 'failure.png'), fullPage: true }).catch(() => {});
         console.error(JSON.stringify({ script_errors: scriptErrors, requests: calls, page_state: await page.evaluate(() => ({

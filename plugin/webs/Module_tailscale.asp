@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.0.1"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.1.0"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -127,6 +127,7 @@ function init() {
 <input id="core_check" class="button_gen" type="button" value="检查更新" disabled="disabled" />
 <input id="core_update" class="button_gen" type="button" value="更新核心" disabled="disabled" />
 <input id="core_rollback" class="button_gen" type="button" value="回退上一核心" disabled="disabled" />
+<div id="core_rollback_target" class="ts_help" style="display:none;"></div>
 <div class="ts_help">先检查更新，再安装更新源提供的核心。保留有上一版本时，可手动回退。</div>
 </td></tr></table></div>
 <div id="task_panel" class="ts_box ts_section" style="display:none;" role="region" aria-label="操作进度">

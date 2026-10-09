@@ -82,6 +82,12 @@ elif name=='tsks-helper':
         else:value=read('status.json',{})
         if value is None:sys.exit(1)
         print(json.dumps(value))
+    elif args[0]=='connect':
+        result=read('connect_exit.json',0)
+        if result==0:
+            value=read('status.json',{});value['want_running']=True;write('status.json',value)
+            print(json.dumps({'ok':True,'want_running_set':True,'login_requested':value.get('backend_state')=='NeedsLogin'}))
+        sys.exit(result)
     elif args[0]=='timeout':
         import subprocess
         sys.exit(subprocess.run(args[2:]).returncode)
@@ -91,6 +97,8 @@ elif name=='tsks-helper':
         with open(args[1],'a') as dest:
             for line in sys.stdin:dest.write(line);dest.flush()
 elif name in ('tailscale','tailscaled'):
+    if name=='tailscale' and (any(arg in ('up','login','update') for arg in args) or any(arg.startswith('--reset') for arg in args)):
+        (root/'forbidden-cli').write_text(json.dumps(args));sys.exit(99)
     if name=='tailscaled' and os.environ.get('MOCK_DAEMON')=='1':
         import time
         proc=Path(os.environ['TSKS_PROC'])/str(os.getpid());proc.mkdir(parents=True)
@@ -190,6 +198,8 @@ class BackendTests(unittest.TestCase):
         self.shell(":")
 
     def tearDown(self):
+        forbidden = self.mock / "forbidden-cli"
+        self.assertFalse(forbidden.exists(), "forbidden preference-resetting CLI invocation: " + (forbidden.read_text() if forbidden.exists() else ""))
         self.temp.cleanup()
 
     def write(self, name, value):
@@ -376,6 +386,8 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(state.read_bytes(), b"secret-persisted-identity\x00prefs")
         args = self.calls("tailscale")[0]
         self.assertIn("--netfilter-mode=on", args)
+        self.assertIn("--auto-update=false", args)
+        self.assertIn("--update-check=false", args)
         self.assertNotIn("--accept-dns=false", args)
         self.assertFalse(any("--reset" in a for a in args))
         self.assertEqual(self.calls("tailscaled"), [])
@@ -389,9 +401,60 @@ class BackendTests(unittest.TestCase):
         self.assertEqual((self.run / "started-at").read_text().strip(), "20000")
         self.assertEqual(self.calls("tailscaled"), [])
 
-    def test_fresh_state_disables_magic_dns_once(self):
-        self.shell("ts_pid_alive() { return 0; }; ts_start")
-        self.assertIn("--accept-dns=false", self.calls("tailscale")[0])
+    def test_start_applies_managed_preferences_once_before_connect(self):
+        for startup in ("manual", "automatic"):
+            for have_key in (None, False, True):
+                with self.subTest(startup=startup, have_key=have_key):
+                    (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                    self.write("status.json", dict(self.status, have_node_key=have_key, want_running=False,
+                                                   backend_state="NeedsLogin", logged_out=True))
+                    self.write("config.json", {"tailscale_enable": "1", "tailscale_exit_node": "1"})
+                    # A nonempty state file is not evidence of a logged-in identity.
+                    (self.ks / "configs/tailscale/tailscaled.state").write_text("{}")
+                    self.shell("ts_pid_alive() { return 0; }; ts_start " + startup)
+                    calls = self.calls("tailscale")
+                    self.assertEqual(len(calls), 1)
+                    args = calls[0]
+                    self.assertEqual(args[1], "set")
+                    for flag in ("--auto-update=false", "--update-check=false", "--advertise-exit-node=true"):
+                        self.assertIn(flag, args)
+                    self.assertEqual("--accept-dns=false" in args, have_key is not True)
+                    sequence = [json.loads(line) for line in (self.mock / "calls.jsonl").read_text().splitlines()]
+                    connect = [i for i, (name, argv) in enumerate(sequence) if name == "tsks-helper" and argv[0] == "connect"]
+                    self.assertEqual(len(connect), 1 if startup == "manual" else 0)
+                    if connect:
+                        set_index = next(i for i, (name, argv) in enumerate(sequence) if name == "tailscale")
+                        self.assertLess(set_index, connect[0])
+                        self.assertEqual(sequence[connect[0]][1], ["connect", str(self.run / "tailscaled.sock")])
+
+    def test_running_manual_start_does_not_connect(self):
+        self.shell("ts_pid_alive() { return 0; }; ts_start manual")
+        self.assertEqual(len(self.calls("tailscale")), 1)
+        self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+
+    def test_offline_nostate_requires_healthy_persisted_connection_intent(self):
+        status = dict(self.status, backend_state="NoState", node_id="", online=None,
+                      monitoring_available=False, health_available=True)
+        self.write("status.json", status)
+        self.shell("ts_pid_alive() { return 0; }; ts_start automatic")
+        self.assertIn("等待控制面同步", (self.run / "events.log").read_text())
+        self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
+        for delta in ({"have_node_key": False}, {"want_running": False}, {"logged_out": True},
+                      {"health_available": False}, {"health_available": None},
+                      {"health_codes": ["state-store-health"]}):
+            with self.subTest(delta=delta):
+                self.write("status.json", dict(status, **delta))
+                result = self.shell("ts_pid_alive() { return 0; }; ts_start automatic", check=False)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_connection_failure_is_reported_and_not_swallowed(self):
+        self.write("status.json", dict(self.status, backend_state="NeedsLogin", want_running=False, have_node_key=None))
+        self.write("connect_exit.json", 1)
+        result = self.shell("ts_pid_alive() { return 0; }; ts_start manual", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("无法发起连接或登录", (self.run / "events.log").read_text())
+        self.assertEqual(len(self.calls("tailscale")), 1)
+        self.assertEqual(self.calls("iptables"), [])
 
     def test_daemon_logger_lifecycle_and_children_release_lock(self):
         self.env["MOCK_DAEMON"] = "1"
@@ -491,12 +554,12 @@ class BackendTests(unittest.TestCase):
         try:
             self.shell("ts_now() { echo 20180; }; ts_lock; ts_watchdog_run; ts_unlock")
             self.assertEqual(len(self.calls("tailscaled")), 1)
-            self.assertFalse(any("up" in args for args in self.calls("tailscale")))
+            self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
             self.assertEqual(state.read_text(), "persisted-identity-and-connection-preferences")
             self.assertEqual((state.parent / "watchdog-ledger").read_text(), "20180\n")
             if manual_start:
                 self.shell("ts_lock; ts_start; ts_unlock")
-                self.assertTrue(any("up" in args for args in self.calls("tailscale")))
+                self.assertTrue(any(args[0] == "connect" for args in self.calls("tsks-helper")))
                 self.assertEqual(len(self.calls("tailscaled")), 1)
         finally:
             self.shell("ts_lock; ts_stop; ts_unlock")
@@ -555,7 +618,7 @@ class BackendTests(unittest.TestCase):
         (self.ks / "tailscale/current/descriptor.json").write_text('{"version":"1.102.4"}')
         (self.ks / "tailscale/available.json").write_text('{"version":"1.104.0"}')
         status = json.loads(self.entry("tailscale_fettle").stdout)
-        self.assertEqual(status["core"], {"installed": "1.102.4", "available": "1.104.0", "can_rollback": False})
+        self.assertEqual(status["core"], {"installed": "1.102.4", "installed_build": "", "available": "", "available_build": "", "update_available": False, "previous": "", "previous_build": "", "can_rollback": False})
         self.assertEqual(status["health_messages"], ['safe "quoted" message\nnext line'])
         self.entry("tailscale_fettle", "123456789012345")
         self.assertEqual(self.read("reply.json")["plugin_version"], (ROOT / "VERSION").read_text().strip())
@@ -567,6 +630,55 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(net["interfaces"]), 2)
         self.assertEqual(net["interfaces"][0]["ip"], "100.64.2.3")
         self.assertEqual(net["interfaces"][0]["rx"], 12000000000000)
+
+    def test_core_update_status_uses_exact_validated_target(self):
+        data = self.ks / "tailscale"
+        shutil.rmtree(data / "current")
+        current = data / "cores/1.104.1-r1-arm"
+        current.mkdir(parents=True)
+        (current / "descriptor.json").write_text(json.dumps(dict(version="1.104.1", build="r1", arch="arm")))
+        (data / "current").symlink_to("cores/1.104.1-r1-arm")
+        previous = data / "cores/1.102.4-legacy-arm"
+        previous.mkdir()
+        (previous / "descriptor.json").write_text(json.dumps(dict(version="1.102.4", build="legacy", arch="arm")))
+        (previous / "tailscaled").write_text("binary fixture")
+        (previous / "tailscaled").chmod(0o755)
+        (data / "previous").symlink_to("cores/1.102.4-legacy-arm")
+        for build, expected in (("r2", True), ("r1", False)):
+            with self.subTest(build=build):
+                (data / "available.json").write_text(json.dumps(dict(version="1.104.1", build=build, arch="arm")))
+                core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+                self.assertEqual(core, dict(installed="1.104.1", installed_build="r1", available="1.104.1",
+                                            available_build=build, update_available=expected,
+                                            previous="1.102.4", previous_build="legacy", can_rollback=True))
+        (data / "current").unlink()
+        (data / "current").symlink_to("cores/1.102.4-legacy-arm")
+        (data / "available.json").write_text(json.dumps(dict(version="1.104.1", build="r2", arch="arm")))
+        core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+        self.assertEqual(core["installed_build"], "legacy")
+        self.assertTrue(core["update_available"])
+        (data / "available.json").unlink()
+        core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+        self.assertFalse(core["update_available"])
+        self.assertEqual(core["available_build"], "")
+        self.assertEqual(core["installed_build"], "legacy")
+        for changes in ({"version": "1.104.1/../../outside"}, {"version": "1.104.1\n1.104.2"},
+                        {"build": "r2/../outside"}, {"build": "r2\nr3"}, {"arch": "arm64"}, {"arch": "x86"}):
+            with self.subTest(invalid=changes):
+                descriptor = dict(version="1.104.1", build="r2", arch="arm")
+                descriptor.update(changes)
+                (data / "available.json").write_text(json.dumps(descriptor))
+                core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+                self.assertFalse(core["update_available"])
+                self.assertEqual((core["available"], core["available_build"]), ("", ""))
+        (data / "available.json").write_text(json.dumps(dict(version="1.104.1", build="r2", arch="arm")))
+        for target in (str(current), "cores/../current", "cores/.hidden", "cores/missing"):
+            with self.subTest(target=target):
+                (data / "current").unlink()
+                (data / "current").symlink_to(target)
+                core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+                self.assertFalse(core["update_available"])
+                self.assertEqual((core["available"], core["available_build"]), ("", ""))
 
     def test_reply_encodes_the_real_software_center_string_envelope(self):
         values = [

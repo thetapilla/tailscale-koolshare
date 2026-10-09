@@ -4,6 +4,7 @@ set -eu
 umask 077
 export LC_ALL=C
 arch=$1
+mode=$2
 base=/tmp/core-update-smoke
 export TSKS_ROOT=$base/koolshare TSKS_RUN=$base/run TSKS_WEB=$base/web
 export TSKS_SMOKE_CONFIG=$base/dbus
@@ -85,10 +86,15 @@ DAEMON
     chmod 755 "$DATA/$target/tailscaled"
 }
 prepare_core /previous
-old=$target old_version=$version
+old=$target old_version=$version old_build=$build
 prepare_core /candidate
-new=$target new_version=$version
-[ "$("$HELPER" compare "$new_version" "$old_version")" = 1 ] || fail 'candidate must be newer than previous core'
+new=$target new_version=$version new_build=$build
+comparison=$("$HELPER" compare "$new_version" "$old_version")
+if [ "$comparison" = 0 ]; then
+    [ "${new_build#r}" -gt "${old_build#r}" ] || fail 'candidate build must increase for an unchanged version'
+else
+    [ "$comparison" = 1 ] || fail 'candidate must be newer than previous core'
+fi
 "$HELPER" atomic-link "$old" "$DATA/current"
 printf '1' >"$TSKS_SMOKE_CONFIG/tailscale_enable"
 printf '0' >"$TSKS_SMOKE_CONFIG/tailscale_advertise_routes"
@@ -106,7 +112,13 @@ check_live() {
     ts_cli status --json >"$RUN/test-raw-status.json" || :
     [ "$(ts_get "$RUN/test-raw-status.json" Version)" = "$actual" ] || fail 'helper changed the original long version'
     [ "$(ts_get "$RUN/test-status.json" want_running)" = true ] || fail 'running preference changed'
-    case $(ts_get "$RUN/test-status.json" backend_state) in NeedsLogin|Starting) ;; *) fail 'unexpected logged-out state';; esac
+    case $(ts_get "$RUN/test-status.json" backend_state) in NoState|Starting|Running) ;; *) fail 'synthetic authenticated identity was lost';; esac
+    [ "$(ts_get "$RUN/test-status.json" have_node_key)" = true ] || fail 'synthetic node key was lost'
+    [ "$(ts_get "$RUN/test-status.json" logged_out)" = false ] || fail 'synthetic profile was logged out'
+    if [ "$(ts_get "$RUN/test-status.json" backend_state)" = NoState ]; then
+        [ "$(ts_get "$RUN/test-status.json" health_available)" = true ] || fail 'offline startup has no structured health evidence'
+        case $(ts_get "$RUN/test-status.json" health_codes) in *'"state-store-health"'*) fail 'offline startup has a state-store failure';; esac
+    fi
     printf 'LocalAPI %s: %s\n' "$arch" "$actual"
 }
 check_identity() {
@@ -123,14 +135,42 @@ check_committed() {
 }
 
 ts_job_begin 31001
+/fixture/mkstate "$STATE" true
 ts_start
 check_live "$old_version"
 machine_key=$(ts_get "$STATE" _machinekey)
 [ -n "$machine_key" ] && [ "$machine_key" != null ] || fail 'fixture did not create a machine identity'
+# Seed the old running core with a real persisted Apply=true. This reproduces
+# the tailnet default adopted by older plugin versions before the transaction.
+ts_cli set --auto-update=true --update-check=true
+ts_cli debug prefs >"$RUN/before-prefs.json"
+[ "$(ts_get "$RUN/before-prefs.json" AutoUpdate.Apply)" = true ] || fail 'migration fixture did not retain Apply=true'
+if [ "$mode" = legacy-rollback ]; then
+    # The previous plugin cannot cold-start a connected profile without a
+    # control map. Keep the daemon/service enabled but deliberately disconnect
+    # this baseline profile, isolating its Apply=true migration failure from
+    # that separate offline NoState lifecycle limitation.
+    ts_cli down
+    ts_cli debug prefs >"$RUN/legacy-disconnected-prefs.json"
+    [ "$(ts_get "$RUN/legacy-disconnected-prefs.json" WantRunning)" = false ] || fail 'legacy baseline did not disconnect'
+    if ts_core_switch "$new"; then fail 'old plugin unexpectedly accepted the incompatible updater preference'; else result=$?; fi
+    [ "$result" = 2 ] || fail 'old plugin did not complete automatic rollback'
+    [ "$(ts_core_target "$DATA/current")" = "$old" ] || fail 'old plugin failed to restore original core'
+    [ ! -e "$DATA/update.txn" ] && [ ! -e "$DATA/update.state" ] || fail 'rollback transaction remains incomplete'
+    check_live "$old_version"
+    check_identity
+    ts_cli debug prefs >"$RUN/restored-prefs.json"
+    [ "$(ts_get "$RUN/restored-prefs.json" AutoUpdate.Apply)" = true ] || fail 'rollback did not restore original preferences'
+    printf 'PASS %s: previous plugin safely restores %s-%s when candidate rejects Apply=true (service enabled, profile deliberately disconnected)\n' "$arch" "$old_version" "$old_build"
+    exit 0
+fi
 ts_core_switch "$new" || fail 'enabled update rejected a healthy real daemon'
 check_committed "$new" "$old"
 check_live "$new_version"
-printf 'PASS %s: enabled %s -> %s preserves real LongVersion, identity and running preference\n' "$arch" "$old_version" "$new_version"
+ts_cli debug prefs >"$RUN/migrated-prefs.json"
+[ "$(ts_get "$RUN/migrated-prefs.json" AutoUpdate.Apply)" = false ] && [ "$(ts_get "$RUN/migrated-prefs.json" AutoUpdate.Check)" = false ] || fail 'candidate did not normalize updater preferences'
+[ "$(ts_get "$RUN/migrated-prefs.json" CorpDNS)" = true ] && [ "$(ts_get "$RUN/migrated-prefs.json" Hostname)" = core-smoke ] || fail 'candidate changed unowned preferences'
+printf 'PASS %s: enabled %s-%s -> %s-%s migrates Apply=true and preserves identity and preferences\n' "$arch" "$old_version" "$old_build" "$new_version" "$new_build"
 
 ts_core_rollback || fail 'manual rollback failed'
 check_committed "$old" "$new"

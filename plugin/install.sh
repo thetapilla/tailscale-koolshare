@@ -30,7 +30,7 @@ check_package_paths() {
 
 check_package() {
     "$VERIFIED_HELPER" check-tree "$PKG" || fail '安装包文件校验失败'
-    [ "$(cat "$PKG/version")" = 3.0.1 ] || fail '插件版本无效'
+    [ "$(cat "$PKG/version")" = 3.1.0 ] || fail '插件版本无效'
 }
 
 verify_helper() {
@@ -353,8 +353,8 @@ done
 HELPER=$KSROOT/bin/tsks-helper
 ts_start || fail '服务就绪检查失败'
 # Registration follows successful readiness, including disabled fresh installs.
-for pair in tailscale_version=3.0.1 softcenter_module_tailscale_version=3.0.1 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
+for pair in tailscale_version=3.1.0 softcenter_module_tailscale_version=3.1.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
     dbus set "$pair" || fail '无法注册插件'
 done
 COMMITTED=1
-say "Tailscale 3.0.1 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"
+say "Tailscale 3.1.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"

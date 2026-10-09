@@ -113,14 +113,33 @@ class ReleasePublicationTests(unittest.TestCase):
         self.assertEqual([call[1] for call in calls], ["create", "edit", "create", "upload"])
         self.assertEqual(calls[0][:3], ("release", "create", self.tag))
         self.assertIn("--draft", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--title") + 1], "core-1.102.4-r1")
         self.assertEqual(calls[1], ("release", "edit", self.tag, "--draft=false", "--latest=false"))
         self.assertEqual(calls[2][:3], ("release", "create", "core-stable"))
+        self.assertEqual(calls[2][calls[2].index("--title") + 1], "Core feed")
         self.assertEqual(calls[3][:3], ("release", "upload", "core-stable"))
         self.assertTrue(all("--clobber" not in call for call in calls[:3]))
         upload_index = next(i for i, event in enumerate(self.events) if event[:3] == ("gh", "release", "upload"))
         for desc in self.descriptors.values():
             self.assertLess(self.events.index(("download", desc["url"])), upload_index)
         self.assertEqual(self.uploads, [("core-stable", b"local envelope")])
+
+    def test_release_only_publishes_verified_assets_without_creating_feed(self):
+        publish_core.main(release_only=True)
+        self.assertEqual([call.args[1] for call in self.gh_mock.call_args_list], ["create", "edit"])
+        self.assertNotIn("core-stable", self.releases)
+        self.assertEqual(self.uploads, [])
+        for desc in self.descriptors.values():
+            self.assertIn(("download", desc["url"]), self.events)
+
+    def test_release_only_leaves_existing_feed_unchanged(self):
+        self.releases["core-stable"] = {}
+        self.stable_bytes = b"stable envelope"
+        for desc in self.envelopes[self.stable_bytes].values():
+            desc["version"] = "1.102.3"
+        publish_core.main(release_only=True)
+        self.assertEqual(self.stable_bytes, b"stable envelope")
+        self.assertEqual(self.uploads, [])
 
     def test_existing_release_resumes_with_remote_envelope_without_immutable_writes(self):
         self.releases[self.tag] = {}
@@ -257,9 +276,10 @@ class StableCheckTests(unittest.TestCase):
             remote.assert_not_called()
 
     def test_skip_only_when_verified_feed_is_same_or_newer(self):
-        for version, build, needed in (("1.100.0", "r9", True), ("1.102.4", "r1", False),
-                                       ("1.102.4", "r2", False), ("1.104.0", "r1", False)):
+        for version, build, needed in (("1.100.0", "r9", True), ("1.102.4", "r1", True),
+                                       ("1.102.4", "r2", False), ("1.102.4", "r3", False), ("1.104.0", "r1", False)):
             with self.subTest(version=version, build=build), \
+                 mock.patch.object(check_stable, "RECIPE", dict(check_stable.RECIPE, build="r2")), \
                  mock.patch.object(check_stable, "remote_manifest", return_value=(b"signed", {"arm": {"version": version, "build": build}})) as remote:
                 self.assertEqual(check_stable.update_needed("1.102.4", self.helper), needed)
                 remote.assert_called_once_with(publish_core.STABLE_URL, missing_ok=True, helper=self.helper)

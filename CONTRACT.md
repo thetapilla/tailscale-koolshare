@@ -73,6 +73,8 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 `core_version` 是用于展示和发布版本比较的版本号；LocalAPI 不可用时回退到已安装描述符中的版本。`core_version_long` 保留 daemon 上报的完整版本字符串，用于诊断；尚未取得 LocalAPI 版本时为空字符串。版本规范化规则见下文辅助程序接口。
 
+`core` 还包含 `installed_build`、`available_build`、`update_available`、`previous` 和 `previous_build`。构建号来自对应描述符，可以是 `rN`、`legacy` 或空字符串。`update_available` 仅在存在有效更新结果且目标 `cores/<version>-<build>-<arch>` 与当前指针不同时为 `true`，与更新事务的目标判断一致。页面只在运行版本与已安装版本相符时附上已安装构建号。
+
 接口流量响应为 `{"interfaces":[{"if":"tailscale0","ip":"...","rx":0,"tx":0}]}`。`rx`、`tx` 为字节计数。连接详情任务通过有时间上限的 CLI 调用生成状态文本，并经日志脱敏后显示。
 
 ## 配置提交
@@ -101,7 +103,11 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 
 自动恢复在服务启用期间按分钟检查。启动宽限期为 180 秒；本地服务连续三次检查失败，或控制连接异常持续至少 600 秒且 WAN 与经验证的 HTTPS 可达时，才进入恢复判断。恢复前再次确认本地状态。等待登录、设备审批、明确停用和关闭同步等状态豁免恢复。
 
-恢复尝试先写入持久记录，再重启插件服务。自动恢复沿用 daemon 持久化的连接意图，保留主动断开、登出或等待登录状态；手动启动按用户提交的配置请求连接。尝试间隔至少 1800 秒，任意连续 24 小时最多两次。地址与防火墙维护独立于自动恢复开关。
+恢复尝试先写入持久记录，再重启插件服务。自动恢复沿用 daemon 持久化的连接意图，保留主动断开、登出或等待登录状态；手动启动在应用托管偏好后通过辅助程序 `connect` 请求连接。尝试间隔至少 1800 秒，任意连续 24 小时最多两次。地址与防火墙维护独立于自动恢复开关。
+
+启动时用同一次 `tailscale set` 应用网络托管偏好及 `--auto-update=false --update-check=false`。这一原子偏好修改可迁移已有的 `AutoUpdate.Apply=true`，适配已移除 clientupdate 的核心，也兼容旧核心回退。LocalAPI 的 `have_node_key != true` 表示当前身份尚未完成登录，此时追加 `--accept-dns=false`；身份存在后保留其 DNS 偏好。状态文件可能仅含 `{}`，文件大小不用于身份判定。自动启动不调用 `connect`；手动连接失败会使任务失败并进入原有配置恢复流程。
+
+离线冷启动可能在取得控制面信息前保持 `NoState`。启动与核心自检仅在 LocalAPI 正常、节点密钥存在、运行意图为真、未登出且结构化健康信息可读，并且没有 `state-store-health` 警告时，将其视为等待控制同步。其余 `NoState` 不作为启动成功。这个判断不改变看门狗对监测能力的要求。
 
 ## 辅助程序接口
 
@@ -115,6 +121,7 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 | `timeout SECONDS COMMAND [ARGS...]` | 直接执行参数，不经过 shell；保留退出码，超时返回 `124` |
 | `version BINARY` | 设置 `TS_BE_CLI=1`，在 5 秒内读取 CLI 输出的首个字段，要求为纯 `X.Y.Z` 发布版本 |
 | `status SOCKET` | 通过受限 LocalAPI 请求返回状态、健康信息和身份存在标志；不返回原始 state |
+| `connect SOCKET` | 读取 prefs，必要时只 PATCH `WantRunning`，再读取状态；仅 `NeedsLogin` 时请求交互式登录。请求失败则非零退出 |
 | `fetch URL DEST MAX_BYTES` | 有大小和时间上限的 HTTPS 下载，仅接受允许的发布及 CDN 主机 |
 | `verify ENVELOPE PUBKEY ARCH` | 校验签名与清单，输出所选架构的扁平描述符 |
 | `extract ARCHIVE DESCRIPTOR DEST` | 校验归档与核心哈希、大小、结构及 ELF 架构，安全解包 |
@@ -126,6 +133,10 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则；LAN 宣告来自固�
 | `log PATH MAX_BYTES` | 从标准输入读取日志、脱敏凭据，并按上限轮转 |
 
 `status SOCKET` 的 `version_long` 原样保留 LocalAPI 的 `Version`；`version` 只将正式发布格式 `X.Y.Z-t<9 位小写十六进制>` 及可选的 `-g<9 位小写十六进制>` 后缀规范化为 `X.Y.Z`。例如 `1.104.1-t9a522a978` 对应 `1.104.1`。纯数字发布版本保持不变；带开发版、dirty 或其他未知后缀的版本保持原值，不能据此通过与纯数字发布版本的相等检查。
+
+辅助程序的 `health_available` 仅表示结构化健康快照读取成功；它不依赖控制面提供的 `Self` 信息。`monitoring_available` 继续要求完整的连接状态和运行意图数据，供自动恢复判定使用。结构化健康信息不可读时，不能仅凭密钥存在将 `NoState` 认定为正常等待。
+
+`connect` 仅访问固定端点：`GET /localapi/v0/prefs`、必要的 `PATCH /localapi/v0/prefs`、`GET /localapi/v0/status?peers=false` 和按状态选择的 `POST /localapi/v0/login-interactive`。PATCH 请求体固定为 `{"WantRunning":true,"WantRunningSet":true}`，要求 HTTP 200；登录请求要求 2xx。每次请求限时 3 秒，不接受调用者提供路径或请求体。输出包含 `ok`、`want_running_set`、`login_requested`、`backend_state`。
 
 ## 签名清单与核心归档
 
@@ -148,6 +159,8 @@ https://github.com/thetapilla/tailscale-koolshare/releases/download/core-v<VERSI
 清单上限为 64 KiB，归档上限为 13 MiB，核心上限为 12 MiB。核心归档仅包含一个普通文件 `tailscale.combined`，权限为 `0755`。入口链接由安装器或更新器创建。
 
 带版本的核心 Release 及其资源保持不可变。`core-stable` 只承载可更新的签名清单。稳定源检查拒绝版本或构建号倒退；显式本地回退独立处理。
+
+核心配方包含 `ts_omit_clientupdate`，从编译期移除内置更新入口。版本发现和核心替换由插件的签名通道负责。
 
 ## 插件包约定
 

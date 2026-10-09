@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Publish verified immutable core assets, then advance the signed stable feed."""
+import argparse
 import hashlib
 import json
 import os
@@ -9,24 +10,29 @@ import tempfile
 import time
 import urllib.error
 
-from build_core import json_url, request
+from build_core import RECIPE, json_url, request
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "thetapilla/tailscale-koolshare"
 ARCHES = ("arm", "arm64")
 MAX_MANIFEST = 65536
 STABLE_URL = f"https://github.com/{REPO}/releases/download/core-stable/manifest.json"
-STABLE_TITLE = "核心更新索引"
+STABLE_TITLE = "Core feed"
 STABLE_NOTES = ("供插件页面“检查更新”读取的签名索引。\n\n"
                 f"插件安装包请从[最新发行版](https://github.com/{REPO}/releases/latest)下载。\n")
 
 
 def core_release_notes(desc):
     version, build = desc["version"], desc["build"]
+    updater = "ts_omit_clientupdate" in RECIPE["tags"]
+    update_note = ("- 核心更新统一通过插件的签名通道进行，内置自动更新和 `tailscale update` 已禁用。\n" if updater else "")
+    compatibility = ("请先安装插件 **3.1.0 或更新版本**，以迁移已有的自动更新偏好。\n\n" if updater else "")
     return (f"## 更新内容\n\n"
             f"- 基于 Tailscale {version} 构建 ARM32 和 ARM64 精简合并核心，构建编号为 `{build}`。\n"
+            + update_note +
             "- 上游变更见 [Tailscale 更新日志](https://tailscale.com/changelog)。\n\n"
             "## 使用方式\n\n"
+            + compatibility +
             "在插件页面点击“检查更新”，再点击“更新核心”。\n\n"
             f"插件安装包请从[最新发行版](https://github.com/{REPO}/releases/latest)下载。\n\n"
             "## 来源与校验\n\n"
@@ -154,7 +160,7 @@ def existing_manifest(release, tag, descriptors):
     return data
 
 
-def main():
+def main(release_only=False):
     out = ROOT / "build/core-release"
     descriptors = validate_archives(out)
     desc = descriptors["arm"]
@@ -179,11 +185,11 @@ def main():
         notes = out / "release-notes.md"
         notes.write_text(core_release_notes(desc))
         gh("release", "create", tag, *assets, "--draft", "--target", os.environ["GITHUB_SHA"],
-           "--title", f'Tailscale 核心 {desc["version"]} ({desc["build"]})', "--notes-file", str(notes), "--latest=false")
+           "--title", f'core-{desc["version"]}-{desc["build"]}', "--notes-file", str(notes), "--latest=false")
         gh("release", "edit", tag, "--draft=false", "--latest=false")
         readback_assets(descriptors)
         envelope = (out / "manifest.json").read_bytes()
-    if current == descriptors:
+    if release_only or current == descriptors:
         return
     if stable is None:
         gh("release", "create", "core-stable", "--target", os.environ["GITHUB_SHA"], "--title", STABLE_TITLE,
@@ -195,4 +201,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-only", action="store_true", help="publish immutable assets without advancing the stable feed")
+    main(parser.parse_args().release_only)

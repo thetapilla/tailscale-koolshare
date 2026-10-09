@@ -28,12 +28,13 @@ type statusResult struct {
 	WantRunning *bool    `json:"want_running"`
 	LoggedOut   *bool    `json:"logged_out"`
 	Sync        *bool    `json:"sync_enabled"`
+	HealthReady bool     `json:"health_available"`
 	Monitoring  bool     `json:"monitoring_available"`
 	Error       string   `json:"error,omitempty"`
 }
 
 func localClient(socket string) *http.Client {
-	return &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	return &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "unix", socket)
 	}}}
 }
@@ -131,6 +132,7 @@ func readStatus(socket string) statusResult {
 		Health *struct{ Warnings map[string]json.RawMessage }
 	}
 	if e := localJSON(c, "watch-ipn-bus?mask=130", &h); e == nil && h.Health != nil {
+		out.HealthReady = true
 		for code := range h.Health.Warnings {
 			if regexp.MustCompile(`^[a-z0-9-]{1,80}$`).MatchString(code) {
 				out.Codes = append(out.Codes, code)

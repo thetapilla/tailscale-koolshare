@@ -147,6 +147,10 @@ ts_core_health() {
             esac
             new_state=$(ts_get "$RUN/core-health.json" backend_state) || new_state=
             new_id=$(ts_get "$RUN/core-health.json" node_id) || new_id=
+            if [ "$new_state" = NoState ] && ! ts_waiting_for_control "$RUN/core-health.json"; then
+                ts_job_log '核心自检失败：无法确认状态存储和连接意图'
+                return 1
+            fi
             if [ "$old_state" = Running ]; then
                 case $new_state in NeedsLogin|NeedsMachineAuth)
                     ts_job_log '核心自检失败：已授权设备需要重新登录或批准'
@@ -181,6 +185,11 @@ ts_core_health() {
         case $new_state:$have_key in Starting:true|Running:true)
             ts_job_log '本机核心检查通过，等待控制面同步设备信息'
             return 0;;
+            NoState:true)
+                if ts_waiting_for_control "$RUN/core-health.json"; then
+                    ts_job_log '本机核心检查通过，等待控制面同步设备信息'
+                    return 0
+                fi;;
         esac
         ts_job_log '核心自检失败：未能确认原有设备身份';;
         *) ts_job_log '核心自检失败：本机服务接口持续不可用';;

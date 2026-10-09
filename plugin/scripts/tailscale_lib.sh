@@ -375,6 +375,21 @@ ts_firewall_remove() {
     done
 }
 
+ts_waiting_for_control() {
+    local file=$1 codes
+    [ "$(ts_get "$file" ok)" = true ] &&
+        [ "$(ts_get "$file" backend_state)" = NoState ] &&
+        [ "$(ts_get "$file" have_node_key)" = true ] &&
+        [ "$(ts_get "$file" want_running)" = true ] &&
+        [ "$(ts_get "$file" logged_out)" = false ] &&
+        [ "$(ts_get "$file" health_available)" = true ] || return 1
+    codes=$(ts_get "$file" health_codes) || return 1
+    case $codes in \[*\]) ;; *) return 1;; esac
+    # NoState also represents a failed state store. Only accept a known healthy
+    # persisted profile while its control map is still unavailable.
+    ! printf '%s\n' "$codes" | grep -q '"state-store-health"'
+}
+
 ts_start() {
     local startup=${1:-manual}
     case $startup in manual|automatic) ;; *) return 1;; esac
@@ -384,8 +399,7 @@ ts_start() {
     [ -x "$DATA/current/tailscaled" ] && [ -x "$DATA/current/tailscale" ] || {
         ts_job_log '未找到已安装的核心，请重新安装插件'; return 1;
     }
-    local fresh=0 pid tries state want
-    [ -s "$STATE" ] || fresh=1
+    local pid tries state want have_key
     rm -f "$RUN/manual-stop"
     # Explicit start also handles WAN restoration with an existing daemon.
     # Give control reconnection the same grace as a newly launched process.
@@ -411,26 +425,38 @@ ts_start() {
         sleep 1
     done
     if [ "$tries" -ge 15 ]; then ts_job_log '等待本机服务就绪超时，请查看诊断摘要'; return 1; fi
-    set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")"
+    have_key=$(ts_get "$RUN/start-status.json" have_node_key)
+    # Normalize the updater flags in the same edit as other managed settings:
+    # clientupdate-free cores reject edits while a persisted Apply=true remains.
+    set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")" \
+        --auto-update=false --update-check=false
     if [ "$ADVERTISE" = 1 ]; then
         ts_lan || { ts_job_log '局域网地址或子网掩码无效，请检查路由器局域网设置'; return 1; }
         set -- "$@" "--advertise-routes=$LAN_CIDR"
     else
         set -- "$@" --advertise-routes=
     fi
-    [ "$fresh" = 0 ] || set -- "$@" --accept-dns=false
+    # Pre-login preferences are not persisted; the state file can already
+    # contain {}. Reapply the DNS default until the identity has a node key.
+    [ "$have_key" = true ] || set -- "$@" --accept-dns=false
     ts_cli "$@" >/dev/null 2>&1 || { ts_job_log '无法应用 Tailscale 设置，请检查本机服务状态'; return 1; }
     want=$(ts_get "$RUN/start-status.json" want_running)
     state=$(ts_get "$RUN/start-status.json" backend_state)
     if [ "$startup" = manual ] && { [ "$want" != true ] || [ "$state" = NeedsLogin ]; }; then
-        # No --reset: existing identity and unexposed preferences are preserved.
-        ts_cli up >/dev/null 2>&1 || :
+        ts_bound 15 "$HELPER" connect "$SOCKET" >/dev/null 2>&1 || {
+            ts_job_log '无法发起连接或登录，请查看诊断摘要'; return 1;
+        }
     fi
     ts_firewall_apply || { ts_job_log '防火墙设置失败，请检查防火墙状态和诊断摘要'; return 1; }
     ts_status_file "$RUN/start-status.json" || return 1
     state=$(ts_get "$RUN/start-status.json" backend_state)
     case $state in NeedsLogin|NeedsMachineAuth) ts_job_log '需要登录或设备授权，请前往插件页面完成授权';;
         Running|Starting|Stopped) ts_job_log '服务设置已应用';;
+        NoState)
+            ts_waiting_for_control "$RUN/start-status.json" || {
+                ts_job_log '本机服务尚未就绪，无法确认状态存储和连接意图'; return 1;
+            }
+            ts_job_log '本机服务已就绪，等待控制面同步';;
         *) ts_job_log '本机服务状态异常，请查看诊断摘要'; return 1;; esac
 }
 
@@ -609,6 +635,7 @@ ts_watchdog_run() {
 ts_status_json() {
     local file="$RUN/status-query.$$" backend=Unavailable online=null codes='[]' messages='[]'
     local auth= monitoring=false version= version_long= installed= available= rollback=false error= now statusok=false
+    local installed_build= available_build= update_available=false previous= previous_build= current_target= offered_target= available_arch=
     ts_config_read || { ENABLE=0; WATCHDOG=0; error=invalid_configuration; }
     if ts_status_file "$file"; then
         statusok=$(ts_get "$file" ok)
@@ -628,14 +655,39 @@ ts_status_json() {
     [ -n "$codes" ] || codes='[]'
     [ -n "$messages" ] || messages='[]'
     installed=$(ts_get "$DATA/current/descriptor.json" version) || installed=
+    installed_build=$(ts_get "$DATA/current/descriptor.json" build) || installed_build=
     [ -n "$version" ] || version=$installed
     available=$(ts_get "$DATA/available.json" version) || available=
+    available_build=$(ts_get "$DATA/available.json" build) || available_build=
+    available_arch=$(ts_get "$DATA/available.json" arch) || available_arch=
+    # This library only declares functions. Reuse the updater's pointer
+    # validation and compare the exact version/build/architecture target.
+    if [ -f "$KSROOT/scripts/tailscale_core_lib.sh" ]; then
+        . "$KSROOT/scripts/tailscale_core_lib.sh"
+        current_target=$(ts_core_target "$DATA/current") || current_target=
+    fi
+    case $available:$available_build in *[!0-9.r:]*) current_target=;; esac
+    if [ -n "$current_target" ] && printf '%s\n' "$available" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' &&
+        printf '%s\n' "$available_build" | grep -Eq '^r[1-9][0-9]*$'; then
+        case $available_arch in arm|arm64)
+            if [ "$available_arch" = "$(ts_get "$DATA/current/descriptor.json" arch)" ]; then
+                offered_target=cores/$available-$available_build-$available_arch
+                [ "$current_target" = "$offered_target" ] || update_available=true
+            fi
+            ;;
+        esac
+    fi
+    # A nonempty offer with update_available=false means the exact current
+    # target. Hide an invalid/uncomparable cache rather than label it equal.
+    [ -n "$offered_target" ] || { available=; available_build=; }
     [ ! -x "$DATA/previous/tailscaled" ] || rollback=true
+    previous=$(ts_get "$DATA/previous/descriptor.json" version) || previous=
+    previous_build=$(ts_get "$DATA/previous/descriptor.json" build) || previous_build=
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.0.1","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"available":%s,"can_rollback":%s}' \
-        "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$available")" "$rollback"
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.1.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
+        "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback"
     printf ',"core_version_long":%s' "$(ts_quote "$version_long")"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
     printf '}\n'

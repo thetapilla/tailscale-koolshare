@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "build": "r1",
+  "build": "r2",
   "initial_version": "1.102.4",
   "initial_source_commit": "bbcd7d1fc2054b9189ebc1531acf74bd880ca0c8",
   "initial_source_sha256": "25f288531e849498b8dae2adb0f0c4ac12e6a3285338f63cfc789ab5c7fe4843",
@@ -11,7 +11,7 @@
     "amd64": "ddc2654063fe4dc80d95b420788494e4db078ebb01a650692d623b5a9906e61e",
     "arm64": "100310f74eb6f67694d1d0377f1c729b6a49238ce8c4de21ea2e7d3406186f8b"
   },
-  "tags": ["ts_omit_aws", "ts_omit_bird", "ts_omit_tap", "ts_omit_kube", "ts_omit_completion", "ts_include_cli", "ts_omit_systray", "ts_omit_tpm", "ts_omit_debugeventbus", "ts_omit_syspolicy", "ts_omit_capture", "ts_omit_ssh", "ts_omit_taildrop"],
+  "tags": ["ts_omit_aws", "ts_omit_bird", "ts_omit_tap", "ts_omit_kube", "ts_omit_completion", "ts_include_cli", "ts_omit_systray", "ts_omit_tpm", "ts_omit_debugeventbus", "ts_omit_syspolicy", "ts_omit_capture", "ts_omit_ssh", "ts_omit_taildrop", "ts_omit_clientupdate"],
   "upx_args": ["--best", "--lzma"],
   "max_binary_size": 12582912
 }

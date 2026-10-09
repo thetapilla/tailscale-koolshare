@@ -59,7 +59,7 @@ function harness(initialStorage = {}) {
     function reply(request, result, string = false) { request.finish(null, { result: string ? JSON.stringify(result) : result }); }
     function status(extra = {}) { return { schema: 1, enabled: true, plugin_version: '3.0.0', core_version: '1.102.4', backend_state: 'Running', online: true,
         health_codes: [], health_messages: [], auth_url: '', monitoring_available: true,
-        watchdog: { enabled: true, last_recovery: '', count_24h: 0 }, core: { installed: '1.102.4', available: '1.104.0', can_rollback: true }, ...extra }; }
+        watchdog: { enabled: true, last_recovery: '', count_24h: 0 }, core: { installed: '1.102.4', available: '1.104.0', update_available: true, can_rollback: true }, ...extra }; }
     function boot() {
         app.init();
         reply(next(), [{ tailscale_enable: '1', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1', tailscale_watchdog_enable: '1' }], true);
@@ -93,6 +93,70 @@ test('initial load uses bounded asynchronous same-origin requests and performs n
     assert.deepEqual(h.history.map(r => r.body && r.body.method), [undefined, 'tailscale_fettle', 'tailscale_tsnets']);
     for (const r of h.history) { assert.equal(r.settings.async, true); assert.equal(r.settings.timeout, 10000); }
     assert.equal(h.maxSimultaneous(), 1);
+});
+
+test('core identity includes matching builds and the rollback target', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+    h.reply(h.next('tailscale_fettle'), h.status({ core_version: '1.104.1', core: {
+        installed: '1.104.1', installed_build: 'r1', available: '1.104.1', available_build: 'r2',
+        update_available: true, can_rollback: true, previous: '1.102.4', previous_build: 'legacy'
+    } })); h.advance();
+    assert.equal(h.nodes.core_current.textContent, '1.104.1 (r1)');
+    assert.equal(h.nodes.core_latest.textContent, '1.104.1 (r2)');
+    assert.equal(h.nodes.core_update.disabled, false);
+    assert.equal(h.nodes.core_rollback_target.textContent, '将回退到 1.102.4（原版核心）');
+    assert.equal(h.nodes.core_rollback_target.style.display, '');
+});
+
+test('same core after update is labelled and cannot be installed again', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+    h.reply(h.next('tailscale_fettle'), h.status({ core_version: '1.104.1', core: {
+        installed: '1.104.1', installed_build: 'r2', available: '1.104.1', available_build: 'r2',
+        update_available: false, can_rollback: true, previous: '1.104.1', previous_build: 'r1'
+    } })); h.advance();
+    assert.equal(h.nodes.core_current.textContent, '1.104.1 (r2)');
+    assert.equal(h.nodes.core_latest.textContent, '1.104.1 (r2)（与当前核心相同）');
+    assert.equal(h.nodes.core_update.disabled, true);
+    assert.equal(h.nodes.core_rollback_target.textContent, '将回退到 1.104.1 (r1)');
+});
+
+test('mismatched running versions never inherit a descriptor build and legacy builds are identified', () => {
+    for (const [running, installed, build, expected] of [
+        ['1.104.1', '1.102.4', 'r2', '1.104.1'],
+        ['1.102.4', '1.102.4', 'legacy', '1.102.4（原版核心）'],
+        ['1.104.1', '1.104.1', '', '1.104.1'],
+        ['1.104.1', '1.104.1', '<img src=x>', '1.104.1']
+    ]) {
+        const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+        h.reply(h.next('tailscale_fettle'), h.status({ core_version: running,
+            core: { installed, installed_build: build, available: '', update_available: false, can_rollback: false } })); h.advance();
+        assert.equal(h.nodes.core_current.textContent, expected);
+        assert.equal(h.nodes.core_latest.textContent, '暂无检查结果');
+        assert.equal(h.nodes.core_rollback_target.style.display, 'none');
+    }
+});
+
+test('only the strict backend update decision enables installation', () => {
+    for (const decision of [undefined, false, 'true', 1, null]) {
+        const h = harness(); h.app.init(); h.reply(h.next(), [{}]);
+        h.reply(h.next('tailscale_fettle'), h.status({ core: {
+            installed: '1.104.1', installed_build: 'r1', available: '1.104.1', available_build: 'r2', update_available: decision
+        } })); h.advance();
+        assert.equal(h.nodes.core_update.disabled, true);
+    }
+});
+
+test('an authorization URL arriving after the start task appears on the next status poll', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ backend_state: 'NeedsLogin', online: false, auth_url: '' }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    assert.equal(h.nodes.auth_link.style.display, 'none');
+    h.advance(5000);
+    h.reply(h.next('tailscale_fettle'), h.status({ backend_state: 'NeedsLogin', online: false,
+        auth_url: 'https://login.tailscale.com/a/delayed-test' })); h.advance();
+    assert.equal(h.nodes.auth_link.style.display, '');
+    assert.equal(h.nodes.auth_link.attrs.href, 'https://login.tailscale.com/a/delayed-test');
+    assert.deepEqual(h.history.filter(r => r.body).map(r => r.body.method), ['tailscale_fettle', 'tailscale_tsnets', 'tailscale_fettle']);
 });
 
 test('config errors retry; empty interfaces continue polling and stale status disables core changes', () => {

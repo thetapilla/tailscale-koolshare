@@ -54,6 +54,13 @@
     function safeAuth(value) {
         return typeof value === 'string' && value.length <= 2048 && /^https:\/\/login\.tailscale\.com\/[A-Za-z0-9._~!$&'()*+,;=:@%/?#-]*$/.test(value) ? value : '';
     }
+    function coreLabel(version, build) {
+        var value = plain(version), revision = plain(build);
+        if (!value) { return ''; }
+        if (/^r[0-9]+$/.test(revision)) { return value + ' (' + revision + ')'; }
+        if (revision === 'legacy') { return value + '（原版核心）'; }
+        return value;
+    }
     function recoveryTime(value) {
         var stamp = plain(value), date;
         function two(part) { return part < 10 ? '0' + part : String(part); }
@@ -162,11 +169,15 @@
         var labels = { Running: '运行中', NeedsLogin: '等待登录，请登录并授权', NeedsMachineAuth: '等待设备授权，请在管理控制台批准', Stopped: '已停止', Starting: '启动中', NoState: '尚未就绪', InUseOtherUser: '被其他用户占用', Unavailable: '暂时无法读取' };
         var health = Array.isArray(data.health_messages) ? data.health_messages.filter(function (item) { return typeof item === 'string'; }).slice(0, 12).join('\n') : '';
         var auth = safeAuth(data.auth_url), link = node('auth_link');
-        canUpdate = !!plain(core.available);
+        var installed = plain(core.installed), current = plain(data.core_version) || installed;
+        var available = coreLabel(core.available, core.available_build), previous = coreLabel(core.previous, core.previous_build);
+        canUpdate = core.update_available === true;
         canRollback = core.can_rollback === true;
         text('plugin_version', plain(data.plugin_version) || '版本未知');
-        text('core_current', plain(data.core_version) || plain(core.installed) || '版本不可用');
-        text('core_latest', plain(core.available) || '暂无检查结果');
+        text('core_current', coreLabel(current, current === installed ? core.installed_build : '') || '版本不可用');
+        text('core_latest', available ? available + (core.update_available === false ? '（与当前核心相同）' : '') : '暂无检查结果');
+        text('core_rollback_target', canRollback && previous ? '将回退到 ' + previous : '');
+        visible('core_rollback_target', canRollback && !!previous);
         text('daemon_state', changing || (refreshingStatus ? '正在刷新状态…' : data.enabled === false ? '未启用' : labels[data.backend_state] || '状态未知（' + plain(data.backend_state) + '）'));
         text('tailnet_state', changing ? '等待操作完成' : refreshingStatus ? '正在刷新状态…' : data.online === true ? '已连接' : data.online === false ? '未连接' : '暂不可用');
         text('monitoring_state', changing ? '等待操作完成' : refreshingStatus ? '正在刷新状态…' : data.monitoring_available === true ? '可用' : '暂不可用');
