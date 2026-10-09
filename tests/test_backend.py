@@ -432,6 +432,14 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(self.calls("tailscale")), 1)
         self.assertFalse(any(args[0] == "connect" for args in self.calls("tsks-helper")))
 
+    def test_json_scalar_fast_path_preserves_escaping_and_unicode(self):
+        for value in ("", "1.104.1", "r2", "legacy", "Running", "https://example.invalid/a-b:c",
+                      '"', "\\", "line\nnext", "\t\r\b\x01", "中文", "\u2028", "<script>&", "[]{}!"):
+            with self.subTest(value=value):
+                self.env["TSKS_QUOTE_VALUE"] = value
+                self.assertEqual(json.loads(self.shell('ts_quote "$TSKS_QUOTE_VALUE"').stdout), value)
+        self.env.pop("TSKS_QUOTE_VALUE", None)
+
     def test_offline_nostate_requires_healthy_persisted_connection_intent(self):
         status = dict(self.status, backend_state="NoState", node_id="", online=None,
                       monitoring_available=False, health_available=True)

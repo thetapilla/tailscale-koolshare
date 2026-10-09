@@ -31,7 +31,14 @@ ts_now() { date +%s; }
 ts_uint() { case ${1:-} in ''|*[!0-9]*|0[0-9]*) return 1;; esac; [ "${#1}" -le 12 ]; }
 ts_counter() { case ${1:-} in ''|*[!0-9]*|0[0-9]*) return 1;; esac; [ "${#1}" -le 20 ]; }
 ts_job_id() { case ${1:-} in ''|*[!0-9]*) return 1;; esac; [ "${#1}" -le 15 ]; }
-ts_quote() { "$HELPER" quote "$1"; }
+ts_quote() {
+    # Versions, build IDs and lifecycle labels need no JSON escapes. Avoid
+    # repeatedly starting the compressed helper for these bounded alphabets.
+    case $1 in
+        *[!A-Za-z0-9._:/-]*) "$HELPER" quote "$1";;
+        *) printf '"%s"\n' "$1";;
+    esac
+}
 ts_get() { "$HELPER" json-get "$1" "$2" 2>/dev/null; }
 ts_bool() { [ "$1" = 1 ] && printf true || printf false; }
 ts_bound() { "$HELPER" timeout "$@"; }
