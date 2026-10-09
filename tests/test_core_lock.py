@@ -145,7 +145,7 @@ class CoreResolutionTests(CoreLockFixture):
         original = self.resolve()
         cases = (
             ("version", "1.102.5", "different source or release identity"),
-            ("build", "r2", "different source or release identity"),
+            ("build", f"r{int(original['build'][1:]) + 1}", "different source or release identity"),
             ("recipe_source_sha256", "f" * 64, "recipe differs"),
         )
         for field, value, message in cases:
@@ -322,7 +322,7 @@ class LockedCoreBuildTests(CoreLockFixture):
 
     def test_lock_build_number_must_match_recipe_before_download(self):
         changed = copy.deepcopy(self.lock)
-        changed["build"] = "r2"
+        changed["build"] = f"r{int(self.lock['build'][1:]) + 1}"
         self.write_lock(changed)
         with self.assertRaisesRegex(ValueError, "locked build differs"):
             self.build()
