@@ -70,6 +70,9 @@ class PackagingTests(unittest.TestCase):
     def open(self, platform):
         return tarfile.open(self.out / f"tailscale_3.0.0_{platform}.tar.gz")
 
+    def test_core_keeps_app_connector_and_peerapi_dns_support(self):
+        self.assertTrue({"ts_omit_appconnectors", "ts_omit_dns"}.isdisjoint(RECIPE["tags"]))
+
     def test_six_packages_architecture_selection_matches_universal(self):
         self.assertEqual(len(self.packages()), 6)
         with self.open("universal") as universal:

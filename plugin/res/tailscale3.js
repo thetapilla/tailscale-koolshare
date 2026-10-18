@@ -7,7 +7,7 @@
     var $ = options.$, doc = options.document, clock = options.now || function () { return Date.now(); };
     var later = options.setTimeout || setTimeout, cancel = options.clearTimeout || clearTimeout;
     var storage = options.storage, ask = options.confirm || function () { return true; };
-    var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable', 'tailscale_accept_dns', 'tailscale_custom_routes_enable'];
+    var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable', 'tailscale_accept_dns', 'tailscale_custom_routes_enable', 'tailscale_app_connector'];
     var buttons = ['apply_settings', 'core_check', 'core_update', 'core_rollback', 'run_status', 'run_netcheck', 'run_diagnostics'];
     // Software-center httpdb accepts request IDs of at most eight digits.
     var maxRequestId = 99999999, lastId = Math.floor(Math.random() * maxRequestId), timer = null, xhr = null;
@@ -17,7 +17,8 @@
     var canUpdate = false, canRollback = false, statusGood = false, lastStatus = null;
     var configNotice = '', statusNotice = '', statusReadNotice = '', baseline = '', refreshingStatus = false;
     var jobStarted = 0, jobPaused = false, JOB_WINDOW = 15 * 60 * 1000;
-    var routeRows = [], routeSerial = 0, baselineRoutes = '', legacyDraft = false, routesNotice = '';
+    var routeRows = [], routeSerial = 0, baselineRoutes = '', legacyDraft = 0, routesNotice = '';
+    var connectorKnown = false, connectorDraft = false;
 
     function node(id) { return doc.getElementById(id); }
     function plain(value, limit) {
@@ -156,10 +157,11 @@
         }
     }
     function restoreDraft(task) {
-        if (task.method !== 'tailscale_config' || typeof task.draft !== 'string' || !/^(?:[01]{7}|[01]{9})$/.test(task.draft)) { return; }
+        if (task.method !== 'tailscale_config' || typeof task.draft !== 'string' || !/^(?:[01]{7}|[01]{9}|[01]{10})$/.test(task.draft)) { return; }
         keys.slice(0, task.draft.length).forEach(function (key, index) { node(key).checked = task.draft.charAt(index) === '1'; });
-        legacyDraft = task.draft.length === 7;
-        if (!legacyDraft && typeof task.routes === 'string') { setRoutes(task.routes); }
+        legacyDraft = task.draft.length < 10 ? task.draft.length : 0;
+        connectorDraft = task.draft.length === 10;
+        if (task.draft.length >= 9 && typeof task.routes === 'string') { setRoutes(task.routes); }
         dirty = true;
     }
     function activeTask() { return pending || submitted || job; }
@@ -178,6 +180,8 @@
     function controls() {
         var locked = busy || !configReady, task = activeTask(), settingTask = task && task.method === 'tailscale_config', i;
         for (i = 0; i < keys.length; i++) { if (node(keys[i])) { node(keys[i]).disabled = locked; } }
+        node('tailscale_app_connector').disabled = locked || !(connectorKnown || connectorDraft);
+        visible('app_connector_migration', configReady && !connectorKnown && !connectorDraft);
         routeRows.forEach(function (item) { item.input.disabled = locked; item.button.disabled = locked; });
         if (node('custom_routes_add')) { node('custom_routes_add').disabled = locked || routeRows.length >= 32; }
         visible('custom_routes_editor', !!node('tailscale_custom_routes_enable').checked);
@@ -218,7 +222,7 @@
     }
     function readConfig() {
         request({ type: 'GET', url: '/_api/tailscale_', dataType: 'json' }, function (error, response) {
-            var result = unpack(response), data = result && result[0], i;
+            var result = unpack(response), data = result && result[0], i, connector;
             if (error || !data || typeof data !== 'object') {
                 configDue = clock() + 3000;
                 configNotice = readError(error, response, '设置');
@@ -226,14 +230,25 @@
                 controls();
                 return;
             }
+            connector = data.tailscale_app_connector;
+            connectorKnown = connector === '0' || connector === 0 || connector === false || connector === '1' || connector === 1 || connector === true;
+            if (!connectorKnown && lastStatus && lastStatus.app_connector && typeof lastStatus.app_connector.advertise === 'boolean') {
+                connector = lastStatus.app_connector.advertise; connectorKnown = true;
+            }
             if (!dirty || legacyDraft) {
                 for (i = 0; i < keys.length; i++) {
-                    if (node(keys[i]) && (!dirty || i >= 7)) { node(keys[i]).checked = data[keys[i]] === '1' || data[keys[i]] === 1 || data[keys[i]] === true; }
+                    if (node(keys[i]) && (!dirty || i >= legacyDraft)) {
+                        node(keys[i]).checked = i === 9 ? connector === '1' || connector === 1 || connector === true : data[keys[i]] === '1' || data[keys[i]] === 1 || data[keys[i]] === true;
+                    }
                 }
-                setRoutes(typeof data.tailscale_custom_routes === 'string' ? data.tailscale_custom_routes : '');
-                legacyDraft = false;
+                if (!dirty || legacyDraft === 7) { setRoutes(typeof data.tailscale_custom_routes === 'string' ? data.tailscale_custom_routes : ''); }
+                legacyDraft = 0;
+                if (!dirty) { connectorDraft = false; }
             }
-            baseline = keys.map(function (key) { return data[key] === '1' || data[key] === 1 || data[key] === true ? '1' : '0'; }).join('');
+            baseline = keys.map(function (key, index) {
+                var value = index === 9 ? connector : data[key];
+                return value === '1' || value === 1 || value === true ? '1' : '0';
+            }).join('');
             baselineRoutes = typeof data.tailscale_custom_routes === 'string' ? data.tailscale_custom_routes : '';
             dirty = snapshot() !== baseline || routesDraft() !== baselineRoutes;
             configReady = true;
@@ -242,6 +257,39 @@
             connectionNotice();
             controls();
         });
+    }
+    function renderConnector(data, changing) {
+        var appc = data.app_connector, message = '', domains, addresses = [], seen = Object.create(null);
+        if (appc && typeof appc.advertise === 'boolean' && !connectorKnown) {
+            connectorKnown = true;
+            if (!connectorDraft) { node('tailscale_app_connector').checked = appc.advertise; }
+            baseline = baseline.slice(0, 9) + (appc.advertise ? '1' : '0');
+            if (configReady) { dirty = snapshot() !== baseline || routesDraft() !== baselineRoutes; }
+        }
+        if (appc && appc.advertise === false) { visible('app_connector_status', false); return; }
+        if ((!appc || appc.advertise === null) && (changing || refreshingStatus)) { message = changing ? '等待操作完成' : '正在刷新状态…'; }
+        else if (!appc || appc.error || appc.advertise !== true) { message = '无法读取应用连接器状态'; }
+        else if (!Array.isArray(appc.tags) || !appc.tags.length) {
+            message = '本机没有标签，不能作为应用连接器。请在管理控制台为本机添加应用使用的标签。';
+        } else {
+            domains = Array.isArray(appc.assigned_domains) ? appc.assigned_domains.filter(function (value) { return typeof value === 'string'; }) : [];
+            if (!domains.length) { message = '后台没有给本机的标签分配应用，请检查管理控制台的 Apps 设置。'; }
+            else {
+                if (appc.learned && typeof appc.learned === 'object' && !Array.isArray(appc.learned)) {
+                    Object.keys(appc.learned).forEach(function (domain) {
+                        if (Array.isArray(appc.learned[domain])) {
+                            appc.learned[domain].forEach(function (address) {
+                                if (typeof address === 'string' && !seen[address]) { seen[address] = true; addresses.push(address); }
+                            });
+                        }
+                    });
+                }
+                message = '已分配：' + domains.join('、') + '；已学习 ' + addresses.length + ' 个地址' +
+                    (addresses.length && addresses.length <= 8 ? '：' + addresses.join('、') : '');
+            }
+        }
+        text('app_connector_status', message);
+        visible('app_connector_status', true);
     }
     function renderStatus(data) {
         var core = data.core || {}, watchdog = data.watchdog || {}, changing = transition();
@@ -267,6 +315,7 @@
             text('routes_primary', data.routes.primary.filter(function (value) { return typeof value === 'string'; }).join('、') || '无');
             visible('routes_status', true);
         } else { visible('routes_status', false); }
+        renderConnector(data, changing);
         text('health_messages', health);
         visible('health_row', !!health);
         statusNotice = statusReadNotice || (data.error && !(data.error === 'local_api_unavailable' && (data.enabled === false || changing || refreshingStatus)) ? errorMessage(data.error) : '');
@@ -504,7 +553,9 @@
         if (busy || !configReady) { return false; }
         // httpdb writes fields before dispatch. Keep the snapshot in params so
         // only the locked backend operation can change persisted settings.
-        bits = snapshot();
+        // An upgrade may leave this setting unset until the daemon can report
+        // its existing preference. A nine-bit request preserves it meanwhile.
+        bits = snapshot().slice(0, connectorKnown || connectorDraft ? 10 : 9);
         clearRouteErrors();
         return action('tailscale_config', ['web_submit', bits, routesWire(routesDraft())], '应用设置', {});
     }
@@ -516,7 +567,10 @@
         stopped = false;
         setRoutes('');
         keys.forEach(function (key) {
-            bind(key, 'change', draftChanged);
+            bind(key, 'change', function () {
+                if (key === 'tailscale_app_connector' && !busy && configReady) { connectorDraft = true; }
+                draftChanged();
+            });
         });
         bind('custom_routes_add', 'click', function () {
             if (busy || !configReady || routeRows.length >= 32) { return; }
@@ -539,7 +593,7 @@
         if (saved && validId(saved.id)) {
             lastId = Math.max(lastId, Number(saved.id));
             busy = true;
-            if (saved.method === 'tailscale_config' && typeof saved.draft === 'string' && /^(?:[01]{7}|[01]{9})$/.test(saved.draft)) {
+            if (saved.method === 'tailscale_config' && typeof saved.draft === 'string' && /^(?:[01]{7}|[01]{9}|[01]{10})$/.test(saved.draft)) {
                 restoreDraft(saved);
             }
             beginJob({ id: String(saved.id), title: plain(saved.title) || '上次操作', method: plain(saved.method),

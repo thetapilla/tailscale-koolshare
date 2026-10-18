@@ -106,6 +106,9 @@ ts_unlock() { flock -u 9; exec 9>&-; }
 ts_stop() { printf '%s\n' stop >>"$MOCK_ROOT/lifecycle"; }
 ts_start() {
  printf 'start version=%s\n' "$(dbus get tailscale_version)" >>"$MOCK_ROOT/lifecycle"
+ if [ -f "$MOCK_ROOT/migrate-connector" ] && [ -z "$(dbus get tailscale_app_connector)" ]; then
+   dbus set tailscale_app_connector=1
+ fi
  if [ -f "$MOCK_ROOT/fail-start" ]; then
    rm -f "$MOCK_ROOT/fail-start"
    printf damaged >"$STATE"
@@ -265,6 +268,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read('config.json')['tailscale_accept_dns'], '0')
         self.assertEqual(self.read('config.json')['tailscale_custom_routes_enable'], '0')
         self.assertNotIn('tailscale_custom_routes', self.read('config.json'))
+        self.assertNotIn('tailscale_app_connector', self.read('config.json'))
         self.assertIn('start version=\n', (self.mock / 'lifecycle').read_text())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
 
@@ -380,10 +384,11 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(config['tailscale_accept_dns'], '0')
         self.assertEqual(config['tailscale_custom_routes_enable'], '0')
         self.assertNotIn('tailscale_custom_routes', config)
+        self.assertNotIn('tailscale_app_connector', config)
 
     def test_upgrade_retains_existing_dns_and_custom_routes(self):
         self.current()
-        custom = {'tailscale_accept_dns': '1', 'tailscale_custom_routes_enable': '1',
+        custom = {'tailscale_app_connector': '1', 'tailscale_accept_dns': '1', 'tailscale_custom_routes_enable': '1',
                   'tailscale_custom_routes': '119.188.240.179/32,2001:db8::/64'}
         self.write('config.json', dict(self.read('config.json'), **custom))
         self.install()
@@ -392,9 +397,18 @@ class InstallTests(unittest.TestCase):
 
     def test_failed_upgrade_preserves_new_keys_and_untrusted_route_bytes(self):
         self.current()
-        original = dict(self.read('config.json'), tailscale_accept_dns='1', tailscale_custom_routes_enable='1',
+        original = dict(self.read('config.json'), tailscale_app_connector='1', tailscale_accept_dns='1', tailscale_custom_routes_enable='1',
                         tailscale_custom_routes='bad\ntailscale_enable=1\n$(touch /tmp/never-run)\n')
         self.write('config.json', original)
+        (self.mock / 'fail-start').touch()
+        self.install(False)
+        self.assertEqual(self.read('config.json'), original)
+
+    def test_failed_upgrade_rolls_back_connector_migrated_during_start(self):
+        self.current()
+        original = self.read('config.json')
+        self.assertNotIn('tailscale_app_connector', original)
+        (self.mock / 'migrate-connector').touch()
         (self.mock / 'fail-start').touch()
         self.install(False)
         self.assertEqual(self.read('config.json'), original)
@@ -542,11 +556,13 @@ class InstallTests(unittest.TestCase):
     def test_uninstall_preserves_identity_preferences_and_unrelated_files(self):
         self.legacy(); self.install()
         unrelated = self.ks / 'scripts/tailscale_custom_user_note'; unrelated.write_text('keep')
+        self.write('config.json', dict(self.read('config.json'), tailscale_app_connector='1'))
         result = subprocess.run([SHELL, str(self.ks / 'scripts/uninstall_tailscale.sh')], env=self.env, text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.ks / 'configs/tailscale/tailscaled.state').read_text(), 'preserved-identity')
         self.assertEqual(self.read('config.json')['tailscale_accept_routes'], '0')
         self.assertNotIn('tailscale_version', self.read('config.json'))
+        self.assertNotIn('tailscale_app_connector', self.read('config.json'))
         self.assertTrue(unrelated.exists())
         self.assertFalse((self.ks / 'bin/tsks-helper').exists())
         self.assertFalse((self.ks / 'tailscale/cores').exists())

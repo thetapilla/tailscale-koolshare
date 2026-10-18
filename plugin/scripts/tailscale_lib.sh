@@ -168,7 +168,8 @@ ts_config_read() {
     EXIT_NODE=$(ts_read_bool tailscale_exit_node 0) &&
     WATCHDOG=$(ts_read_bool tailscale_watchdog_enable 1) &&
     ACCEPT_DNS=$(ts_read_bool tailscale_accept_dns 0) &&
-    CUSTOM=$(ts_read_bool tailscale_custom_routes_enable 0) || return 1
+    CUSTOM=$(ts_read_bool tailscale_custom_routes_enable 0) &&
+    APP_CONNECTOR=$(ts_read_bool tailscale_app_connector 0) || return 1
     ts_routes_read || return 1
     # Validate even a disabled list: keep it available for later use, never
     # conceal a corrupt saved value by treating it as an empty list.
@@ -176,7 +177,7 @@ ts_config_read() {
 }
 
 ts_bits_valid() {
-    case ${#1} in 7|9) ;; *) return 1;; esac
+    case ${#1} in 7|9|10) ;; *) return 1;; esac
     case $1 in *[!01]*) return 1;; esac
 }
 
@@ -200,17 +201,17 @@ ts_routes_validate() {
 ts_config_keys() {
     printf '%s\n' tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable \
         tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable \
-        tailscale_accept_dns tailscale_custom_routes_enable
+        tailscale_accept_dns tailscale_custom_routes_enable tailscale_app_connector
 }
 
 ts_config_snapshot() {
-    local key value count=0 bits=${1:-000000000}
+    local key value count=0 bits=${1:-0000000000}
     [ "$TS_LOCKED" = 1 ] || return 1
     : >"$RUN/config.previous"
     rm -f "$RUN/config.routes.previous" "$RUN/config.routes.invalid"
     for key in $(ts_config_keys); do
         count=$((count + 1))
-        [ "${#bits}" != 7 ] || [ "$count" -le 7 ] || break
+        [ "$count" -le "${#bits}" ] || break
         value=$(dbus get "$key" 2>/dev/null) || return 1
         case $value in ''|0|1) ;; *) return 1;; esac
         printf '%s=%s\n' "$key" "$value" >>"$RUN/config.previous" || return 1
@@ -228,13 +229,13 @@ ts_config_snapshot() {
 ts_config_bits_apply() {
     local remaining=$1 key bit
     [ "$TS_LOCKED" = 1 ] && ts_bits_valid "$remaining" || return 1
-    [ "${#remaining}" != 9 ] || [ "$#" = 2 ] || return 1
+    [ "${#remaining}" = 7 ] || [ "$#" = 2 ] || return 1
     for key in $(ts_config_keys); do
         [ -n "$remaining" ] || break
         bit=${remaining%"${remaining#?}"}; remaining=${remaining#?}
         dbus set "$key=$bit" >/dev/null 2>&1 || return 1
     done
-    if [ "${#1}" = 9 ]; then
+    if [ "${#1}" != 7 ]; then
         [ "$#" = 2 ] || return 1
         if [ -n "$2" ]; then dbus set "tailscale_custom_routes=$2" >/dev/null 2>&1
         else dbus remove tailscale_custom_routes >/dev/null 2>&1; fi
@@ -253,7 +254,7 @@ ts_config_restore() {
         else return 1; fi
     fi
     while IFS='=' read -r key value; do
-        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable|tailscale_accept_dns|tailscale_custom_routes_enable) ;; *) return 1;; esac
+        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable|tailscale_accept_dns|tailscale_custom_routes_enable|tailscale_app_connector) ;; *) return 1;; esac
         case $value in 0|1) dbus set "$key=$value" >/dev/null 2>&1 || failed=1;;
             '') dbus remove "$key" >/dev/null 2>&1 || failed=1;; *) return 1;; esac
     done <"$RUN/config.previous"
@@ -532,12 +533,35 @@ ts_start() {
     ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
     ts_cron
     [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
-    local state want routes= remaining route route_count=0
+    local state want routes= remaining route route_count=0 plan changed=0 current_connector saved_connector
     ts_daemon_start || return 1
+    # Reuse the ready sample's prefs. Do not issue another LocalAPI request;
+    # a missing setting is migrated before any managed preference is changed.
+    current_connector=$(ts_get "$RUN/start-status.json" app_connector.advertise) || current_connector=
+    case $current_connector in true|false) ;;
+        *) ts_job_log '无法读取核心当前的应用连接器设置，未应用设置'; return 1;; esac
+    if [ "${TS_CONNECTOR_CAPTURE:-0}" = 1 ]; then
+        # A first 10-bit submission may create the key before startup. Preserve
+        # its original core value if the set succeeds but later setup fails.
+        case $current_connector in true) TS_CONNECTOR_BEFORE=1;; false) TS_CONNECTOR_BEFORE=0;; esac
+        TS_CONNECTOR_CAPTURE=0
+    fi
+    saved_connector=$(dbus get tailscale_app_connector 2>/dev/null) || return 1
+    if [ -z "$saved_connector" ]; then
+        case $current_connector in
+            true) APP_CONNECTOR=1; state=开启;;
+            false) APP_CONNECTOR=0; state=关闭;;
+            *) ts_job_log '无法读取核心当前的应用连接器设置，未应用设置'; return 1;;
+        esac
+        dbus set "tailscale_app_connector=$APP_CONNECTOR" >/dev/null 2>&1 || {
+            ts_job_log '无法保存应用连接器设置，未应用设置'; return 1;
+        }
+        ts_job_log "已沿用核心当前的应用连接器设置：$state"
+    fi
     # Normalize the updater flags in the same edit as other managed settings:
     # clientupdate-free cores reject edits while a persisted Apply=true remains.
-    set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")" \
-        "--accept-dns=$(ts_bool "$ACCEPT_DNS")" --auto-update=false --update-check=false
+    set -- set --netfilter-mode=on "--accept-routes=$(ts_bool "$ACCEPT")" \
+        "--accept-dns=$(ts_bool "$ACCEPT_DNS")" "--advertise-connector=$(ts_bool "$APP_CONNECTOR")" --auto-update=false --update-check=false
     if [ "$ADVERTISE" = 1 ]; then
         ts_lan || { ts_job_log '局域网地址或子网掩码无效，请检查路由器局域网设置'; return 1; }
         routes=$LAN_CIDR; route_count=1
@@ -552,7 +576,18 @@ ts_start() {
             route_count=$((route_count + 1))
         done
     fi
-    set -- "$@" "--advertise-routes=$routes"
+    if ! plan=$("$HELPER" routes-plan "$SOCKET" "$routes" "$EXIT_NODE" "$APP_CONNECTOR" 2>/dev/null); then
+        ts_job_log '无法读取当前宣告列表，未应用设置'
+        return 1
+    fi
+    case $plan in
+        keep) ;;
+        "set$(printf '\t')"*)
+            changed=1
+            set -- "$@" "--advertise-exit-node=$(ts_bool "$EXIT_NODE")" "--advertise-routes=${plan#*"$(printf '\t')"}"
+            ;;
+        *) ts_job_log '宣告列表计算结果无效，未应用设置'; return 1;;
+    esac
     ts_cli "$@" >/dev/null 2>&1 || { ts_job_log '无法应用 Tailscale 设置，请检查本机服务状态'; return 1; }
     want=$(ts_get "$RUN/start-status.json" want_running)
     state=$(ts_get "$RUN/start-status.json" backend_state)
@@ -572,7 +607,40 @@ ts_start() {
             }
             ts_job_log '本机服务已就绪，等待控制面同步';;
         *) ts_job_log '本机服务状态异常，请查看诊断摘要'; return 1;; esac
+    if [ "$APP_CONNECTOR" = 1 ] && { [ "$changed" = 1 ] || [ "$current_connector" = false ]; }; then
+        ts_appc_prime
+    fi
     [ "$route_count" = 0 ] || ts_job_log "已宣告 $route_count 条网段：$routes；请在管理控制台批准"
+}
+
+# Self queries are best effort: DNS policy and control-plane propagation may
+# delay learning, but neither should roll back an otherwise healthy startup.
+ts_appc_prime() {
+    local file="$RUN/appc-prime.$$" assigned primed learned wildcards denied
+    if ! ts_bound 20 "$HELPER" appc-prime "$SOCKET" >"$file" 2>/dev/null; then
+        rm -f "$file"
+        ts_job_log '应用连接器：自查暂未完成，将在设备访问所分配域名时学习'
+        return 0
+    fi
+    assigned=$(ts_get "$file" assigned); primed=$(ts_get "$file" primed)
+    learned=$(ts_get "$file" learned); wildcards=$(ts_get "$file" wildcards)
+    denied=$(ts_get "$file" denied)
+    rm -f "$file"
+    if ! ts_uint "$assigned" || ! ts_uint "$primed" || ! ts_uint "$learned" || ! ts_uint "$wildcards"; then
+        ts_job_log '应用连接器：无法读取自查结果，请查看诊断摘要'
+        return 0
+    fi
+    if [ "$denied" = true ]; then
+        ts_job_log '应用连接器：本机查询被访问控制拒绝，将在设备访问这些域名时学习'
+    elif [ "$assigned" = 0 ]; then
+        ts_job_log '应用连接器：后台未给本机分配应用'
+    else
+        ts_job_log "应用连接器：已分配 $assigned 个域名，已学习 $learned 个地址"
+        if [ "$primed" -lt "$((assigned - wildcards))" ]; then
+            ts_job_log '应用连接器：部分域名尚未完成自查，将在设备访问这些域名时继续学习'
+        fi
+        [ "$wildcards" = 0 ] || ts_job_log '应用连接器：通配域名需要设备查询后才能学习'
+    fi
 }
 
 ts_stop() {
@@ -750,7 +818,7 @@ ts_watchdog_run() {
 ts_status_json() {
     local file="$RUN/status-query.$$" backend=Unavailable online=null codes='[]' messages='[]'
     local auth= monitoring=false version= version_long= installed= available= rollback=false error= now statusok=false
-    local routes='{"advertised":[],"primary":[]}'
+    local routes='{"advertised":[],"primary":[]}' app_connector='{"advertise":null,"tags":[],"assigned_domains":[],"wildcards":0,"learned":{},"error":"local_api_unavailable"}'
     local installed_build= available_build= update_available=false previous= previous_build= current_target= offered_target= available_arch=
     ts_config_read || { ENABLE=0; WATCHDOG=0; error=invalid_configuration; }
     if ts_status_file "$file"; then
@@ -765,6 +833,7 @@ ts_status_json() {
         version=$(ts_get "$file" version)
         version_long=$(ts_get "$file" version_long) || version_long=
         routes=$(ts_get "$file" routes) || routes='{"advertised":[],"primary":[]}'
+        app_connector=$(ts_get "$file" app_connector) || app_connector='{"advertise":null,"tags":[],"assigned_domains":[],"wildcards":0,"learned":{},"error":"local_api_unavailable"}'
     else [ -n "$error" ] || error=local_api_unavailable; fi
     rm -f "$file"
     case $online in true|false|null) ;; *) online=null;; esac
@@ -803,9 +872,9 @@ ts_status_json() {
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.2.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.3.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
         "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback"
-    printf ',"core_version_long":%s,"routes":%s' "$(ts_quote "$version_long")" "$routes"
+    printf ',"core_version_long":%s,"routes":%s,"app_connector":%s' "$(ts_quote "$version_long")" "$routes" "$app_connector"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
     printf '}\n'
 }
@@ -816,16 +885,28 @@ ts_parse_request() {
     ACTION=${1:-}
 }
 
+# When the key was absent before a first explicit submission, its actual core
+# value is the old setting. Persist that captured value on rollback so a later
+# start cannot import the failed edit, including when the old service was off.
+ts_connector_restore_migration() {
+    case ${TS_CONNECTOR_BEFORE:-} in '') return 0;; 0|1) ;; *) return 1;; esac
+    dbus set "tailscale_app_connector=$TS_CONNECTOR_BEFORE" >/dev/null 2>&1 || {
+        ts_job_log '原应用连接器设置恢复失败，请在插件页面检查并重新应用设置'
+        return 1
+    }
+}
+
 ts_mutation() {
     local action=$1 rc=0 bits= has_bits=0 routes= old_running=0 old_manual=0 applied=0
+    local TS_CONNECTOR_CAPTURE=0 TS_CONNECTOR_BEFORE=
     if [ "$action" = web_submit ] && [ "$#" -gt 1 ]; then
         bits=$2; has_bits=1
         if ! ts_bits_valid "$bits" || { [ "${#bits}" = 7 ] && [ "$#" != 2 ]; } ||
-            { [ "${#bits}" = 9 ] && [ "$#" != 3 ]; }; then
+            { [ "${#bits}" != 7 ] && [ "$#" != 3 ]; }; then
             ts_reply '{"accepted":false,"error":"invalid_config_snapshot"}'
             return 1
         fi
-        if [ "${#bits}" = 9 ]; then
+        if [ "${#bits}" != 7 ]; then
             if ! ts_routes_validate "$3"; then
                 ts_reply "{\"accepted\":false,\"error\":\"invalid_custom_routes\",\"detail\":$(ts_quote "$ROUTES_DETAIL")}"
                 return 1
@@ -858,6 +939,9 @@ ts_mutation() {
             ts_job_write failed configuration '无法备份当前设置，未应用更改；请检查存储空间后重试'
             return 1
         fi
+        if [ "${#bits}" = 10 ] && grep -qx 'tailscale_app_connector=' "$RUN/config.previous"; then
+            TS_CONNECTOR_CAPTURE=1
+        fi
         ts_pid_alive && old_running=1
         [ ! -f "$RUN/manual-stop" ] || old_manual=1
         if ! ts_config_bits_apply "$bits" "$routes"; then
@@ -879,7 +963,7 @@ ts_mutation() {
         *) ts_job_log '无法识别操作请求，请刷新插件页面后重试'; rc=1;;
     esac
     if [ "$rc" != 0 ] && [ "$applied" = 1 ]; then
-        if ts_config_restore; then
+        if ts_config_restore && ts_connector_restore_migration; then
             ts_job_log '操作失败后已恢复原设置'
             if [ "$old_running" = 1 ]; then
                 ts_restart || ts_job_log '原设置已恢复，但服务重启失败；请查看诊断摘要'

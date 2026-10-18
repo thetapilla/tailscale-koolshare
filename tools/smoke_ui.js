@@ -43,15 +43,16 @@ const calls = [], scriptErrors = [];
 // ordinary scenarios below still exercise the extracted firmware's real httpdb.
 const lifecycle = { config: { tailscale_enable: '0', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1',
     tailscale_advertise_routes: '0', tailscale_accept_routes: '0', tailscale_exit_node: '0', tailscale_watchdog_enable: '0',
-    tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_custom_routes: '' },
+    tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_app_connector: '0', tailscale_custom_routes: '' },
     task: null, failNext: false, unavailableReads: 0 };
-// Status overlays cover signed-descriptor identities and delayed authorization
+// Status overlays cover signed-descriptor identities, connector states and delayed authorization
 // without downloading cores or registering a device on a real tailnet.
 const identity = { enabled: true, backend_state: 'Running', online: true, error: '', monitoring_available: true,
     core_version: '1.104.1', auth_url: '', core: {
     installed: '1.104.1', installed_build: 'r1', available: '1.104.1', available_build: 'r2',
     update_available: true, can_rollback: true, previous: '1.102.4', previous_build: 'legacy'
 } };
+const connector = { value: { advertise: false, tags: [], assigned_domains: [], learned: {}, error: '' }, missingKey: false };
 function lifecycleResponse(url, body) {
     if (url.pathname === '/_api/tailscale_') { return { result: [lifecycle.config] }; }
     const call = JSON.parse(body.toString());
@@ -65,7 +66,7 @@ function lifecycleResponse(url, body) {
         if (task && Date.now() - task.started >= 8500) {
             task.state = task.fail ? 'failed' : 'success';
             if (!task.fail) {
-                Object.keys(lifecycle.config).slice(0, 9).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; });
+                Object.keys(lifecycle.config).slice(0, 10).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; });
                 lifecycle.config.tailscale_custom_routes = task.routes;
             }
         }
@@ -78,6 +79,7 @@ function lifecycleResponse(url, body) {
         data = { schema: 1, plugin_version: version, core_version: '1.104.1', enabled: unavailable ? true : lifecycle.config.tailscale_enable === '1',
             backend_state: unavailable ? 'Unavailable' : 'Running', online: unavailable ? null : true,
             monitoring_available: !unavailable, error: unavailable ? 'local_api_unavailable' : '',
+            app_connector: { advertise: unavailable ? null : lifecycle.config.tailscale_app_connector === '1', tags: [], assigned_domains: [], learned: {}, error: unavailable ? 'local_api_unavailable' : '' },
             core: { installed: '1.104.1' }, watchdog: { enabled: false, count_24h: 0 }, health_messages: [] };
     } else if (call.method === 'tailscale_tsnets') { data = { interfaces: [] }; }
     else { throw new Error('Unexpected lifecycle request: ' + call.method); }
@@ -107,6 +109,14 @@ const server = http.createServer((req, res) => {
                     let data = Buffer.concat(received);
                     let status = response.statusCode;
                     const scenario = new URL(req.headers.referer || 'http://127.0.0.1').searchParams.get('scenario');
+                    if (scenario === 'connector' && (method === 'tailscale_fettle' || (connector.missingKey && url.pathname === '/_api/tailscale_'))) {
+                        const wrapped = JSON.parse(data.toString());
+                        let result = typeof wrapped.result === 'string' ? JSON.parse(wrapped.result) : wrapped.result;
+                        if (method === 'tailscale_fettle') { result.app_connector = connector.value; }
+                        else { delete result[0].tailscale_app_connector; }
+                        wrapped.result = typeof wrapped.result === 'string' ? JSON.stringify(result) : result;
+                        data = Buffer.from(JSON.stringify(wrapped));
+                    }
                     if (scenario === 'identity' && method === 'tailscale_fettle') {
                         const wrapped = JSON.parse(data.toString());
                         const statusData = JSON.parse(wrapped.result);
@@ -185,6 +195,7 @@ const server = http.createServer((req, res) => {
             environment: 'isolated fixture with extracted firmware userspace', real_httpdb: upstream.origin, requests: calls.length, initial_load_ms: initialLoadMs,
             lifecycle_transport: checks.includes('delayed start/stop status') ? 'deterministic delayed HTTP responses at local proxy' : 'not exercised',
             identity_transport: checks.includes('core build identities') ? 'status overlays on real HTTP/DBus replies at local proxy' : 'not exercised',
+            connector_transport: checks.includes('connector status states') ? 'synthetic connector status overlays on real HTTP/DBus replies at local proxy' : 'not exercised',
             result: 'passed', checks };
         fs.writeFileSync(path.join(screenshots, 'result.json'), JSON.stringify(result, null, 2) + '\n');
         console.log(JSON.stringify(result));
@@ -236,7 +247,7 @@ const server = http.createServer((req, res) => {
         assert.equal(await routeInputs.count(), 3);
         await job('apply_settings', /^操作完成$/);
         const routeSave = calls.slice(routesAt).find(call => call.method === 'tailscale_config');
-        assert.match(routeSave.params[1], /^[01]{7}11$/);
+        assert.match(routeSave.params[1], /^[01]{7}11[01]$/);
         assert.equal(routeSave.params[1][3], '0');
         assert.equal(routeSave.params[2], 'b64.' + Buffer.from('192.168.60.0/24,2001:DB8:1::/64').toString('base64url'));
         assert.deepEqual(routeSave.fields, {});
@@ -277,15 +288,26 @@ const server = http.createServer((req, res) => {
         assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), true);
         assert.equal(await page.locator('#tailscale_custom_routes_enable').isChecked(), false);
         assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), ['192.168.60.0/24', '2001:db8:1::/64']);
-        for (const oldDraft of [false, true]) {
-            const task = { id: oldDraft ? '999999999999998' : '999999999999997', title: '应用设置', method: 'tailscale_config',
-                draft: oldDraft ? '0100000' : '010000001', routes: oldDraft ? undefined : '10.20.0.0/16', reloadConfig: true };
+        const connectorAt = calls.length;
+        await page.locator('#tailscale_app_connector').check();
+        assert.equal(calls.slice(connectorAt).filter(call => call.method === 'tailscale_config').length, 0);
+        assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), true);
+        await job('apply_settings', /^操作完成$/);
+        const connectorSave = calls.slice(connectorAt).find(call => call.method === 'tailscale_config');
+        assert.match(connectorSave.params[1], /^[01]{9}1$/);
+        await page.reload(); await ready();
+        assert.equal(await page.locator('#tailscale_app_connector').isChecked(), true);
+        for (const draftLength of [7, 9, 10]) {
+            const oldDraft = draftLength === 7;
+            const task = { id: String(999999999999980 + draftLength), title: '应用设置', method: 'tailscale_config',
+                draft: oldDraft ? '0100000' : draftLength === 9 ? '010000001' : '0100000010', routes: oldDraft ? undefined : '10.20.0.0/16', reloadConfig: true };
             await page.evaluate(task => sessionStorage.setItem('tailscale3_pending', JSON.stringify(task)), task);
             await page.reload(); await ready();
             assert.equal(await text('job_state'), '任务结果无法确认');
             assert.equal(await text('settings_notice'), '设置尚未应用');
             assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), oldDraft);
             assert.equal(await page.locator('#tailscale_custom_routes_enable').isChecked(), !oldDraft);
+            assert.equal(await page.locator('#tailscale_app_connector').isChecked(), draftLength < 10);
             assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), oldDraft ? ['192.168.60.0/24', '2001:db8:1::/64'] : ['10.20.0.0/16']);
         }
         await page.reload(); await ready();
@@ -324,6 +346,7 @@ const server = http.createServer((req, res) => {
             assert.ok(lifecycle.unavailableReads > reads, 'The browser must receive the injected missing-LocalAPI response during the transition');
             await page.waitForFunction(() => document.getElementById('tailnet_state').textContent === '等待操作完成');
             assert.equal(await text('connection_notice'), '');
+            assert.equal(await text('app_connector_status'), '等待操作完成');
             assert.doesNotMatch(await text('settings_notice'), /尚未应用/);
             await page.screenshot({ path: path.join(screenshots, fail ? 'starting-failure.png' : enabled ? 'starting.png' : 'stopping.png'), fullPage: true });
             await page.waitForFunction(() => /^(操作完成|操作失败)$/.test(document.getElementById('job_state').textContent), null, { timeout: 20000 });
@@ -371,6 +394,38 @@ const server = http.createServer((req, res) => {
         assert.ok(calls.slice(identityAt).every(call => !call.method || ['tailscale_fettle', 'tailscale_tsnets'].includes(call.method)),
             'Identity changes and authorization links must arrive through read-only polling');
         console.log(JSON.stringify({ phase: 'core build identities, update eligibility and delayed authorization', result: 'passed' }));
+        const connectorBase = { advertise: true, tags: ['tag:app-egress'], assigned_domains: ['app.example.test', 'files.example.test'], learned: {}, error: '' };
+        const connectorCases = [
+            [{ ...connectorBase, advertise: false }, null],
+            [{ ...connectorBase, error: 'local_api_unavailable' }, '无法读取应用连接器状态'],
+            [{ ...connectorBase, tags: [] }, '本机没有标签，不能作为应用连接器。请在管理控制台为本机添加应用使用的标签。'],
+            [{ ...connectorBase, assigned_domains: [] }, '后台没有给本机的标签分配应用，请检查管理控制台的 Apps 设置。'],
+            [{ ...connectorBase, learned: { 'app.example.test': ['198.51.100.9'], 'files.example.test': ['198.51.100.9'] } }, '已分配：app.example.test、files.example.test；已学习 1 个地址：198.51.100.9'],
+            [{ ...connectorBase, assigned_domains: ['<img src=x onerror=alert(1)>'], learned: { x: ['<b>untrusted</b>'] } }, '已分配：<img src=x onerror=alert(1)>；已学习 1 个地址：<b>untrusted</b>'],
+            [{ ...connectorBase, learned: { 'app.example.test': Array.from({ length: 9 }, (_, index) => '198.51.100.' + (index + 1)) } }, '已分配：app.example.test、files.example.test；已学习 9 个地址']
+        ];
+        for (const [value, expected] of connectorCases) {
+            connector.value = value;
+            await page.goto(url + '?scenario=connector'); await ready();
+            assert.equal(await page.locator('#app_connector_status').isVisible(), expected !== null);
+            if (expected !== null) { assert.equal(await text('app_connector_status'), expected); }
+            assert.equal(await page.locator('#app_connector_status *').count(), 0);
+            if (expected && expected.includes('已学习 1 个地址：198')) {
+                await page.screenshot({ path: path.join(screenshots, 'app-connector.png'), fullPage: true });
+            }
+        }
+        connector.missingKey = true;
+        connector.value = connectorCases[4][0];
+        await page.goto(url + '?scenario=connector'); await ready();
+        assert.equal(await page.locator('#tailscale_app_connector').isChecked(), true);
+        assert.equal(await page.locator('#tailscale_app_connector').isDisabled(), false);
+        assert.equal(await text('settings_notice'), '');
+        connector.value = { ...connectorBase, advertise: null, error: 'local_api_unavailable' };
+        await page.reload(); await ready();
+        assert.equal(await page.locator('#tailscale_app_connector').isDisabled(), true);
+        assert.equal(await page.locator('#app_connector_migration').isVisible(), true);
+        connector.missingKey = false;
+        console.log(JSON.stringify({ phase: 'connector checkbox, ten-bit save, legacy drafts, status states, text safety and first-upgrade state', result: 'passed' }));
         await page.goto(url); await ready();
         await page.evaluate(() => sessionStorage.setItem('tailscale3_pending', JSON.stringify({ id: '999999999999999', title: '应用设置', reloadConfig: true })));
         const resumeAt = calls.length;
@@ -380,7 +435,7 @@ const server = http.createServer((req, res) => {
         assert.ok(calls.slice(resumeAt).every(call => !call.method || ['tailscale_job', 'tailscale_fettle', 'tailscale_tsnets'].includes(call.method)));
         await page.screenshot({ path: path.join(screenshots, 'recovered.png'), fullPage: true });
         assert.deepEqual(scriptErrors, []);
-        await report(['initial state', 'settings', 'DNS setting', 'custom route normalization', 'route validation and error rows', 'oversized request rejection', '32 row limit', 'disabled route preservation', 'old and new route draft recovery', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery', 'core build identities', 'backend update eligibility', 'delayed authorization link'], initialLoadMs);
+        await report(['initial state', 'settings', 'DNS setting', 'custom route normalization', 'route validation and error rows', 'oversized request rejection', '32 row limit', 'disabled route preservation', 'old and new route draft recovery', 'ten-bit connector save', 'seven and nine-bit connector preservation', 'connector status states', 'connector text safety', 'connector learned address deduplication', 'connector migration state', 'diagnostic jobs', 'offline core check', 'malformed envelope recovery', 'login response recovery', 'HTTP failure recovery', 'missing task recovery', 'draft-only enable switch', 'delayed start/stop status', 'failed apply draft recovery', 'core build identities', 'backend update eligibility', 'delayed authorization link'], initialLoadMs);
     } catch (error) {
         await page.screenshot({ path: path.join(screenshots, 'failure.png'), fullPage: true }).catch(() => {});
         console.error(JSON.stringify({ script_errors: scriptErrors, requests: calls, page_state: await page.evaluate(() => ({

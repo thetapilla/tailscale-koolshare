@@ -17,7 +17,8 @@ if [ -e "$DATA/update.txn" ] || [ -L "$DATA/update.txn" ]; then
     exit 1
 fi
 ts_stop || exit 1
-# Identity and user settings under configs/tailscale and tailscale_* remain.
+# Preserve identity and existing user settings. The connector preference is
+# re-imported from the core on a future installation.
 for name in tailscale_config tailscale_fettle tailscale_tsnets tailscale_status tailscale_ncheck tailscale_watchdog tailscale_lib.sh tailscale_core tailscale_core_lib.sh tailscale_job tailscale_diagnostics; do
     rm -f "$KSROOT/scripts/$name" || exit 1
 done
@@ -33,7 +34,7 @@ done
 if [ -d "$DATA/cores" ] && [ ! -L "$DATA/cores" ]; then rm -rf "$DATA/cores" || exit 1; fi
 rm -f "$DATA/current" "$DATA/previous" "$DATA/release.pub" "$DATA/available.json" "$DATA/available.signed.json" "$DATA/available-release.json" "$DATA/update.state" || exit 1
 rmdir "$DATA" 2>/dev/null || :
-for key in tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
+for key in tailscale_app_connector tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
     dbus remove "$key" || exit 1
 done
 printf '%s\n' "Tailscale 已卸载。已保留连接身份（$KSROOT/configs/tailscale）和软件中心中的插件设置。"

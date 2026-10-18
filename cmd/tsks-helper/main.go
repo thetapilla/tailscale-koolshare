@@ -33,6 +33,17 @@ func run(a []string) error {
 		return errors.New("command required")
 	}
 	switch a[0] {
+	case "routes-plan":
+		return runRoutesPlan(a)
+	case "appc-prime":
+		if len(a) != 2 {
+			return errors.New("appc-prime SOCKET")
+		}
+		result, err := appcPrime(localClient(a[1]), nil, defaultPrimeTiming)
+		if err != nil {
+			return err
+		}
+		return emit(result)
 	case "routes", "routes-wire":
 		if len(a) != 2 {
 			return fmt.Errorf("%s LIST", a[0])

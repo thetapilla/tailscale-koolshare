@@ -210,7 +210,7 @@ sys.exit(7)
                 body = {"Version": "1.102.4", "BackendState": "Running", "Health": [health_message], "AuthURL": "",
                         "HaveNodeKey": True, "Self": {"ID": "fixture-node", "Online": True, "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"]}}
             elif self.path == "/localapi/v0/prefs":
-                body = {"WantRunning": True, "LoggedOut": False}
+                body = {"WantRunning": True, "LoggedOut": False, "AppConnector": {"Advertise": False}, "AdvertiseRoutes": []}
             elif self.path.startswith("/localapi/v0/watch-ipn-bus"):
                 body = {"Health": {"Warnings": {}}}
             else:
@@ -296,13 +296,13 @@ sys.exit(7)
         route_params = ("", "192.0.2.0/24", "2001:db8:abcd::/48,198.51.100.10/32", ",".join(f"2001:0db8:1111:2222:3333:4444:5555:{i:04x}/128" for i in range(32)), "非法网段")
         for routes in route_params:
             wire = "b64." + base64.urlsafe_b64encode(routes.encode()).decode().rstrip("=")
-            _, actual = rpc("tailscale_args_probe", ["011110101", wire])
-            assert actual == {"argc": 3, "bits": "011110101", "routes": wire}, actual
+            _, actual = rpc("tailscale_args_probe", ["0111101011", wire])
+            assert actual == {"argc": 3, "bits": "0111101011", "routes": wire}, actual
         subprocess.run(["/koolshare/bin/dbus", "set", "tailscale_probe_newline=one"], env=env, check=True)
         stored = subprocess.check_output(["/koolshare/bin/dbus", "get", "tailscale_probe_newline"], env=env)
         assert stored in (b"one", b"one\n"), repr(stored)
         oversized_wire = "b64." + base64.urlsafe_b64encode(b"1" * 2048).decode().rstrip("=")
-        large_reply = json.loads(request_http("/_api/", {"id": 98765432, "method": "tailscale_args_probe", "params": ["011110101", oversized_wire], "fields": {}}))
+        large_reply = json.loads(request_http("/_api/", {"id": 98765432, "method": "tailscale_args_probe", "params": ["0111101011", oversized_wire], "fields": {}}))
         if large_reply.get("result") != -6:
             assert json.loads(large_reply["result"])["routes"] == oversized_wire
         if params_only:
@@ -370,21 +370,30 @@ sys.exit(7)
         assert config["tailscale_enable"] == "0", config
         def wire_routes(value):
             return "b64." + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
-        job("tailscale_config", ["web_submit", "011110111", wire_routes("192.0.2.0/24,2001:0DB8:ABCD::/48")])
+        job("tailscale_config", ["web_submit", "0111101111", wire_routes("192.0.2.0/24,2001:0DB8:ABCD::/48")])
         config = json.loads(request_http("/_api/tailscale_"))["result"][0]
         assert config["tailscale_accept_dns"] == "1" and config["tailscale_custom_routes_enable"] == "1", config
         assert config["tailscale_custom_routes"] == "192.0.2.0/24,2001:db8:abcd::/48", config
+        assert config["tailscale_app_connector"] == "1", config
+        job("tailscale_config", ["web_submit", "011110111", wire_routes(config["tailscale_custom_routes"])])
+        assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
         job("tailscale_config", ["web_submit", "0111101"])
         assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
         jobs_before = sorted(p.name for p in Path("/tmp/upload").glob("*.json"))
-        _, bad_routes = rpc("tailscale_config", ["web_submit", "011110111", wire_routes("192.0.2.1/24")])
+        for params in (["web_submit", "0111101111"], ["web_submit", "0111101", "b64."], ["web_submit", "0111101111", "b64.", "extra"]):
+            _, invalid_snapshot = rpc("tailscale_config", params)
+            assert invalid_snapshot == {"accepted": False, "error": "invalid_config_snapshot"}, invalid_snapshot
+        assert sorted(p.name for p in Path("/tmp/upload").glob("*.json")) == jobs_before
+        assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
+        _, bad_routes = rpc("tailscale_config", ["web_submit", "0111101111", wire_routes("192.0.2.1/24")])
         assert bad_routes["accepted"] is False and bad_routes["error"] == "invalid_custom_routes", bad_routes
         assert "192.0.2.0/24" in bad_routes["detail"], bad_routes
         assert sorted(p.name for p in Path("/tmp/upload").glob("*.json")) == jobs_before
         assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
-        job("tailscale_config", ["web_submit", "011110100", wire_routes("")])
+        job("tailscale_config", ["web_submit", "0111101000", wire_routes("")])
         cleared = json.loads(request_http("/_api/tailscale_"))["result"][0]
         assert not cleared.get("tailscale_custom_routes"), cleared
+        assert cleared["tailscale_app_connector"] == "0", cleared
 
         # The preceding stop removes the socket, providing the real missing-
         # daemon path. Recreate only the test LocalAPI service afterwards.

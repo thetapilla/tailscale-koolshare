@@ -102,6 +102,12 @@ elif name=='tsks-helper':
                 entry=json.dumps(values[index-1],ensure_ascii=False)[1:-1] or '(empty)'
                 error=str(index)+'\t'+entry+'\t无效的 CIDR 网段'
             print(error,file=sys.stderr);sys.exit(1)
+    elif args[0]=='routes-plan':
+        if read('routes-plan-exit.json',0):sys.exit(1)
+        print(read('routes-plan.json','set\t'+args[2]))
+    elif args[0]=='appc-prime':
+        if read('appc-prime-exit.json',0):sys.exit(1)
+        print(json.dumps(read('appc-prime.json',{'assigned':2,'primed':2,'learned':1,'wildcards':0,'denied':False})))
     elif args[0]=='fifo':os.mkfifo(args[1],0o600)
     elif args[0]=='temp':
         import tempfile
@@ -144,7 +150,14 @@ elif name in ('tailscale','tailscaled'):
         (proc/'cmdline').write_bytes((sys.argv[0]+'\0'+'\0'.join(args)).encode())
         print('mock daemon started',flush=True)
         while True:time.sleep(1)
-    if name=='tailscale':print(read('cli_output.json',''),end='')
+    if name=='tailscale':
+        print(read('cli_output.json',''),end='')
+        if read('cli_exit.json',0)==0 and 'set' in args:
+            for arg in args:
+                if arg.startswith('--advertise-connector='):
+                    value=read('status.json',{})
+                    value.setdefault('app_connector',{})['advertise']=arg.endswith('=true')
+                    write('status.json',value)
     sys.exit(read('cli_exit.json',0))
 elif name=='cru':pass
 elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
@@ -232,7 +245,8 @@ class BackendTests(unittest.TestCase):
         self.status = dict(ok=True, version="1.102.4", backend_state="Running", online=True,
                            health_codes=[], health_messages=[], auth_url="", ips=["100.64.2.3", "fd7a:115c:a1e0::123"],
                            want_running=True, logged_out=False, sync_enabled=True, monitoring_available=True,
-                           node_id="node-original", have_node_key=True)
+                           node_id="node-original", have_node_key=True,
+                           app_connector={"advertise": False, "tags": [], "assigned_domains": [], "wildcards": 0, "learned": {}, "error": ""})
         self.write("status.json", self.status)
         self.shell(":")
 
@@ -455,7 +469,7 @@ class BackendTests(unittest.TestCase):
                     self.assertEqual(len(calls), 1)
                     args = calls[0]
                     self.assertEqual(args[1], "set")
-                    for flag in ("--auto-update=false", "--update-check=false", "--advertise-exit-node=true"):
+                    for flag in ("--auto-update=false", "--update-check=false", "--advertise-exit-node=true", "--advertise-connector=false"):
                         self.assertIn(flag, args)
                     self.assertIn("--accept-dns=false", args)
                     sequence = [json.loads(line) for line in (self.mock / "calls.jsonl").read_text().splitlines()]
@@ -550,7 +564,7 @@ class BackendTests(unittest.TestCase):
 
     def test_disabled_custom_routes_are_retained_but_not_advertised(self):
         original = {"tailscale_enable": "1", "tailscale_advertise_routes": "0",
-            "tailscale_custom_routes_enable": "0", "tailscale_custom_routes": "119.188.240.179/32"}
+            "tailscale_custom_routes_enable": "0", "tailscale_custom_routes": "119.188.240.179/32", "tailscale_app_connector": "0"}
         self.write("config.json", original)
         self.shell("ts_pid_alive() { return 0; }; ts_start")
         self.assertIn("--advertise-routes=", self.calls("tailscale")[0])
@@ -577,6 +591,127 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(any(field.startswith("routes.") for field in fields))
         self.write("status.json", None)
         self.assertEqual(json.loads(self.shell("ts_status_json").stdout)["routes"], {"advertised": [], "primary": []})
+
+    def test_connector_migration_uses_ready_sample_before_any_preference_edit(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                self.write("config.json", {"tailscale_enable": "1"})
+                self.write("status.json", dict(self.status, app_connector={"advertise": enabled}))
+                self.write("routes-plan.json", "keep")
+                self.shell("ts_pid_alive() { return 0; }; ts_start")
+                self.assertEqual(self.read("config.json")["tailscale_app_connector"], "1" if enabled else "0")
+                sequence = [json.loads(line) for line in (self.mock / "calls.jsonl").read_text().splitlines()]
+                migration = next(i for i, (name, args) in enumerate(sequence) if name == "dbus" and args[0] == "set")
+                edit = next(i for i, (name, args) in enumerate(sequence) if name == "tailscale")
+                self.assertLess(migration, edit)
+                self.assertIn("--advertise-connector=" + str(enabled).lower(), self.calls("tailscale")[0])
+                self.assertFalse(any(args[0] in ("appc-current", "appc-prime") for args in self.calls("tsks-helper")))
+                self.assertIn("已沿用核心当前的应用连接器设置：" + ("开启" if enabled else "关闭"),
+                              (self.run / "events.log").read_text())
+
+    def test_connector_migration_unknown_or_write_failure_blocks_preferences(self):
+        for connector in (None, {}, {"advertise": None}, {"advertise": "invalid"}):
+            with self.subTest(connector=connector):
+                self.write("status.json", dict(self.status, app_connector=connector))
+                result = self.shell("ts_pid_alive() { return 0; }; ts_start", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("tailscale_app_connector", self.read("config.json"))
+                self.assertEqual(self.calls("tailscale"), [])
+        self.write("status.json", self.status)
+        self.env["DBUS_FAIL_ONCE_KEY"] = "tailscale_app_connector"
+        self.assertNotEqual(self.shell("ts_pid_alive() { return 0; }; ts_start", check=False).returncode, 0)
+        self.assertEqual(self.calls("tailscale"), [])
+
+    def test_existing_connector_key_is_authoritative_and_not_migrated(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value):
+                (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": value})
+                self.write("status.json", dict(self.status, app_connector={"advertise": value == "1"}))
+                self.write("routes-plan.json", "keep")
+                self.shell("ts_pid_alive() { return 0; }; ts_start")
+                self.assertEqual([args for args in self.calls("dbus") if args[0] != "get"], [])
+                self.assertFalse(any(args[0] in ("appc-current", "appc-prime") for args in self.calls("tsks-helper")))
+                self.assertIn("--advertise-connector=" + ("true" if value == "1" else "false"), self.calls("tailscale")[0])
+
+    def test_unknown_core_connector_preference_does_not_overwrite_saved_choice(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": "1"})
+        self.write("status.json", dict(self.status, app_connector={"advertise": None, "error": "prefs_unavailable"}))
+        self.assertNotEqual(self.shell("ts_pid_alive() { return 0; }; ts_start", check=False).returncode, 0)
+        self.assertEqual(self.read("config.json")["tailscale_app_connector"], "1")
+        self.assertEqual(self.calls("tailscale"), [])
+
+    def test_routes_plan_controls_both_route_flags_and_preserves_helper_list(self):
+        for plan in ("keep", "set\t", "set\t192.168.50.0/24,203.0.113.7/32,2001:db8::7/128"):
+            with self.subTest(plan=plan):
+                (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": "1", "tailscale_exit_node": "1"})
+                self.write("status.json", dict(self.status, app_connector={"advertise": True}))
+                self.write("routes-plan.json", plan)
+                self.shell("ts_pid_alive() { return 0; }; ts_start")
+                args = self.calls("tailscale")[0]
+                self.assertEqual(len(self.calls("tailscale")), 1)
+                route_flags = [a for a in args if a.startswith(("--advertise-exit-node=", "--advertise-routes="))]
+                self.assertEqual(route_flags, [] if plan == "keep" else
+                                 ["--advertise-exit-node=true", "--advertise-routes=" + plan.split("\t")[1]])
+                planner = [a for a in self.calls("tsks-helper") if a[0] == "routes-plan"]
+                self.assertEqual(planner, [["routes-plan", str(self.run / "tailscaled.sock"), "192.168.50.0/24", "1", "1"]])
+                prime = [a for a in self.calls("tsks-helper") if a[0] == "appc-prime"]
+                self.assertEqual(len(prime), 0 if plan == "keep" else 1)
+
+    def test_first_connector_enable_primes_even_without_route_edit(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": "1"})
+        self.write("routes-plan.json", "keep")
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertEqual(len([a for a in self.calls("tsks-helper") if a[0] == "appc-prime"]), 1)
+        self.assertFalse(any(a.startswith("--advertise-routes=") for a in self.calls("tailscale")[0]))
+
+    def test_disabled_connector_never_primes_and_routes_plan_errors_fail_start(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": "0"})
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertFalse(any(a[0] == "appc-prime" for a in self.calls("tsks-helper")))
+        (self.mock / "calls.jsonl").unlink()
+        self.write("routes-plan-exit.json", 1)
+        self.assertNotEqual(self.shell("ts_pid_alive() { return 0; }; ts_start", check=False).returncode, 0)
+        self.assertEqual(self.calls("tailscale"), [])
+        self.assertIn("无法读取当前宣告列表，未应用设置", (self.run / "events.log").read_text())
+        self.write("routes-plan-exit.json", 0)
+        self.write("routes-plan.json", "unexpected")
+        self.assertNotEqual(self.shell("ts_pid_alive() { return 0; }; ts_start", check=False).returncode, 0)
+        self.assertEqual(self.calls("tailscale"), [])
+
+    def test_connector_prime_failure_is_visible_but_does_not_fail_start(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_app_connector": "1"})
+        cases = [({"assigned": 0, "primed": 0, "learned": 0, "wildcards": 0, "denied": False}, "后台未给本机分配应用"),
+                 ({"assigned": 2, "primed": 0, "learned": 0, "wildcards": 0, "denied": True}, "本机查询被访问控制拒绝"),
+                 ({"assigned": 3, "primed": 1, "learned": 1, "wildcards": 1, "denied": False}, "部分域名尚未完成自查"),
+                 ({"assigned": 1, "primed": 0, "learned": 0, "wildcards": 1, "denied": False}, "通配域名需要设备查询后才能学习"),
+                 ({"assigned": "bad"}, "无法读取自查结果")]
+        for result, message in cases:
+            with self.subTest(result=result):
+                (self.run / "events.log").unlink(missing_ok=True)
+                self.write("appc-prime.json", result)
+                self.shell("ts_pid_alive() { return 0; }; ts_start")
+                self.assertIn(message, (self.run / "events.log").read_text())
+                self.assertEqual(list(self.run.glob("appc-prime.*")), [])
+        self.write("appc-prime-exit.json", 1)
+        self.shell("ts_pid_alive() { return 0; }; ts_start")
+        self.assertIn("自查暂未完成", (self.run / "events.log").read_text())
+
+    def test_connector_status_is_passed_as_one_object_without_more_api_reads(self):
+        appc = {"advertise": True, "tags": ["tag:connector"], "assigned_domains": ["example.com"],
+                "learned": {"example.com": ["203.0.113.7"]}, "wildcards": 0, "error": ""}
+        self.write("status.json", dict(self.status, app_connector=appc))
+        result = json.loads(self.shell("ts_status_json").stdout)
+        self.assertEqual(result["app_connector"], appc)
+        fields = [a[2] for a in self.calls("tsks-helper") if a[0] == "json-get"]
+        self.assertEqual(fields.count("app_connector"), 1)
+        self.assertFalse(any(a[0] in ("appc-current", "appc-prime", "routes-plan") for a in self.calls("tsks-helper")))
+        self.write("status.json", None)
+        unknown = json.loads(self.shell("ts_status_json").stdout)["app_connector"]
+        self.assertIsNone(unknown["advertise"])
+        self.assertTrue(unknown["error"])
 
     def test_running_manual_start_does_not_connect(self):
         self.shell("ts_pid_alive() { return 0; }; ts_start manual")
@@ -952,8 +1087,92 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "210"})
         self.assertEqual(json.loads((self.web / "tailscale3_210.json").read_text())["state"], "success")
 
+    def test_ten_bit_submission_writes_connector_and_routes_under_lock(self):
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        self.entry("tailscale_config", "230", "web_submit", "0101010111", routes_wire("119.188.240.179/32"))
+        config = self.read("config.json")
+        self.assertEqual(config["tailscale_app_connector"], "1")
+        self.assertEqual(config["tailscale_custom_routes"], "119.188.240.179/32")
+        self.assertEqual(config["tailscale_accept_dns"], "1")
+        self.assertEqual(json.loads((self.web / "tailscale3_230.json").read_text())["state"], "success")
+
+    def test_nine_bit_submission_and_failed_restore_preserve_connector(self):
+        for saved in (None, "0", "1"):
+            with self.subTest(saved=saved):
+                (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                config = {"tailscale_enable": "0"}
+                if saved is not None: config["tailscale_app_connector"] = saved
+                self.write("config.json", config)
+                self.entry("tailscale_config", "231", "web_submit", "000000000", routes_wire(""))
+                self.assertEqual(self.read("config.json").get("tailscale_app_connector"), saved)
+                self.env["DBUS_FAIL_ONCE_KEY"] = "tailscale_accept_routes"
+                (self.mock / "dbus-failed").unlink(missing_ok=True)
+                self.assertNotEqual(self.entry("tailscale_config", "232", "web_submit", "000000000", routes_wire(""), check=False).returncode, 0)
+                self.env.pop("DBUS_FAIL_ONCE_KEY")
+                self.assertEqual(self.read("config.json").get("tailscale_app_connector"), saved)
+                self.assertFalse(any(a[1].split("=", 1)[0] == "tailscale_app_connector" for a in self.calls("dbus") if a[0] != "get"))
+
+    def test_ten_bit_failed_apply_restores_connector_including_absent_key(self):
+        for saved in (None, "0", "1"):
+            with self.subTest(saved=saved):
+                config = {"tailscale_enable": "0"}
+                if saved is not None: config["tailscale_app_connector"] = saved
+                self.write("config.json", config)
+                result = self.shell('ts_pid_alive() { return 1; }; ts_restart() { return 1; }; ts_stop() { return 0; }; '
+                                    'ID=233; ts_mutation web_submit 1000000001 b64.', check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read("config.json"), config)
+
+    def test_failed_first_connector_edit_restores_original_core_choice_for_on_and_off_service(self):
+        for old_enabled in ("0", "1"):
+            for old_connector in (False, True):
+                with self.subTest(old_enabled=old_enabled, old_connector=old_connector):
+                    (self.mock / "calls.jsonl").unlink(missing_ok=True)
+                    (self.run / "fw-failed").unlink(missing_ok=True)
+                    self.write("config.json", {"tailscale_enable": old_enabled})
+                    self.write("status.json", dict(self.status, app_connector={"advertise": old_connector}))
+                    new_connector = "0" if old_connector else "1"
+                    overrides = ('ts_daemon_start() { cp "$MOCK_ROOT/status.json" "$RUN/start-status.json"; }; '
+                                 'ts_stop() { :; }; ts_pid_alive() { return ' + ("0" if old_enabled == "1" else "1") + '; }; '
+                                 'ts_firewall_apply() { if [ ! -f "$RUN/fw-failed" ]; then : >"$RUN/fw-failed"; return 1; fi; return 0; }; ')
+                    result = self.shell(overrides + 'ID=234; ts_mutation web_submit 111110100' + new_connector + ' b64.', check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.read("config.json"), {"tailscale_enable": old_enabled,
+                                     "tailscale_app_connector": "1" if old_connector else "0"})
+                    calls = self.calls("tailscale")
+                    self.assertIn("--advertise-connector=" + str(not old_connector).lower(), calls[0])
+                    # A stopped old service is not restarted by rollback; its
+                    # next normal start must still use the original choice.
+                    config = self.read("config.json"); config["tailscale_enable"] = "1"
+                    self.write("config.json", config)
+                    self.shell('ts_pid_alive() { return 0; }; ts_start')
+                    self.assertIn("--advertise-connector=" + str(old_connector).lower(), self.calls("tailscale")[-1])
+                    self.assertEqual(self.read("status.json")["app_connector"]["advertise"], old_connector)
+
+    def test_connector_rollback_migration_write_failure_is_reported(self):
+        self.write("config.json", {"tailscale_enable": "0"})
+        self.env["DBUS_FAIL_ONCE_KEY"] = "tailscale_app_connector"
+        # Fail only the restoration write: the first submission write is
+        # allowed, then the simulated post-set failure arms the fixture.
+        (self.mock / "dbus-failed").touch()
+        result = self.shell('ts_daemon_start() { cp "$MOCK_ROOT/status.json" "$RUN/start-status.json"; }; '
+                            'ts_pid_alive() { return 1; }; ts_stop() { :; }; '
+                            'ts_firewall_apply() { rm -f "$MOCK_ROOT/dbus-failed"; return 1; }; '
+                            'ID=235; ts_mutation web_submit 1111101001 b64.', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        log = (self.run / "events.log").read_text()
+        self.assertIn("原应用连接器设置恢复失败", log)
+        self.assertNotIn("操作失败后已恢复原设置", log)
+        self.assertEqual(json.loads((self.web / "tailscale3_235.json").read_text())["state"], "failed")
+
+    def test_connector_restore_whitelist_rejects_other_keys(self):
+        self.shell('ts_lock; printf "tailscale_app_connector=1\\n" >"$RUN/config.previous"; ts_config_restore; ts_unlock')
+        self.assertEqual(self.read("config.json")["tailscale_app_connector"], "1")
+        self.assertNotEqual(self.shell('ts_lock; printf "unrelated_key=1\\n" >"$RUN/config.previous"; ts_config_restore', check=False).returncode, 0)
+        self.assertNotIn("unrelated_key", self.read("config.json"))
+
     def test_seven_bit_submission_preserves_new_settings(self):
-        new = {"tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
+        new = {"tailscale_app_connector": "1", "tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
                "tailscale_custom_routes": "119.188.240.179/32"}
         self.write("config.json", dict(self.read("config.json"), **new))
         self.entry("tailscale_config", "211", "web_submit", "0000000")
@@ -962,7 +1181,7 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(any(args[1].split("=", 1)[0] in new for args in self.calls("dbus") if args[0] != "get"))
 
     def test_failed_seven_bit_submission_does_not_write_new_keys(self):
-        new = {"tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
+        new = {"tailscale_app_connector": "1", "tailscale_accept_dns": "1", "tailscale_custom_routes_enable": "1",
                "tailscale_custom_routes": "119.188.240.179/32"}
         original = dict(self.read("config.json"), **new)
         self.write("config.json", original)
@@ -981,7 +1200,8 @@ class BackendTests(unittest.TestCase):
 
     def test_snapshot_argument_count_must_match_snapshot_width(self):
         original = self.read("config.json")
-        for args in (("000000000",), ("0000000", ""), ("000000000", "", "extra")):
+        for args in (("000000000",), ("0000000000",), ("0000000", ""), ("000000000", "", "extra"),
+                     ("0000000000", "", "extra")):
             with self.subTest(args=args):
                 self.assertNotEqual(self.entry("tailscale_config", "212", "web_submit", *args, check=False).returncode, 0)
                 self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_config_snapshot"})

@@ -60,6 +60,7 @@ function harness(initialStorage = {}) {
     function reply(request, result, string = false) { request.finish(null, { result: string ? JSON.stringify(result) : result }); }
     function status(extra = {}) { return { schema: 1, enabled: true, plugin_version: '3.0.0', core_version: '1.102.4', backend_state: 'Running', online: true,
         health_codes: [], health_messages: [], auth_url: '', monitoring_available: true,
+        app_connector: { advertise: false, tags: [], assigned_domains: [], learned: {}, error: '' },
         watchdog: { enabled: true, last_recovery: '', count_24h: 0 }, core: { installed: '1.102.4', available: '1.104.0', update_available: true, can_rollback: true }, ...extra }; }
     function boot() {
         app.init();
@@ -79,12 +80,15 @@ function harness(initialStorage = {}) {
         maxSimultaneous: () => maxSimultaneous, timers };
 }
 
-test('native page keeps menu, all four skins, nine options, and unique HTML IDs', () => {
+test('native page keeps menu, all four skins, ten options, and unique HTML IDs', () => {
     const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
     assert.equal(ids.length, new Set(ids).size);
-    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable', 'accept_dns', 'custom_routes_enable']) { assert.ok(ids.includes('tailscale_' + key)); }
+    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable', 'accept_dns', 'custom_routes_enable', 'app_connector']) { assert.ok(ids.includes('tailscale_' + key)); }
     for (const skin of ['ASUSWRT', 'ROG', 'TUF', 'TS']) { assert.ok(html.includes('[skin=' + skin + ']')); }
     assert.match(html, /show_menu\(menu_hook\)/);
+    assert.match(html, /id="tailscale_exit_node"[^]*?<\/tr>\s*<tr><th><label for="tailscale_app_connector"/);
+    assert.match(html, /可能包含应用连接器自动加入的地址/);
+    assert.match(html, /仍由局域网共享或应用连接器负责的条目会继续宣告/);
     assert.doesNotMatch(html + source, /vx\.link|innerHTML|\.html\(|async\s*:\s*false|eval\(|document\.write/);
     assert.ok(html.includes('rel="noopener noreferrer"'));
 });
@@ -248,7 +252,7 @@ test('busy rejection releases controls and preserves draft settings', () => {
     const h = harness(); h.boot(); h.change('tailscale_accept_routes', true); h.click('apply_settings');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '111010100', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '1110101000', 'b64.']);
     h.reply(write, { accepted: false, error: 'busy' }); h.advance();
     assert.equal(h.nodes.apply_settings.disabled, false);
     assert.equal(h.nodes.tailscale_accept_routes.checked, true);
@@ -264,7 +268,7 @@ test('switch only edits the draft; Apply submits once and locks concurrent chang
     assert.equal(h.nodes.settings_notice.textContent, '正在提交设置…');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '011000100', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '0110001000', 'b64.']);
     assert.equal(h.app.apply(), false);
     h.accept(write); h.finishJob(h.next('tailscale_job'), 'success'); h.advance();
     const log = h.next(); log.finish(null, 'stopped');
@@ -429,7 +433,7 @@ test('core management remains available when structured status says the daemon i
 });
 
 
-test('queued save snapshots all nine settings without exposing DBus fields to httpdb', () => {
+test('queued save snapshots all ten settings without exposing DBus fields to httpdb', () => {
     const h = harness(); h.boot(); h.advance(5000);
     const inFlight = h.next('tailscale_fettle');
     h.change('tailscale_advertise_routes', true);
@@ -441,7 +445,7 @@ test('queued save snapshots all nine settings without exposing DBus fields to ht
     h.reply(inFlight, h.status());
     const save = h.next('tailscale_config');
     assert.deepEqual(save.body.fields, {});
-    assert.deepEqual(save.body.params, ['web_submit', '111101000', 'b64.']);
+    assert.deepEqual(save.body.params, ['web_submit', '1111010000', 'b64.']);
     assert.ok(h.history.filter(r => r.body).every(r => Object.keys(r.body.fields).length === 0));
 });
 
@@ -519,7 +523,7 @@ test('all draft options including enable are applied in one snapshot and reverti
     assert.equal(h.nodes.daemon_state.textContent, '运行中');
     h.click('apply_settings');
     const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '011001100', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '0110011000', 'b64.']);
     h.accept(write);
     assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
     assert.equal(h.nodes.daemon_state.textContent, '正在停止…');
@@ -630,7 +634,7 @@ test('unconfirmed or expired jobs cannot continue suppressing service errors', (
     assert.equal(h.nodes.settings_notice.textContent, '正在确认设置结果…');
 });
 
-test('DNS and custom routes are independent draft settings in a nine-bit submission', () => {
+test('DNS and custom routes are independent draft settings in a ten-bit submission', () => {
     const h = harness(); h.boot();
     assert.equal(h.nodes.tailscale_accept_dns.checked, false);
     assert.equal(h.nodes.custom_routes_editor.style.display, 'none');
@@ -643,7 +647,7 @@ test('DNS and custom routes are independent draft settings in a nine-bit submiss
     h.editRoute(2, '   ');
     assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
     h.click('apply_settings'); const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '111000111', wire('192.168.60.0/24,2001:db8:1::/64')]);
+    assert.deepEqual(write.body.params, ['web_submit', '1110001110', wire('192.168.60.0/24,2001:db8:1::/64')]);
     assert.deepEqual(write.body.fields, {});
     assert.ok(h.rows().every(row => row.input.disabled && row.remove.disabled));
     assert.equal(h.nodes.custom_routes_add.disabled, true);
@@ -729,7 +733,7 @@ test('legacy seven-bit task drafts preserve the new configuration values read fr
     assert.equal(h.nodes.tailscale_accept_dns.checked, true);
     assert.equal(h.rows()[0].input.value, '10.20.0.0/16');
     h.click('apply_settings'); const write = reach(h, 'tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '111000111', wire('10.20.0.0/16')]);
+    assert.deepEqual(write.body.params, ['web_submit', '1110001110', wire('10.20.0.0/16')]);
 });
 
 test('route baseline loads saved rows and successful normalization replaces the draft', () => {
@@ -795,4 +799,127 @@ test('httpdb explicitly rejects an oversized settings request without creating a
     assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_job').length, 0);
     h.editRoute(0, '192.168.60.0/24'); h.click('apply_settings');
     assert.equal(h.next('tailscale_config').body.params[2], wire('192.168.60.0/24'));
+});
+
+
+test('connector edits are draft-only, independent of DNS, and become the tenth snapshot bit', () => {
+    const h = harness(); h.boot(); h.change('tailscale_app_connector', true);
+    assert.equal(h.nodes.tailscale_accept_dns.checked, false);
+    assert.equal(h.requests.length, 0);
+    assert.match(h.nodes.settings_notice.textContent, /尚未应用/);
+    h.click('apply_settings');
+    const write = h.next('tailscale_config');
+    assert.deepEqual(write.body.params, ['web_submit', '1110001001', 'b64.']);
+    assert.deepEqual(write.body.fields, {});
+    assert.equal(h.nodes.tailscale_app_connector.disabled, true);
+});
+
+test('seven and nine-bit drafts preserve the current connector setting and nine-bit route edits', () => {
+    for (const bits of ['1110001', '111000111']) {
+        const saved = { id: '64533', method: 'tailscale_config', draft: bits, routes: '192.168.60.0/24', intent: 'apply' };
+        const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+        h.finishJob(h.next('tailscale_job'), 'running'); h.next().finish(null, 'applying');
+        const persisted = { tailscale_enable: '0', tailscale_accept_dns: '1', tailscale_custom_routes_enable: '1',
+            tailscale_custom_routes: '10.20.0.0/16', tailscale_app_connector: '1' };
+        h.reply(h.next(), [persisted]); h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+        assert.equal(h.nodes.tailscale_app_connector.checked, true);
+        assert.deepEqual(h.rows().map(row => row.input.value), [bits.length === 7 ? '10.20.0.0/16' : '192.168.60.0/24']);
+        h.advance(1500); h.finishJob(reach(h, 'tailscale_job'), 'failed');
+        h.reply(reach(h, '/_api/tailscale_'), [persisted]); h.advance();
+        assert.equal(h.nodes.tailscale_app_connector.checked, true);
+        assert.deepEqual(h.rows().map(row => row.input.value), [bits.length === 7 ? '10.20.0.0/16' : '192.168.60.0/24']);
+        h.click('apply_settings'); const write = reach(h, 'tailscale_config');
+        assert.equal(write.body.params[1], '1110001111');
+    }
+});
+
+test('ten-bit drafts retain an explicit connector change after a failed task and configuration reload', () => {
+    const saved = { id: '64534', method: 'tailscale_config', draft: '1110001001', routes: '', intent: 'apply' };
+    const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'running'); h.next().finish(null, 'applying');
+    const persisted = { tailscale_app_connector: '0' };
+    h.reply(h.next(), [persisted]); h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+    assert.equal(h.nodes.tailscale_app_connector.checked, true);
+    h.advance(1500); h.finishJob(reach(h, 'tailscale_job'), 'failed');
+    h.reply(reach(h, '/_api/tailscale_'), [persisted]); h.advance();
+    assert.equal(h.nodes.tailscale_app_connector.checked, true);
+    h.click('apply_settings'); assert.equal(reach(h, 'tailscale_config').body.params[1], saved.draft);
+});
+
+test('an unmigrated connector key adopts the core value without making the form dirty', () => {
+    for (const advertise of [true, false]) {
+        const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '1' }]);
+        assert.equal(h.nodes.tailscale_app_connector.disabled, true);
+        h.reply(h.next('tailscale_fettle'), h.status({ app_connector: { advertise, tags: ['tag:connector'], assigned_domains: [], learned: {}, error: '' } }));
+        h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+        assert.equal(h.nodes.tailscale_app_connector.checked, advertise);
+        assert.equal(h.nodes.tailscale_app_connector.disabled, false);
+        assert.equal(h.nodes.settings_notice.textContent, '');
+        assert.equal(h.nodes.app_connector_migration.style.display, 'none');
+        h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '100000000' + (advertise ? '1' : '0'));
+    }
+});
+
+test('a missing connector key with an unavailable core stays unresolved and submits nine bits to preserve it', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '0' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ enabled: false, error: 'local_api_unavailable',
+        app_connector: { advertise: null, tags: [], assigned_domains: [], learned: {}, error: 'local_api_unavailable' } }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    assert.equal(h.nodes.tailscale_app_connector.disabled, true);
+    assert.equal(h.nodes.app_connector_migration.style.display, '');
+    h.change('tailscale_enable', true); h.click('apply_settings');
+    assert.deepEqual(h.next('tailscale_config').body.params, ['web_submit', '100000000', 'b64.']);
+});
+
+test('an explicit persisted connector setting is available even while the daemon is stopped', () => {
+    const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_enable: '0', tailscale_app_connector: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ enabled: false, error: 'local_api_unavailable', app_connector: { advertise: null, error: 'local_api_unavailable' } }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    assert.equal(h.nodes.tailscale_app_connector.disabled, false);
+    assert.equal(h.nodes.tailscale_app_connector.checked, true);
+    h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '0000000001');
+});
+
+test('connector status covers hidden, failed, untagged, unassigned, and learned states as plain text', () => {
+    const base = { advertise: true, tags: ['tag:connector'], assigned_domains: ['app.example.test', 'files.example.test'], learned: {}, error: '' };
+    const cases = [
+        [{ ...base, advertise: false, error: 'ignored while disabled' }, null],
+        [{ ...base, error: '<script>status failed</script>' }, '无法读取应用连接器状态'],
+        [{ ...base, tags: [] }, '本机没有标签，不能作为应用连接器。请在管理控制台为本机添加应用使用的标签。'],
+        [{ ...base, assigned_domains: [] }, '后台没有给本机的标签分配应用，请检查管理控制台的 Apps 设置。'],
+        [{ ...base, learned: { 'app.example.test': ['198.51.100.9'], 'files.example.test': ['198.51.100.9'] } }, '已分配：app.example.test、files.example.test；已学习 1 个地址：198.51.100.9'],
+        [{ ...base }, '已分配：app.example.test、files.example.test；已学习 0 个地址'],
+        [{ ...base, assigned_domains: ['<img src=x onerror=alert(1)>'], learned: { x: ['<script>address</script>'] } }, '已分配：<img src=x onerror=alert(1)>；已学习 1 个地址：<script>address</script>']
+    ];
+    for (const [app_connector, expected] of cases) {
+        const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_app_connector: '1' }]);
+        h.reply(h.next('tailscale_fettle'), h.status({ app_connector })); h.advance();
+        assert.equal(h.nodes.app_connector_status.style.display, expected === null ? 'none' : '');
+        if (expected !== null) { assert.equal(h.nodes.app_connector_status.textContent, expected); }
+        assert.equal(h.nodes.app_connector_status.children.length, 0);
+    }
+});
+
+test('connector status lists at most eight unique learned addresses and then shows only the count', () => {
+    for (const count of [8, 9]) {
+        const addresses = Array.from({ length: count }, (_, index) => '198.51.100.' + (index + 1));
+        const h = harness(); h.app.init(); h.reply(h.next(), [{ tailscale_app_connector: '1' }]);
+        h.reply(h.next('tailscale_fettle'), h.status({ app_connector: { advertise: true, tags: ['tag:connector'], assigned_domains: ['app.example.test'],
+            learned: { 'app.example.test': addresses, 'another.example.test': [addresses[0]], bad: 'ignored', null: null }, error: '' } }));
+        assert.match(h.nodes.app_connector_status.textContent, new RegExp('已学习 ' + count + ' 个地址'));
+        if (count === 8) { assert.ok(h.nodes.app_connector_status.textContent.includes(addresses.join('、'))); }
+        else { assert.doesNotMatch(h.nodes.app_connector_status.textContent, /198\.51\.100/); }
+    }
+});
+
+
+test('connector state uses lifecycle progress for expected startup API gaps and reports a continuing failure', () => {
+    const h = harness(); h.boot(); h.change('tailscale_app_connector', true); h.click('apply_settings');
+    h.accept(h.next('tailscale_config'));
+    const unavailable = { backend_state: 'Unavailable', online: null, error: 'local_api_unavailable',
+        app_connector: { advertise: null, error: 'local_api_unavailable' } };
+    h.reply(reach(h, 'tailscale_fettle'), h.status(unavailable));
+    assert.equal(h.nodes.app_connector_status.textContent, '等待操作完成');
+    h.finishJob(reach(h, 'tailscale_job'), 'failed');
+    assert.equal(h.nodes.app_connector_status.textContent, '无法读取应用连接器状态');
 });

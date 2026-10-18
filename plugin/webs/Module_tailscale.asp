@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.2.0"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.3.0"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -117,10 +117,11 @@ function init() {
 <div id="custom_routes_rows"></div>
 <input id="custom_routes_add" class="button_gen" type="button" value="添加网段" disabled="disabled" />
 <div class="ts_help">向 Tailnet 宣告额外的网段，例如其他 VLAN，或需要经本机访问的单个地址。每条都需要在管理控制台批准。多台路由器的局域网网段相同时，不要同时共享局域网。不支持 0.0.0.0/0，请使用「提供互联网出口」。</div>
-<div class="ts_help">最多 32 条。自定义网段可独立启用；关闭后保留列表，点击“应用设置”撤下宣告。</div>
+<div class="ts_help">最多 32 条。自定义网段可独立启用；关闭后保留列表，仍由局域网共享或应用连接器负责的条目会继续宣告。</div>
 </div>
 <div id="routes_status" class="ts_help" style="display:none;">
 <div>已宣告：<span id="routes_advertised" class="ts_value"></span></div>
+<div>列表可能包含应用连接器自动加入的地址。</div>
 <div>本机主路由：<span id="routes_primary" class="ts_value"></span></div>
 <div>本机主路由表示当前由本机承担的网段。批准状态请在管理控制台查看。</div>
 </div></td></tr>
@@ -130,6 +131,10 @@ function init() {
 <div class="ts_help">开启后，路由器自身的域名解析经过 Tailscale，可解析 Tailnet 设备名；局域网设备的解析不受影响。默认关闭，此时使用固件的 DNS 设置。</div></td></tr>
 <tr><th><label for="tailscale_exit_node">提供互联网出口</label></th><td><input id="tailscale_exit_node" type="checkbox" disabled="disabled" />
 <div class="ts_help">允许其他设备通过此路由器访问互联网。需先在管理控制台批准，再由其他设备选择此出口节点。</div></td></tr>
+<tr><th><label for="tailscale_app_connector">提供应用连接器</label></th><td><input id="tailscale_app_connector" type="checkbox" disabled="disabled" />
+<div class="ts_help">让 Tailnet 中的设备按域名经本机访问互联网。域名在管理控制台的 Apps 中配置；本机需带有应用指定的标签，并为该标签设置自动批准。设备使用 Tailscale DNS 查询这些域名时，本机会记下解析出的地址并对 Tailnet 宣告；局域网中未安装 Tailscale 的设备也能经已宣告的地址访问。只在需要作为出口的那台路由器上开启。</div>
+<div id="app_connector_migration" class="ts_help" style="display:none;">服务启动后才能读取并更改此选项；本次应用会保留原设置。</div>
+<div id="app_connector_status" class="ts_help ts_value" style="display:none;" aria-live="polite"></div></td></tr>
 <tr><th><label for="tailscale_watchdog_enable">自动恢复连接</label></th><td><input id="tailscale_watchdog_enable" type="checkbox" disabled="disabled" />
 <div class="ts_help">检测服务异常，并在满足恢复条件时尝试重启。关闭 Tailscale 后不会自动启动。</div>
 <div id="watchdog_state" class="ts_help"></div>

@@ -76,12 +76,56 @@ managed_set --accept-dns=false
 check_managed false
 [ "$(get Hostname)" = unmanaged-host ] || fail 'DNS toggle reset an unmanaged preference'
 printf 'PASS: explicit DNS true/false retains merged IPv4/IPv6 subnets and exit-node defaults\n'
+# The connector is enabled in a network-isolated daemon. The real LocalAPI
+# must accept the feature, expose learning data, and keep route preferences
+# untouched when the planner decides no route edit is needed.
+"$CLI" --socket="$SOCKET" set --advertise-connector=true
+prefs
+[ "$(get AppConnector.Advertise)" = true ] || fail 'connector preference not applied'
+"$CLI" --socket="$SOCKET" appc-routes --map >"$CASE/appc-map.json"
+plan=$("$HELPER" routes-plan "$SOCKET" '192.0.2.0/24,198.51.100.27/32,2001:db8:60::/64' 1 1)
+[ "$plan" = keep ] || fail 'unchanged routes planned an edit'
+routes_before=$(get AdvertiseRoutes)
+edits_before=$(grep -c 'EditPrefs:.*AdvertiseRoutes' "$CASE/daemon.log" || :)
+"$CLI" --socket="$SOCKET" set --netfilter-mode=on --accept-routes=true --accept-dns=true --advertise-connector=true --auto-update=false --update-check=false
+prefs
+[ "$(get AdvertiseRoutes)" = "$routes_before" ] || fail 'unrelated set changed advertised prefixes'
+[ "$(grep -c 'EditPrefs:.*AdvertiseRoutes' "$CASE/daemon.log" || :)" = "$edits_before" ] || fail 'unrelated set edited route preferences'
+"$HELPER" status "$SOCKET" >"$CASE/appc-status.json"
+[ "$("$HELPER" json-get "$CASE/appc-status.json" app_connector.advertise)" = true ] || fail 'helper lost connector flag'
+[ -z "$("$HELPER" json-get "$CASE/appc-status.json" app_connector.error)" ] || fail 'connector learning endpoint unavailable'
+"$CLI" --socket="$SOCKET" set --advertise-connector=false --accept-dns=false
+printf 'PASS: real connector prefs and learning endpoint; keep plan avoids AdvertiseRoutes edit\n'
 if [ "$OMIT_UPDATE" = 1 ]; then
     if "$CLI" update --help >"$CASE/update-help" 2>&1; then fail 'omitted update command remains available'; fi
     if "$CLI" --socket="$SOCKET" set --auto-update=true >"$CASE/enable-update.log" 2>&1; then fail 'omitted auto updater accepted Apply=true'; fi
     grep -Fq 'Auto-update support is disabled in this build' "$CASE/enable-update.log"
     printf 'PASS: standalone update command absent and auto-update=true rejected\n'
 fi
+stop
+
+# Seed only synthetic persisted app-connector records. Offline tests cannot
+# model a live control map, but can check preservation through real LocalAPI
+# preference edits and daemon restart without exposing any real identity.
+mkdir -p "$BASE/appc-persisted"
+/fixture/mkstate "$BASE/appc-persisted/tailscaled.state" false appc
+start appc-persisted
+"$CLI" --socket="$SOCKET" appc-routes --map >"$CASE/learned-before.json"
+grep -Fq '198.51.100.7' "$CASE/learned-before.json" || fail 'persisted learning fixture missing'
+learned_before=$("$HELPER" sha256 "$CASE/learned-before.json")
+for managed in '192.0.2.0/24,198.51.100.7/32' '192.0.2.0/24'; do
+    [ "$("$HELPER" routes-plan "$SOCKET" "$managed" 0 1)" = keep ] || fail 'overlapping custom removal lost learned ownership'
+done
+"$CLI" --socket="$SOCKET" set --accept-dns=false --advertise-connector=true --auto-update=false --update-check=false
+"$CLI" --socket="$SOCKET" appc-routes --map >"$CASE/learned-after.json"
+[ "$("$HELPER" sha256 "$CASE/learned-after.json")" = "$learned_before" ] || fail 'unrelated settings changed persisted learning'
+! grep -q 'EditPrefs:.*AdvertiseRoutes' "$CASE/daemon.log" || fail 'unrelated settings wrote advertised prefixes'
+stop
+start appc-persisted
+"$CLI" --socket="$SOCKET" appc-routes --map >"$CASE/learned-restart.json"
+[ "$("$HELPER" sha256 "$CASE/learned-restart.json")" = "$learned_before" ] || fail 'restart changed persisted learning'
+[ "$("$HELPER" routes-plan "$SOCKET" '192.0.2.0/24' 0 1)" = keep ] || fail 'restart lost learned or Control prefixes'
+printf 'PASS: persisted connector learning and Control ownership survive unrelated set and restart\n'
 stop
 
 # A nonempty {} file is still a never-authenticated identity. Preferences set
