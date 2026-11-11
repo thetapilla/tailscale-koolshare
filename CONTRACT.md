@@ -233,7 +233,7 @@ https://github.com/thetapilla/tailscale-koolshare/releases/download/core-v<VERSI
 | 术语 | 含义 |
 | --- | --- |
 | 发布地址 | `https://github.com/thetapilla/tailscale-koolshare/releases/download/` 下的文件 |
-| 镜像 | `https://tscore.thetapilla.xyz/`，按发布地址之后的相对路径保存同一文件的副本 |
+| 镜像 | 辅助程序 `mirrorHost` 常量指定的 HTTPS 主机，按发布地址之后的相对路径保存同一文件的副本 |
 | 稳定清单 | `core-stable/manifest.json`，签名的更新清单 |
 
 镜像只是第二条下载线路，不参与信任：清单的签名和归档的哈希仍由插件按公钥校验，镜像内容被替换只会导致更新失败。镜像只接受稳定清单和 `core-v<VERSION>-<BUILD>/tailscale-core_<VERSION>_<BUILD>_<ARCH>.tar.gz` 两类路径，不接受查询参数、端口和重定向；清单中签名的下载地址仍是发布地址。

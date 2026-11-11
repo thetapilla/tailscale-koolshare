@@ -101,7 +101,7 @@ python3 tools/release_core.py --key .secrets/release.key
 
 发布流程先验证本地签名、两个核心归档的大小、哈希和解包结构，再创建带版本的草稿 Release 并上传资源。完整资源验证通过后发布；远端核心归档重新下载并与签名描述符核对，之后才更新 `core-stable/manifest.json`。
 
-稳定源更新后，`mirror` 任务把签名清单和它列出的两个归档复制到下载镜像（Cloudflare R2 存储桶 `tailscale-core`，公开地址 `tscore.thetapilla.xyz`）。任务从 `core-release` 环境读取 `R2_ACCOUNT_ID`、`R2_ACCESS_KEY_ID` 和 `R2_SECRET_ACCESS_KEY`；凭据应是只允许读写该存储桶对象的 R2 令牌。三项未配置时任务给出提示并跳过，不影响发布。镜像上传失败不回滚已完成的发布；修复后手动运行该工作流即可补齐，无需发布新核心。
+稳定源更新后，`mirror` 任务把签名清单和它列出的两个归档复制到下载镜像（Cloudflare R2 存储桶 `tailscale-core`）。任务从 `core-release` 环境读取 `R2_ACCOUNT_ID`、`R2_ACCESS_KEY_ID` 和 `R2_SECRET_ACCESS_KEY`；凭据应是只允许读写该存储桶对象的 R2 令牌。三项未配置时任务给出提示并跳过，不影响发布。镜像上传失败不回滚已完成的发布；修复后手动运行该工作流即可补齐，无需发布新核心。
 
 带版本的核心资源不可覆盖。已存在的公开核心 Release 只有在远端签名封装与本地描述符一致、两个远端归档校验通过时才能继续恢复稳定源；恢复复用原远端封装。完整草稿验证后可继续发布，不完整草稿会失败并要求维护者处理。稳定源已匹配时保持不变，版本或构建号倒退会被拒绝。
 
