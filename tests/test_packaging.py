@@ -42,7 +42,7 @@ class PackagingTests(unittest.TestCase):
         (plugin / "init.d/S96tailscale.sh").write_text("#!/bin/sh\nexit 0\n")
         (plugin / "install.sh").write_text("#!/bin/sh\nexit 0\n")
         self.page = '<script src="/res/tailscale3.js?v=3.0.0"></script>'
-        (plugin / "webs/Module_tailscale.asp").write_text(self.page)
+        (plugin / "webs/Module_tailscaleks.asp").write_text(self.page)
         (plugin / "res/tailscale3.js").write_text("window.fixture = 1;\n")
         (plugin / "version").write_text("old-source-version\n")
         (plugin / "release.pub").write_text("ab" * 32 + "\n")
@@ -68,7 +68,7 @@ class PackagingTests(unittest.TestCase):
         return build_packages(self.root, self.out)
 
     def open(self, platform):
-        return tarfile.open(self.out / f"tailscale_3.0.0_{platform}.tar.gz")
+        return tarfile.open(self.out / f"tailscaleks_3.0.0_{platform}.tar.gz")
 
     def test_core_keeps_app_connector_and_peerapi_dns_support(self):
         self.assertTrue({"ts_omit_appconnectors", "ts_omit_dns"}.isdisjoint(RECIPE["tags"]))
@@ -76,12 +76,12 @@ class PackagingTests(unittest.TestCase):
     def test_six_packages_architecture_selection_matches_universal(self):
         self.assertEqual(len(self.packages()), 6)
         with self.open("universal") as universal:
-            self.assertEqual(universal.extractfile("tailscale/.valid").read().decode().splitlines(), list(PLATFORMS))
+            self.assertEqual(universal.extractfile("tailscaleks/.valid").read().decode().splitlines(), list(PLATFORMS))
             for platform, arch in PLATFORMS.items():
                 with self.open(platform) as single:
-                    self.assertEqual(single.extractfile("tailscale/.valid").read().decode(), platform + "\n")
+                    self.assertEqual(single.extractfile("tailscaleks/.valid").read().decode(), platform + "\n")
                     for name in ("tailscale.combined", "tsks-helper", "descriptor.json"):
-                        path = f"tailscale/payload/{arch}/{name}"
+                        path = f"tailscaleks/payload/{arch}/{name}"
                         self.assertEqual(single.extractfile(path).read(), universal.extractfile(path).read())
                     wrong_arch = "arm64" if arch == "arm" else "arm"
                     self.assertFalse(any(f"/payload/{wrong_arch}/" in name for name in single.getnames()))
@@ -100,17 +100,17 @@ class PackagingTests(unittest.TestCase):
         self.packages()
         with self.open("universal") as tar:
             for member in tar:
-                self.assertTrue(member.name == "tailscale" or member.name.startswith("tailscale/"))
+                self.assertTrue(member.name == "tailscaleks" or member.name.startswith("tailscaleks/"))
                 self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
                 self.assertFalse(member.mode & 0o022)
-            self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
-            self.assertEqual(tar.getmember("tailscale/scripts/tailscale_config").mode, 0o755)
-            self.assertEqual(tar.getmember("tailscale/install.sh").mode, 0o755)
-            self.assertEqual(tar.getmember("tailscale/payload/arm/tsks-helper").mode, 0o755)
-            self.assertEqual(tar.getmember("tailscale/release.pub").mode, 0o644)
-            for line in tar.extractfile("tailscale/manifest.sha256").read().decode().splitlines():
+            self.assertEqual(tar.extractfile("tailscaleks/version").read(), b"3.0.0\n")
+            self.assertEqual(tar.getmember("tailscaleks/scripts/tailscale_config").mode, 0o755)
+            self.assertEqual(tar.getmember("tailscaleks/install.sh").mode, 0o755)
+            self.assertEqual(tar.getmember("tailscaleks/payload/arm/tsks-helper").mode, 0o755)
+            self.assertEqual(tar.getmember("tailscaleks/release.pub").mode, 0o644)
+            for line in tar.extractfile("tailscaleks/manifest.sha256").read().decode().splitlines():
                 digest, name = line.split("  ", 1)
-                self.assertEqual(hashlib.sha256(tar.extractfile("tailscale/" + name).read()).hexdigest(), digest)
+                self.assertEqual(hashlib.sha256(tar.extractfile("tailscaleks/" + name).read()).hexdigest(), digest)
 
     def test_host_guard_rejects_protected_text_even_in_comments(self):
         for token in ("detect_package", "ks_tar_install"):
@@ -124,38 +124,38 @@ class PackagingTests(unittest.TestCase):
     def test_same_version_replaces_canonical_archives(self):
         paths = self.packages()
         first = {path.name: path.read_bytes() for path in paths}
-        (self.root / "plugin/webs/Module_tailscale.asp").write_text(self.page + "Updated help text")
+        (self.root / "plugin/webs/Module_tailscaleks.asp").write_text(self.page + "Updated help text")
         paths = self.packages()
-        expected = {f"tailscale_3.0.0_{name}.tar.gz" for name in ("universal", *PLATFORMS)}
+        expected = {f"tailscaleks_3.0.0_{name}.tar.gz" for name in ("universal", *PLATFORMS)}
         self.assertEqual({path.name for path in paths}, expected)
         self.assertEqual({path.name for path in self.out.iterdir()}, expected | {"SHA256SUMS"})
         for path in paths:
             self.assertNotEqual(path.read_bytes(), first[path.name])
             with tarfile.open(path) as tar:
-                self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
-                installer = tar.extractfile("tailscale/install.sh").read()
+                self.assertEqual(tar.extractfile("tailscaleks/version").read(), b"3.0.0\n")
+                installer = tar.extractfile("tailscaleks/install.sh").read()
                 self.assertNotIn(b"detect_package", installer)
                 self.assertNotIn(b"ks_tar_install", installer)
 
     def test_same_version_script_change_refreshes_browser_cache(self):
         self.packages()
         with self.open("hnd") as tar:
-            first = tar.extractfile("tailscale/webs/Module_tailscale.asp").read()
+            first = tar.extractfile("tailscaleks/webs/Module_tailscaleks.asp").read()
         script = self.root / "plugin/res/tailscale3.js"
         script.write_text("window.fixture = 2;\n")
         self.packages()
         digest = hashlib.sha256(script.read_bytes()).hexdigest()[:16]
         for platform in ("universal", *PLATFORMS):
             with self.open(platform) as tar:
-                page = tar.extractfile("tailscale/webs/Module_tailscale.asp").read()
+                page = tar.extractfile("tailscaleks/webs/Module_tailscaleks.asp").read()
                 self.assertNotEqual(first, page)
                 self.assertIn(f"/res/tailscale3.js?v=3.0.0-{digest}".encode(), page)
-                self.assertEqual(tar.extractfile("tailscale/version").read(), b"3.0.0\n")
-        self.assertEqual((self.root / "plugin/webs/Module_tailscale.asp").read_text(), self.page)
+                self.assertEqual(tar.extractfile("tailscaleks/version").read(), b"3.0.0\n")
+        self.assertEqual((self.root / "plugin/webs/Module_tailscaleks.asp").read_text(), self.page)
 
     def test_missing_or_duplicate_script_reference_rejects_package(self):
         for page in ("missing script", self.page * 2):
-            (self.root / "plugin/webs/Module_tailscale.asp").write_text(page)
+            (self.root / "plugin/webs/Module_tailscaleks.asp").write_text(page)
             with self.assertRaisesRegex(ValueError, "exactly once"):
                 self.packages()
 
@@ -188,7 +188,7 @@ class PackagingTests(unittest.TestCase):
         archive = Path(self.temp.name) / "relative-symlink.tar.gz"
         archive_tree(self.root / "plugin", archive)
         with tarfile.open(archive) as tar:
-            member = tar.getmember("tailscale/scripts/alias")
+            member = tar.getmember("tailscaleks/scripts/alias")
             self.assertTrue(member.issym())
             self.assertEqual(member.linkname, "tailscale_config")
 

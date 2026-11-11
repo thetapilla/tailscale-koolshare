@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -153,6 +156,133 @@ func TestURLsAndVersions(t *testing.T) {
 		t.Fatal("invalid version")
 	}
 }
+func TestMirrorURLs(t *testing.T) {
+	const feed = releasePrefix + "core-stable/manifest.json"
+	const core = releasePrefix + "core-v1.104.6-r2/tailscale-core_1.104.6_r2_arm64.tar.gz"
+	for src, want := range map[string]string{
+		feed: "https://tscore.thetapilla.xyz/core-stable/manifest.json",
+		core: "https://tscore.thetapilla.xyz/core-v1.104.6-r2/tailscale-core_1.104.6_r2_arm64.tar.gz",
+		// The mirror carries the signed feed and core archives only.
+		releasePrefix + "v3.4.0/SHA256SUMS":                                         "",
+		releasePrefix + "core-stable/../core-stable/manifest.json":                  "",
+		releasePrefix + "core-stable/manifest.json?x=1":                             "",
+		releasePrefix + "core-stable/manifest%2Ejson":                               "",
+		"https://github.com/other/repo/releases/download/core-stable/manifest.json": "",
+	} {
+		if got := mirrorURL(src); got != want {
+			t.Fatalf("mirrorURL(%q) = %q, want %q", src, got, want)
+		}
+	}
+	mirror := mirrorURL(core)
+	if !trustedURL(mirror, false) {
+		t.Fatal("mirror download rejected")
+	}
+	// Nothing may redirect to the mirror, and the mirror may not redirect at all.
+	if trustedURL(mirror, true) {
+		t.Fatal("mirror accepted as a redirect target")
+	}
+	if noRedirect(nil, nil) == nil {
+		t.Fatal("mirror redirect accepted")
+	}
+	for _, s := range []string{
+		"http://tscore.thetapilla.xyz/core-stable/manifest.json",
+		"https://tscore.thetapilla.xyz:8443/core-stable/manifest.json",
+		"https://user@tscore.thetapilla.xyz/core-stable/manifest.json",
+		"https://tscore.thetapilla.xyz.evil.test/core-stable/manifest.json",
+		"https://evil.thetapilla.xyz/core-stable/manifest.json",
+		"https://tscore.thetapilla.xyz/connectivity-test/8m.bin",
+		"https://tscore.thetapilla.xyz/core-stable/manifest.json#x",
+	} {
+		if trustedURL(s, false) {
+			t.Fatal(s)
+		}
+	}
+}
+
+func TestFetchFallsBackToTheNextSource(t *testing.T) {
+	body := bytes.Repeat([]byte("core"), 4096)
+	var mirrorHits atomic.Int32
+	serve := func(h http.HandlerFunc) string {
+		s := httptest.NewServer(h)
+		t.Cleanup(s.Close)
+		return s.URL
+	}
+	good := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "tsks-helper" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		mirrorHits.Add(1)
+		w.Write(body)
+	}
+	mirror := serve(good)
+	release := map[string]http.HandlerFunc{
+		"http error": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadGateway) },
+		"too large":  func(w http.ResponseWriter, r *http.Request) { w.Write(append(body, body...)) },
+		"cut short": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "16384")
+			w.Write(body[:100])
+		},
+		"stalled": func(w http.ResponseWriter, r *http.Request) {
+			w.Write(body[:100])
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		},
+		"redirect": func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, mirror, http.StatusFound) },
+	}
+	for name, handler := range release {
+		t.Run(name, func(t *testing.T) {
+			dest := filepath.Join(t.TempDir(), "file")
+			before := mirrorHits.Load()
+			start := time.Now()
+			used, e := fetchFrom([]source{{serve(handler), noRedirect, 3 * time.Second}, {mirror, noRedirect, 3 * time.Second}}, dest, int64(len(body)), 300*time.Millisecond)
+			if e != nil || used != 1 || mirrorHits.Load() != before+1 {
+				t.Fatal(used, e)
+			}
+			if got, _ := os.ReadFile(dest); !bytes.Equal(got, body) {
+				t.Fatal("fallback stored a different file")
+			}
+			if time.Since(start) > 2*time.Second {
+				t.Fatal("a failed source held up the fallback")
+			}
+			if left, _ := filepath.Glob(filepath.Join(filepath.Dir(dest), ".download-*")); len(left) != 0 {
+				t.Fatal(left)
+			}
+		})
+	}
+	// A working first source is final: the mirror is never contacted.
+	dest := filepath.Join(t.TempDir(), "file")
+	before := mirrorHits.Load()
+	unused := serve(func(w http.ResponseWriter, r *http.Request) { t.Error("mirror contacted") })
+	if used, e := fetchFrom([]source{{mirror, noRedirect, 3 * time.Second}, {unused, noRedirect, 3 * time.Second}}, dest, int64(len(body)), time.Second); e != nil || used != 0 || mirrorHits.Load() != before+1 {
+		t.Fatal(used, e)
+	}
+	// When every source fails nothing is stored and both reasons are reported.
+	dest = filepath.Join(t.TempDir(), "file")
+	down := serve(release["http error"])
+	_, e := fetchFrom([]source{{down, noRedirect, 3 * time.Second}, {serve(release["stalled"]), noRedirect, 3 * time.Second}}, dest, int64(len(body)), 300*time.Millisecond)
+	if e == nil || !strings.Contains(e.Error(), "HTTP 502") || !strings.Contains(e.Error(), "stalled") {
+		t.Fatal(e)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatal("a failed download left a file")
+	}
+	// The total limit ends a transfer that keeps trickling.
+	slow := serve(func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < 100; i++ {
+			w.Write(body[:10])
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	if _, e = fetchFrom([]source{{slow, noRedirect, 400 * time.Millisecond}}, dest, int64(len(body)), time.Second); e == nil || !strings.Contains(e.Error(), "timed out") {
+		t.Fatal(e)
+	}
+}
+
 func TestDeadline(t *testing.T) {
 	start := time.Now()
 	e := deadlineCommand(100*time.Millisecond, []string{"/bin/sh", "-c", "sleep 10"}, nil, io.Discard, io.Discard)

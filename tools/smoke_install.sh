@@ -6,6 +6,8 @@ set -eu
 umask 077
 export LC_ALL=C
 version=$1 arch=$2 mode=$3
+# Software-center module name of the package under test.
+module=tailscaleks
 shift 3
 base=/tmp/install-smoke
 mkdir -p "$base/commands"
@@ -81,11 +83,11 @@ prepare() {
     printf '0' >"$case_root/dbus/tailscale_enable"
     printf '0' >"$case_root/dbus/tailscale_accept_routes"
     printf 'MemAvailable: 131072 kB\n' >"$case_root/proc/meminfo"
-    tar -xzf "/archives/tailscale_${version}_${2}.tar.gz" -C "$case_root/package"
+    tar -xzf "/archives/${module}_${version}_${2}.tar.gz" -C "$case_root/package"
 }
 install() {
     case_root=$1
-    pkg=$case_root/package/tailscale
+    pkg=$case_root/package/$module
     # Match the software-center's textual package guard before invocation.
     ! grep -q 'detect_package\|ks_tar_install' "$pkg/install.sh" || fail 'host package guard rejected installer'
     if ! env PATH="$base/commands" TSKS_ROOT="$case_root/koolshare" \
@@ -110,9 +112,9 @@ validate() {
     case_root=$1
     ks=$case_root/koolshare
     core=$ks/tailscale/current
-    expected=$case_root/package/tailscale/payload/$arch
+    expected=$case_root/package/$module/payload/$arch
     [ "$(cat "$case_root/dbus/tailscale_version")" = "$version" ] || fail 'plugin version registration'
-    [ "$(cat "$case_root/dbus/softcenter_module_tailscale_install")" = 1 ] || fail 'software-center registration'
+    [ "$(cat "$case_root/dbus/softcenter_module_${module}_install")" = 1 ] || fail 'software-center registration'
     [ "$(cat "$case_root/dbus/tailscale_enable")" = 0 ] || fail 'disabled setting changed'
     [ "$(cat "$case_root/dbus/tailscale_accept_routes")" = 0 ] || fail 'preference changed'
     [ "$(cat "$ks/configs/tailscale/tailscaled.state")" = fixture-identity-preserved ] || fail 'identity changed'
@@ -236,7 +238,7 @@ for platform do
         case_root=$base/$platform/legacy
         prepare "$case_root" "$platform"
         mkdir -p "$case_root/koolshare/bin"
-        cp -p "$case_root/package/tailscale/payload/$arch/tailscale.combined" "$case_root/koolshare/bin/tailscale.combined"
+        cp -p "$case_root/package/$module/payload/$arch/tailscale.combined" "$case_root/koolshare/bin/tailscale.combined"
         ln -s tailscale.combined "$case_root/koolshare/bin/tailscale"
         ln -s tailscale.combined "$case_root/koolshare/bin/tailscaled"
         printf '2.0.0' >"$case_root/dbus/tailscale_version"

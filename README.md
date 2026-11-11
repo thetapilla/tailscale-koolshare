@@ -6,7 +6,7 @@
 - 按需使用 Tailscale DNS，管理局域网及自定义 IPv4/IPv6 共享网段。
 - 提供应用连接器，按管理控制台分配的域名学习并宣告目标地址。
 - 保留已有配置与设备身份，支持从原版插件迁移。
-- 手动检查、验证并更新核心，支持回退上一核心。
+- 手动检查、验证并更新核心，支持回退上一核心和清理旧版核心；GitHub 无法访问时自动改用镜像下载。
 - 提供诊断摘要和有频率限制的自动恢复。
 
 ## 下载与安装
@@ -22,13 +22,17 @@
 | IPQ64 | `_ipq64.tar.gz` | ARM64（`arm64`） |
 | MTK | `_mtk.tar.gz` | ARM64（`arm64`） |
 
-按固件的软件中心平台选择安装包；不确定时使用通用包。平台包体积较小，通用包只会安装设备需要的架构。固件需提供可用的 Koolshare 软件中心及 Linux 4.1 或更新内核。详细要求见 [使用指南](docs/USER-GUIDE.md)。
+安装包文件名为 `tailscaleks_<版本>_<平台>.tar.gz`，上传前不要改名。按固件的软件中心平台选择安装包；不确定时使用通用包。平台包体积较小，通用包只会安装设备需要的架构。固件需提供可用的 Koolshare 软件中心及 Linux 4.1 或更新内核。详细要求见 [使用指南](docs/USER-GUIDE.md)。
 
 安装完成后打开插件页面，勾选「启用 Tailscale」并点击「应用设置」，再按页面的「登录并授权」链接完成首次接入。升级安装会保留已有核心、配置和设备身份；安装及应用设置期间，Tailscale 连接可能短暂中断。
+
+本插件在软件中心登记的模块名是 `tailscaleks`，与插件市场的原版 `tailscale` 是两个插件：软件中心不会把市场版当作本插件的更新。两者共用设置和文件位置，不能同时安装；安装本插件会接管并替换已安装的原版。
 
 ## 核心更新
 
 插件版本与 Tailscale 核心版本分别管理。在页面点击「检查更新」，再点击「更新核心」安装本项目构建并签名的稳定核心。更新前会校验签名、文件哈希、版本和架构；更新失败时尝试恢复原核心，保留上一核心时可手动回退。更新需要手动发起。
+
+更新清单和核心归档先从 GitHub 下载；下载失败时改从镜像 `tscore.thetapilla.xyz` 获取同一文件。镜像只提供备用线路，校验规则不变。
 
 随安装包提供的核心来自官方 Tailscale 源码，采用精简构建；Tailscale SSH、Taildrop 等功能未包含在该构建中。完整构建选项见 [核心构建配方](tools/core_recipe.json)，更新和回退步骤见 [使用指南](docs/USER-GUIDE.md#核心更新与回退)。
 
@@ -42,4 +46,4 @@
 
 ## 来源与许可
 
-插件的页面布局、图标和软件中心接口源自 [Koolshare rogsoft](https://github.com/koolshare/rogsoft/tree/master/tailscale)，保留原作者 sadog / Koolshare 的署名和权利。来源说明见 [NOTICE](NOTICE)。Tailscale 使用官方源码及其 [BSD-3-Clause 许可](LICENSES/Tailscale-BSD-3-Clause.txt)。
+本插件由 [ThetaPilla](https://github.com/thetapilla) 维护。插件的页面布局、图标和软件中心接口源自 [Koolshare rogsoft](https://github.com/koolshare/rogsoft/tree/master/tailscale)，保留原作者 sadog / Koolshare 的署名和权利。来源说明见 [NOTICE](NOTICE)。Tailscale 使用官方源码及其 [BSD-3-Clause 许可](LICENSES/Tailscale-BSD-3-Clause.txt)。

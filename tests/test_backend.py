@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -160,6 +161,7 @@ elif name in ('tailscale','tailscaled'):
                     write('status.json',value)
     sys.exit(read('cli_exit.json',0))
 elif name=='cru':pass
+elif name=='logger':pass
 elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
     table='filter'
     mode=read('iptables-wait.json','legacy')
@@ -185,6 +187,16 @@ elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
         for chain,rules in chains.items():
             for rule in rules:print('-A '+chain+' '+' '.join(rule))
         print('COMMIT');sys.exit(0)
+    if args==['-S']:
+        if read('iptables-list-exit.json',0):sys.exit(4)
+        for chain,rules in chains.items():
+            for rule in rules:print('-A '+chain+' '+' '.join(rule))
+        # The daemon's rules are not created through this fixture. They exist
+        # unless a test clears them the way a firmware rebuild would.
+        if name=='iptables' and table in read('daemon-hooks.json',['filter','nat']):
+            for chain,target in {'filter':[('INPUT','ts-input'),('FORWARD','ts-forward')],'nat':[('POSTROUTING','ts-postrouting')]}[table]:
+                print('-A '+chain+' -j '+target)
+        sys.exit(0)
     op,chain=args[:2];rule=args[2:]
     if read('iptables-fail-once.json','')=='DNAT' and '-j' in rule and rule[rule.index('-j')+1]=='DNAT' and not (root/'iptables-failed').exists():
         (root/'iptables-failed').touch();sys.exit(1)
@@ -288,6 +300,13 @@ class BackendTests(unittest.TestCase):
         path = self.run / "recoveries"
         return len(path.read_text().splitlines()) if path.exists() else 0
 
+    def rule_changes(self):
+        return [args for args in self.calls("iptables") if "-S" not in args and args != ["--help"]]
+
+    def events(self):
+        path = self.run / "events.log"
+        return path.read_text() if path.exists() else ""
+
     def test_bool_validation_never_evaluates_configuration(self):
         payload = "$(touch " + str(self.base / "pwned") + ")"
         self.write("config.json", {"tailscale_enable": payload})
@@ -299,16 +318,16 @@ class BackendTests(unittest.TestCase):
         self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
         self.tick(20000)
         self.assertTrue((self.run / "firewall-status.json").exists())
-        before = len(self.calls("iptables"))
+        before = len(self.rule_changes())
         result = self.shell('ts_lock() { return 1; }; ID=501; ts_mutation start_nat', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.run / "nat-pending").exists())
         self.tick(20060)
-        self.assertGreater(len(self.calls("iptables")), before)
+        self.assertGreater(len(self.rule_changes()), before)
         self.assertFalse((self.run / "nat-pending").exists())
-        after = len(self.calls("iptables"))
+        after = len(self.rule_changes())
         self.tick(20120)
-        self.assertEqual(len(self.calls("iptables")), after)
+        self.assertEqual(len(self.rule_changes()), after)
         self.assertEqual(self.recoveries(), 0)
 
     def test_lan_cidr_masks_are_validated(self):
@@ -372,6 +391,8 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.read("firewall.json")["iptables:nat"]["POSTROUTING"], [foreign, unrelated])
 
     def test_nat_event_only_reapplies_firewall(self):
+        # Not even a daemon whose own rules the rebuild removed is restarted here.
+        self.write("daemon-hooks.json", [])
         self.entry("tailscale_config", "start_nat")
         self.assertEqual(self.calls("tailscale"), [])
         self.assertEqual(self.calls("tailscaled"), [])
@@ -399,17 +420,17 @@ class BackendTests(unittest.TestCase):
         self.tick(20000)
         rule = self.read("firewall.json")["iptables:nat"]["TSKS_PREROUTING"][0]
         self.assertIn("100.64.2.3/32", rule)
-        count = len(self.calls("iptables"))
+        count = len(self.rule_changes())
         self.tick(20060)
-        self.assertEqual(len(self.calls("iptables")), count)
+        self.assertEqual(len(self.rule_changes()), count)
         self.write("status.json", dict(self.status, ips=["100.64.2.9"]))
         self.tick(20120)
         rules = self.read("firewall.json")["iptables:nat"]["TSKS_PREROUTING"]
         self.assertEqual(len(rules), 1)
         self.assertIn("100.64.2.9/32", rules[0])
-        count = len(self.calls("iptables"))
+        count = len(self.rule_changes())
         self.tick(20180)
-        self.assertEqual(len(self.calls("iptables")), count)
+        self.assertEqual(len(self.rule_changes()), count)
         self.assertEqual(len([args for args in self.calls("tsks-helper") if args[0] == "status"]), 5)
         self.assertEqual(self.recoveries(), 0)
         self.assertEqual(self.calls("tailscaled"), [])
@@ -427,10 +448,230 @@ class BackendTests(unittest.TestCase):
         self.tick(20060)
         self.assertEqual(json.loads((self.run / "firewall-status.json").read_text())["ips"], self.status["ips"])
         self.assertIn("100.64.2.3/32", self.read("firewall.json")["iptables:nat"]["TSKS_PREROUTING"][0])
-        count = len(self.calls("iptables"))
+        count = len(self.rule_changes())
         self.tick(20120)
-        self.assertEqual(len(self.calls("iptables")), count)
+        self.assertEqual(len(self.rule_changes()), count)
         self.assertEqual(self.recoveries(), 0)
+
+    def firmware_rebuild(self, *tables):
+        """Replace whole tables, as the firmware's iptables-restore does."""
+        db = self.read("firewall.json")
+        for table in tables:
+            for family in ("iptables", "ip6tables"):
+                if family + ":" + table in db:
+                    db[family + ":" + table] = {chain: [] for chain in ("INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING")}
+        self.write("firewall.json", db)
+
+    def test_tick_reapplies_plugin_rules_cleared_after_the_nat_event(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.tick(20000)
+        applied = self.read("firewall.json")
+        self.assertIn(["-j", "TSKS_FORWARD"], applied["iptables:filter"]["FORWARD"])
+        for step, table in enumerate(("filter", "nat"), 1):
+            with self.subTest(table=table):
+                # The firmware replaced this table after its NAT event had
+                # already been handled, and no further event follows.
+                self.firmware_rebuild(table)
+                self.tick(20000 + 60 * step)
+                self.assertEqual(self.read("firewall.json"), applied)
+                count = len(self.rule_changes())
+                self.tick(20030 + 60 * step)
+                self.assertEqual(len(self.rule_changes()), count)
+        self.assertEqual(self.events().count("插件防火墙规则已被固件重建清除"), 2)
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_tick_reapplies_cleared_plugin_rules_before_any_address_exists(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("status.json", dict(self.status, backend_state="NeedsLogin", ips=[]))
+        self.shell("ts_firewall_apply")
+        applied = self.read("firewall.json")
+        self.firmware_rebuild("filter")
+        self.tick(20000)
+        self.assertEqual(self.read("firewall.json"), applied)
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_unreadable_rule_listing_is_never_treated_as_missing_rules(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.tick(20000)
+        self.firmware_rebuild("filter", "nat")
+        self.write("daemon-hooks.json", [])
+        self.write("iptables-list-exit.json", 1)
+        cleared = self.read("firewall.json")
+        self.tick(20060)
+        self.assertEqual(self.read("firewall.json"), cleared)
+        self.assertEqual(self.recoveries(), 0)
+        self.write("iptables-list-exit.json", 0)
+        self.tick(20120)
+        self.assertEqual(self.recoveries(), 1)
+
+    def test_lost_daemon_rules_restart_the_service_within_bounds(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.tick(20000)
+        self.assertEqual(self.recoveries(), 0)
+        # A rebuilt nat table alone removes one of the daemon's three hooks.
+        self.write("daemon-hooks.json", ["filter"])
+        changes = len(self.rule_changes())
+        self.tick(20060)
+        self.assertEqual(self.recoveries(), 1)
+        self.assertIn("Tailscale 自身的规则已丢失", self.events())
+        # The restart owns rule application; the stale sample is not reused.
+        self.assertEqual(len(self.rule_changes()), changes)
+        # Rule repair is maintenance: it spends no automatic-recovery budget.
+        self.assertFalse((self.ks / "configs/tailscale/watchdog-ledger").exists())
+        self.write("daemon-hooks.json", [])
+        self.tick(20120)
+        self.tick(20180)
+        self.assertEqual(self.recoveries(), 3)
+        self.tick(20240)
+        self.tick(20300)
+        self.assertEqual(self.recoveries(), 3)
+        self.assertEqual(self.events().count("已停止自动修复"), 1)
+        # Seeing the rules again proves the daemon can install them.
+        self.write("daemon-hooks.json", ["filter", "nat"])
+        self.tick(20360)
+        self.assertFalse((self.run / "netfilter-repairs").exists())
+        self.write("daemon-hooks.json", ["nat"])
+        self.tick(20420)
+        self.assertEqual(self.recoveries(), 4)
+
+    def test_daemon_rules_are_repaired_only_when_a_restart_can_restore_them(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "1"})
+        self.write("daemon-hooks.json", [])
+        # Before it has a network map the daemon has not installed any rule.
+        for state in ("Starting", "NeedsLogin", "NeedsMachineAuth", "Stopped", "NoState"):
+            with self.subTest(state=state):
+                self.write("status.json", dict(self.status, backend_state=state))
+                self.tick(20000)
+                self.assertEqual(self.recoveries(), 0)
+        self.write("status.json", self.status)
+        nvram = self.read("nvram.json")
+        for delta in ({"wan0_state_t": "4"}, {"wan0_link": "0"}):
+            with self.subTest(delta=delta):
+                self.write("nvram.json", dict(nvram, **delta))
+                self.tick(20060)
+                self.assertEqual(self.recoveries(), 0)
+        self.write("nvram.json", nvram)
+        self.tick(20120)
+        self.assertEqual(self.recoveries(), 1)
+
+    def test_nat_event_leaves_lost_daemon_rules_to_the_minute_task(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        nat = 'ts_restart() { echo "$1" >>"$RUN/recoveries"; }; ID=; ts_mutation start_nat'
+        # The rebuild that raised the event removed the daemon's rules, and the
+        # firmware raises several events while one rebuild is still under way.
+        self.write("daemon-hooks.json", [])
+        for _ in range(4):
+            self.shell(nat)
+        self.assertEqual(self.recoveries(), 0)
+        self.assertIn(["-j", "TSKS_FORWARD"], self.read("firewall.json")["iptables:filter"]["FORWARD"])
+        self.tick(20000)
+        self.assertEqual(self.recoveries(), 1)
+
+    def test_nat_event_and_lifecycle_request_renew_the_rule_repairs(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("daemon-hooks.json", [])
+        for step in range(5):
+            self.tick(20000 + 60 * step)
+        self.assertEqual(self.recoveries(), 3)
+        self.assertEqual(self.events().count("已停止自动修复"), 1)
+        # A further rebuild explains a further loss of the rules.
+        self.shell('ID=; ts_mutation start_nat')
+        self.tick(20300)
+        self.assertEqual(self.recoveries(), 4)
+        self.tick(20360)
+        self.tick(20420)
+        self.tick(20480)
+        self.assertEqual(self.recoveries(), 6)
+        self.shell('ts_start() { :; }; ID=; ts_mutation start')
+        self.tick(20540)
+        self.assertEqual(self.recoveries(), 7)
+        # A NAT event that found the lock busy renews them when it is replayed.
+        self.tick(20600)
+        self.tick(20660)
+        self.tick(20720)
+        self.assertEqual(self.recoveries(), 9)
+        self.shell('ts_lock() { return 1; }; ID=; ts_mutation start_nat', check=False)
+        self.tick(20780)
+        self.assertEqual(self.recoveries(), 9)
+        self.assertFalse((self.run / "nat-pending").exists())
+        self.tick(20840)
+        self.assertEqual(self.recoveries(), 10)
+        # The marker is spent: it does not renew the repairs a second time.
+        for step in range(4):
+            self.tick(20900 + 60 * step)
+        self.assertEqual(self.recoveries(), 12)
+
+    def test_rule_repair_that_cannot_be_recorded_is_not_attempted(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("daemon-hooks.json", [])
+        # Without a record of the attempts nothing would ever reach the limit.
+        (self.run / "netfilter-repairs").mkdir(parents=True)
+        for step in range(5):
+            self.tick(20000 + 60 * step)
+        self.assertEqual(self.recoveries(), 0)
+        self.assertNotIn("正在重启服务以恢复", self.events())
+        # The plugin's own rules are still maintained.
+        self.assertIn(["-j", "TSKS_FORWARD"], self.read("firewall.json")["iptables:filter"]["FORWARD"])
+        (self.run / "netfilter-repairs").rmdir()
+        self.tick(20300)
+        self.assertEqual(self.recoveries(), 1)
+
+    def test_firmware_lifecycle_request_waits_for_a_busy_lock(self):
+        hold = '. "$TSKS_ROOT/scripts/tailscale_lib.sh"; ts_init; ts_lock; echo locked; read done'
+        start = '. "$TSKS_ROOT/scripts/tailscale_lib.sh"; ts_init; ts_start() { : >"$RUN/started"; }; ID=; ts_mutation start'
+        holder = subprocess.Popen([SHELL, "-c", hold], env=self.env, text=True,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        waiter = None
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            # A page shows "busy" and lets the user retry.
+            result = self.entry("tailscale_config", "88", "start", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "busy"})
+            # Nothing retries the firmware's WAN event, so it must not be dropped.
+            waiter = subprocess.Popen([SHELL, "-c", start], env=self.env, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(1.5)
+            self.assertIsNone(waiter.poll())
+            self.assertFalse((self.run / "started").exists())
+            holder.communicate("done\n", timeout=5)
+            self.assertEqual(waiter.wait(timeout=20), 0)
+        finally:
+            if holder.poll() is None:
+                holder.communicate("done\n", timeout=5)
+            if waiter is not None:
+                if waiter.poll() is None:
+                    waiter.kill()
+                waiter.communicate()
+        self.assertTrue((self.run / "started").exists())
+        self.assertRegex(self.events(), r"start 请求等待其他操作 [1-9][0-9]* 秒后开始执行")
+
+    def test_firmware_lifecycle_failures_reach_the_firmware_log(self):
+        (self.mock / "logger").symlink_to(self.command)
+        result = self.shell('ts_lock() { return 1; }; sleep() { :; }; ts_start() { : >"$RUN/started"; }; ID=; ts_mutation start', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"accepted": False, "error": "busy"})
+        self.assertFalse((self.run / "started").exists())
+        self.assertEqual(self.calls("logger"), [["-t", "tailscale-plugin", "start 未执行：等待其他操作超过 120 秒"]])
+        self.shell('ts_start() { return 1; }; ID=; ts_mutation start', check=False)
+        self.assertEqual(self.calls("logger")[-1], ["-t", "tailscale-plugin", f"start 失败；原因见 {self.run}/events.log"])
+        count = len(self.calls("logger"))
+        # A page shows its own task result; a busy NAT event is replayed later.
+        self.shell('ts_start() { return 1; }; ID=77; ts_mutation start', check=False)
+        self.shell('ts_lock() { return 1; }; ID=; ts_mutation start_nat', check=False)
+        self.assertEqual(len(self.calls("logger")), count)
+        self.assertTrue((self.run / "nat-pending").exists())
+        # A core transaction that cannot be recovered stops a request before it starts.
+        (self.run / "started").unlink(missing_ok=True)
+        (self.ks / "tailscale/update.txn").write_text("not a journal\n")
+        start = 'ts_start() { : >"$RUN/started"; }; ID=; ts_mutation start'
+        self.assertNotEqual(self.shell(start, check=False).returncode, 0)
+        self.assertEqual(self.calls("logger")[-1], ["-t", "tailscale-plugin", "start 失败：上次核心操作尚未恢复"])
+        (self.ks / "scripts/tailscale_core_lib.sh").unlink()
+        self.assertNotEqual(self.shell(start, check=False).returncode, 0)
+        self.assertEqual(self.calls("logger")[-1], ["-t", "tailscale-plugin", "start 失败：核心恢复组件不可用"])
+        self.assertFalse((self.run / "started").exists())
+        self.assertEqual(len(self.calls("logger")), count + 2)
 
     def test_existing_identity_and_preferences_are_retained_on_start(self):
         state = self.ks / "configs/tailscale/tailscaled.state"
@@ -912,7 +1153,7 @@ class BackendTests(unittest.TestCase):
         (self.ks / "tailscale/current/descriptor.json").write_text('{"version":"1.102.4"}')
         (self.ks / "tailscale/available.json").write_text('{"version":"1.104.0"}')
         status = json.loads(self.entry("tailscale_fettle").stdout)
-        self.assertEqual(status["core"], {"installed": "1.102.4", "installed_build": "", "available": "", "available_build": "", "update_available": False, "previous": "", "previous_build": "", "can_rollback": False})
+        self.assertEqual(status["core"], {"installed": "1.102.4", "installed_build": "", "available": "", "available_build": "", "update_available": False, "previous": "", "previous_build": "", "can_rollback": False, "can_cleanup": False, "keep_previous": True})
         self.assertEqual(status["health_messages"], ['safe "quoted" message\nnext line'])
         self.entry("tailscale_fettle", "123456789012345")
         self.assertEqual(self.read("reply.json")["plugin_version"], (ROOT / "VERSION").read_text().strip())
@@ -944,7 +1185,13 @@ class BackendTests(unittest.TestCase):
                 core = json.loads(self.entry("tailscale_fettle").stdout)["core"]
                 self.assertEqual(core, dict(installed="1.104.1", installed_build="r1", available="1.104.1",
                                             available_build=build, update_available=expected,
-                                            previous="1.102.4", previous_build="legacy", can_rollback=True))
+                                            previous="1.102.4", previous_build="legacy", can_rollback=True,
+                                            can_cleanup=True, keep_previous=True))
+        # The retention choice is reported as saved; an unreadable value keeps the old core.
+        for saved, expected in (("0", False), ("1", True), ("yes", True)):
+            with self.subTest(saved=saved):
+                self.write("config.json", {"tailscale_enable": "1", "tailscale_core_keep_previous": saved})
+                self.assertIs(json.loads(self.entry("tailscale_fettle").stdout)["core"]["keep_previous"], expected)
         (data / "current").unlink()
         (data / "current").symlink_to("cores/1.102.4-legacy-arm")
         (data / "available.json").write_text(json.dumps(dict(version="1.104.1", build="r2", arch="arm")))

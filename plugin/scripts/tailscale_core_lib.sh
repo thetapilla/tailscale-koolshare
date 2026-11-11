@@ -23,6 +23,42 @@ ts_core_valid() {
     version=$("$HELPER" version "$dir/tailscale.combined") || return 1
     [ "$version" = "$(ts_get "$dir/descriptor.json" version)" ]
 }
+# True when a core other than TARGET still occupies storage.
+ts_core_stale() {
+    local dir
+    for dir in "$DATA"/cores/* "$DATA"/cores/.[!.]*; do
+        [ -e "$dir" ] || [ -L "$dir" ] || continue
+        [ "cores/${dir##*/}" = "$1" ] || return 0
+    done
+    return 1
+}
+# Deletes installed cores. "unreachable" keeps the active core and the rollback
+# target; "all" keeps only the active core and gives up rollback, so it first
+# confirms that the remaining core is intact. Sets CORE_PRUNED to the count.
+ts_core_prune() {
+    local mode=$1 current previous= dir
+    CORE_PRUNED=0
+    [ "$TS_LOCKED" = 1 ] || return 1
+    # A pending transaction still needs both of its cores to recover.
+    [ ! -e "$DATA/update.txn" ] && [ ! -L "$DATA/update.txn" ] || return 1
+    [ -d "$DATA/cores" ] && [ ! -L "$DATA/cores" ] || return 1
+    current=$(ts_core_target "$DATA/current") || return 1
+    case $mode in
+        unreachable) previous=$(ts_core_target "$DATA/previous") || previous=;;
+        all)
+            ts_core_valid "$DATA/$current" || { ts_job_log '当前核心未通过校验，已保留旧核心'; return 1; }
+            rm -f "$DATA/previous" || return 1;;
+        *) return 1;;
+    esac
+    for dir in "$DATA"/cores/* "$DATA"/cores/.[!.]*; do
+        [ -e "$dir" ] || [ -L "$dir" ] || continue
+        case cores/${dir##*/} in "$current"|"$previous") continue;; esac
+        # rm removes a link itself; it never follows one out of the core store.
+        rm -rf "$dir" || return 1
+        CORE_PRUNED=$((CORE_PRUNED + 1))
+    done
+    sync
+}
 ts_core_journal() {
     printf '{"phase":"%s","old":"%s","new":"%s","had_state":"%s","enabled":"%s"}\n' \
         "$1" "$CORE_OLD" "$CORE_NEW" "$CORE_HAD_STATE" "$CORE_ENABLED" >"$DATA/.update.txn.$$" || return 1
@@ -69,13 +105,20 @@ ts_core_recover() {
     sync
     ts_job_log '已恢复中断操作前的核心'
 }
+# The helper tries GitHub first and its mirror second. Neither is trusted:
+# callers verify the signature and hashes of whatever was downloaded.
+ts_core_fetch() {
+    local origin
+    origin=$("$HELPER" fetch "$1" "$2" "$3") || { ts_job_log '从 GitHub 和镜像下载均失败，请检查网络、DNS 和系统时间后重试'; return 1; }
+    [ "$origin" != mirror ] || ts_job_log '无法从 GitHub 下载，已改从镜像下载；内容仍按签名和哈希校验'
+}
 ts_core_check() {
     local arch current version comparison tmp installed_build offered_build
     arch=$(ts_get "$DATA/current/descriptor.json" arch) || return 1
     case $arch in arm|arm64) ;; *) return 1;; esac
     tmp=$RUN/feed-${TS_JOB:-$$}
     ts_job_write running checking '正在检查核心更新'
-    "$HELPER" fetch 'https://github.com/thetapilla/tailscale-koolshare/releases/download/core-stable/manifest.json' "$tmp.json" 65536 || return 1
+    ts_core_fetch 'https://github.com/thetapilla/tailscale-koolshare/releases/download/core-stable/manifest.json' "$tmp.json" 65536 || return 1
     "$HELPER" verify "$tmp.json" "$DATA/release.pub" "$arch" >"$tmp.descriptor" || { rm -f "$tmp.json" "$tmp.descriptor"; return 1; }
     current=$("$HELPER" version "$DATA/current/tailscale.combined") || return 1
     version=$(ts_get "$tmp.descriptor" version) || return 1
@@ -98,7 +141,7 @@ ts_core_check() {
     ts_job_log "核心 $version 的发布信息已通过签名校验"
 }
 ts_core_space() {
-    local required available previous current mem
+    local required available mode mem
     required=$1
     case $required in ''|*[!0-9]*) return 1;; esac
     [ "$required" -le 12582912 ] || return 1
@@ -107,15 +150,15 @@ ts_core_space() {
     [ "${mem:-0}" -ge 65536 ] || { ts_job_log '可用内存不足：核心更新至少需要 64 MiB，请释放内存后重试'; return 1; }
     available=$(df -Pk "$DATA" | awk 'END {print $4}')
     required=$(( (required + 1023) / 1024 + 8192 ))
-    if [ "${available:-0}" -lt "$required" ]; then
-        previous=$(ts_core_target "$DATA/previous") || previous=
-        current=$(ts_core_target "$DATA/current") || return 1
-        if [ -n "$previous" ] && [ "$previous" != "$current" ]; then
-            rm -f "$DATA/previous"
-            rm -rf "$DATA/$previous"
+    # Reclaim cores no pointer can reach before giving up the rollback target.
+    for mode in unreachable all; do
+        [ "${available:-0}" -lt "$required" ] || break
+        ts_core_prune "$mode" || return 1
+        [ "$CORE_PRUNED" = 0 ] || {
+            [ "$mode" != all ] || ts_job_log '存储空间不足，已删除上一核心以腾出空间；本次更新完成前无法回退'
             available=$(df -Pk "$DATA" | awk 'END {print $4}')
-        fi
-    fi
+        }
+    done
     [ "${available:-0}" -ge "$required" ] || { ts_job_log '可用存储不足：核心更新需保留 8 MiB 余量，请释放存储空间后重试'; return 1; }
 }
 ts_core_health() {
@@ -258,7 +301,7 @@ ts_core_update() {
     ts_core_space "$required" || { rm -rf "$tmp"; return 1; }
     ts_job_write running downloading '正在下载并验证核心'
     url=$(ts_get "$tmp/descriptor.json" url)
-    "$HELPER" fetch "$url" "$tmp/core.tar.gz" 13631488 && "$HELPER" extract "$tmp/core.tar.gz" "$tmp/descriptor.json" "$tmp/core" || { rm -rf "$tmp"; return 1; }
+    ts_core_fetch "$url" "$tmp/core.tar.gz" 13631488 && "$HELPER" extract "$tmp/core.tar.gz" "$tmp/descriptor.json" "$tmp/core" || { rm -rf "$tmp"; return 1; }
     ts_core_valid "$tmp/core" || { rm -rf "$tmp"; return 1; }
     if [ -e "$DATA/$target" ]; then
         [ "$(ts_get "$DATA/$target/descriptor.json" binary_sha256)" = "$(ts_get "$tmp/descriptor.json" binary_sha256)" ] && ts_core_valid "$DATA/$target" || { rm -rf "$tmp"; return 1; }
@@ -271,7 +314,30 @@ ts_core_update() {
             mv "$candidate" "$DATA/$target" || { rm -rf "$candidate" "$tmp"; return 1; }
     fi
     rm -rf "$tmp"
-    ts_core_switch "$target"
+    ts_core_switch "$target" || return $?
+    ts_core_retain
+}
+# Applies the saved retention choice once the new core is committed. The update
+# has already succeeded, so a failed deletion is reported and left for later.
+ts_core_retain() {
+    local keep mode=unreachable
+    # An unreadable preference keeps the old core: never delete on doubt.
+    keep=$(ts_read_bool tailscale_core_keep_previous 1) || keep=1
+    [ "$keep" = 1 ] || mode=all
+    if ! ts_core_prune "$mode"; then
+        ts_job_log '旧版核心未能全部删除，可稍后使用「清理旧版核心」重试'
+    elif [ "$mode" = all ]; then
+        ts_job_log '已按设置删除旧版核心；如需回退，请在下次更新前勾选「更新时保留旧核心」'
+    elif [ "$CORE_PRUNED" != 0 ]; then
+        ts_job_log "已删除 $CORE_PRUNED 个无法再回退到的旧版核心"
+    fi
+    return 0
+}
+ts_core_cleanup() {
+    ts_job_write running cleaning '正在清理旧版核心'
+    ts_core_prune all || { ts_job_log '清理旧版核心未完成，请查看操作日志和存储状态后重试'; return 1; }
+    if [ "$CORE_PRUNED" = 0 ]; then ts_job_log '没有可清理的旧版核心'
+    else ts_job_log "已删除 $CORE_PRUNED 个旧版核心，仅保留当前核心"; fi
 }
 ts_core_rollback() {
     local target

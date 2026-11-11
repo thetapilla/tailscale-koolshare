@@ -3,6 +3,8 @@
 set -u
 export LC_ALL=C
 KSROOT=${TSKS_ROOT:-/koolshare}
+# Software-center module name; must match the installer.
+MODULE=tailscaleks
 [ -f "$KSROOT/scripts/tailscale_lib.sh" ] && [ -x "$KSROOT/bin/tsks-helper" ] || {
     printf '%s\n' '插件文件不完整，保留现状。请先重新安装插件再卸载。' >&2
     exit 1
@@ -24,8 +26,8 @@ for name in tailscale_config tailscale_fettle tailscale_tsnets tailscale_status 
 done
 rm -f "$KSROOT/bin/tailscale" "$KSROOT/bin/tailscaled" "$KSROOT/bin/tailscale.combined" "$KSROOT/bin/tsks-helper" \
     "$KSROOT/init.d/S96tailscale.sh" "$KSROOT/init.d/N96tailscale.sh" \
-    "$KSROOT/res/icon-tailscale.png" "$KSROOT/res/tailscale3.js" "$KSROOT/res/LICENSE.plugin-notice.txt" "$KSROOT/res/LICENSE.tailscale.txt" \
-    "$KSROOT/webs/Module_tailscale.asp" "$KSROOT/scripts/uninstall_tailscale.sh" || exit 1
+    "$KSROOT/res/icon-$MODULE.png" "$KSROOT/res/tailscale3.js" "$KSROOT/res/LICENSE.plugin-notice.txt" "$KSROOT/res/LICENSE.tailscale.txt" \
+    "$KSROOT/webs/Module_$MODULE.asp" "$KSROOT/scripts/uninstall_$MODULE.sh" || exit 1
 for file in "$KSROOT"/res/LICENSE-tailscale*; do
     [ -f "$file" ] || continue
     rm -f "$file" || exit 1
@@ -34,7 +36,10 @@ done
 if [ -d "$DATA/cores" ] && [ ! -L "$DATA/cores" ]; then rm -rf "$DATA/cores" || exit 1; fi
 rm -f "$DATA/current" "$DATA/previous" "$DATA/release.pub" "$DATA/available.json" "$DATA/available.signed.json" "$DATA/available-release.json" "$DATA/update.state" || exit 1
 rmdir "$DATA" 2>/dev/null || :
-for key in tailscale_app_connector tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
+for key in tailscale_app_connector tailscale_version; do
     dbus remove "$key" || exit 1
+done
+for key in version install name title description author; do
+    dbus remove "softcenter_module_${MODULE}_$key" || exit 1
 done
 printf '%s\n' "Tailscale 已卸载。已保留连接身份（$KSROOT/configs/tailscale）和软件中心中的插件设置。"

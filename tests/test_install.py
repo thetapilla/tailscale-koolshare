@@ -141,7 +141,7 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='tsks-install-')
         self.base = Path(self.temp.name)
-        self.pkg = self.base / 'package/tailscale'
+        self.pkg = self.base / 'package/tailscaleks'
         self.ks = self.base / 'koolshare'
         self.mock = self.base / 'mock'
         self.utilities = self.base / 'utilities'
@@ -271,6 +271,58 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn('tailscale_app_connector', self.read('config.json'))
         self.assertIn('start version=\n', (self.mock / 'lifecycle').read_text())
         self.assertFalse(list(self.ks.glob('.tailscale-install.*')))
+
+    NEW_FILES = ('webs/Module_tailscaleks.asp', 'res/icon-tailscaleks.png', 'scripts/uninstall_tailscaleks.sh')
+    FORMER_FILES = ('webs/Module_tailscale.asp', 'res/icon-tailscale.png', 'scripts/uninstall_tailscale.sh')
+    FORMER_KEYS = {'softcenter_module_tailscale_' + key: value for key, value in (
+        ('version', '2.0.0'), ('install', '1'), ('name', 'tailscale'), ('title', 'Tailscale'),
+        ('description', 'marketplace plugin'), ('md5', 'a' * 32))}
+
+    def former_identity(self):
+        """Registration and files left by the marketplace plugin or by 3.3.0 and older."""
+        self.write('config.json', dict(self.read('config.json'), **self.FORMER_KEYS))
+        for rel in self.FORMER_FILES:
+            (self.ks / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.ks / rel).write_text('former ' + rel)
+
+    def registration(self):
+        return {key: value for key, value in self.read('config.json').items() if key.startswith('softcenter_module_')}
+
+    def test_install_registers_a_module_name_the_marketplace_does_not_use(self):
+        self.install()
+        # The software center pairs installed plugins with its catalogue by this
+        # name and splits the key on "_", so the name itself contains none.
+        self.assertEqual(self.registration(), {
+            'softcenter_module_tailscaleks_version': PLUGIN_VERSION,
+            'softcenter_module_tailscaleks_install': '1',
+            'softcenter_module_tailscaleks_name': 'tailscaleks',
+            'softcenter_module_tailscaleks_title': 'Tailscale',
+            'softcenter_module_tailscaleks_description': '连接 Tailscale 网络，共享局域网和互联网出口',
+            'softcenter_module_tailscaleks_author': 'ThetaPilla, sadog'})
+        for rel in self.NEW_FILES:
+            self.assertTrue((self.ks / rel).is_file(), rel)
+        self.assertIn("'Module_tailscaleks.asp'", (self.ks / 'webs/Module_tailscaleks.asp').read_text())
+
+    def test_upgrade_retires_the_former_software_center_identity(self):
+        self.legacy(); self.former_identity(); self.install()
+        self.assertEqual(sorted(self.registration()), sorted(
+            'softcenter_module_tailscaleks_' + key for key in ('version', 'install', 'name', 'title', 'description', 'author')))
+        for rel in self.FORMER_FILES:
+            self.assertFalse((self.ks / rel).exists(), rel)
+        for rel in self.NEW_FILES:
+            self.assertTrue((self.ks / rel).is_file(), rel)
+        # Settings and the connection identity keep their names and values.
+        self.assertEqual(self.read('config.json')['tailscale_accept_routes'], '0')
+        self.assertEqual((self.ks / 'configs/tailscale/tailscaled.state').read_text(), 'preserved-identity')
+
+    def test_failed_upgrade_restores_the_former_identity_exactly(self):
+        self.legacy(); self.former_identity(); before = self.read('config.json')
+        (self.mock / 'fail-start').touch(); self.install(False)
+        self.assertEqual(self.read('config.json'), before)
+        for rel in self.FORMER_FILES:
+            self.assertEqual((self.ks / rel).read_text(), 'former ' + rel)
+        for rel in self.NEW_FILES:
+            self.assertFalse((self.ks / rel).exists(), rel)
 
     def test_universal_and_hnd_install_without_optional_firmware_commands(self):
         for name in ('od', 'timeout', 'command', 'sha256sum'):
@@ -557,7 +609,7 @@ class InstallTests(unittest.TestCase):
         self.legacy(); self.install()
         unrelated = self.ks / 'scripts/tailscale_custom_user_note'; unrelated.write_text('keep')
         self.write('config.json', dict(self.read('config.json'), tailscale_app_connector='1'))
-        result = subprocess.run([SHELL, str(self.ks / 'scripts/uninstall_tailscale.sh')], env=self.env, text=True, capture_output=True, timeout=20)
+        result = subprocess.run([SHELL, str(self.ks / 'scripts/uninstall_tailscaleks.sh')], env=self.env, text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.ks / 'configs/tailscale/tailscaled.state').read_text(), 'preserved-identity')
         self.assertEqual(self.read('config.json')['tailscale_accept_routes'], '0')
@@ -566,12 +618,15 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(unrelated.exists())
         self.assertFalse((self.ks / 'bin/tsks-helper').exists())
         self.assertFalse((self.ks / 'tailscale/cores').exists())
+        self.assertEqual(self.registration(), {})
+        for rel in self.NEW_FILES:
+            self.assertFalse((self.ks / rel).exists(), rel)
 
     def test_uninstall_preserves_pending_recovery_and_installed_files(self):
         self.legacy(); self.install()
         journal = self.ks / 'tailscale/update.txn'
         journal.write_text('{"phase":"switched"}')
-        result = subprocess.run([SHELL, str(self.ks / 'scripts/uninstall_tailscale.sh')], env=self.env, text=True, capture_output=True, timeout=20)
+        result = subprocess.run([SHELL, str(self.ks / 'scripts/uninstall_tailscaleks.sh')], env=self.env, text=True, capture_output=True, timeout=20)
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(journal.exists())
         self.assertTrue((self.ks / 'bin/tsks-helper').exists())

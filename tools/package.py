@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 
-from artifact_utils import MAX_BINARY, archive_tree, check_elf, sha256
+from artifact_utils import MAX_BINARY, MODULE, archive_tree, check_elf, sha256
 from prepare_bundle import bundle_identity
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +25,7 @@ def check_host_installer(path):
 
 def stamp_ui(stage, version):
     """Refresh browser caches when a same-version package changes its script."""
-    page = stage / "webs/Module_tailscale.asp"
+    page = stage / f"webs/Module_{MODULE}.asp"
     digest = sha256(stage / "res/tailscale3.js")[:16]
     source = f"/res/tailscale3.js?v={version}-{digest}"
     text, count = re.subn(r'(?<=src=")/res/tailscale3\.js(?:\?[^"\s]*)?(?=")',
@@ -70,7 +70,7 @@ def build_packages(root, out, public_key=None, helper=None):
         raise ValueError("architecture payloads use different source recipes")
     result = []
     for platform in ("universal", *PLATFORMS):
-        stage = root / "build/packages" / platform / "tailscale"
+        stage = root / "build/packages" / platform / MODULE
         if stage.exists():
             shutil.rmtree(stage)
         shutil.copytree(root / "plugin", stage, symlinks=True)
@@ -101,7 +101,7 @@ def build_packages(root, out, public_key=None, helper=None):
                 checksums.append(f"{sha256(file)}  {file.relative_to(stage).as_posix()}\n")
         (stage / "manifest.sha256").write_text("".join(checksums))
         (stage / "manifest.sha256").chmod(0o644)
-        archive = out / f"tailscale_{version}_{platform}.tar.gz"
+        archive = out / f"{MODULE}_{version}_{platform}.tar.gz"
         archive_tree(stage, archive)
         result.append(archive)
     (out / "SHA256SUMS").write_text("".join(f"{sha256(path)}  {path.name}\n" for path in result))

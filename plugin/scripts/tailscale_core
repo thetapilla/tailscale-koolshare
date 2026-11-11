@@ -3,7 +3,18 @@
 . "${TSKS_ROOT:-/koolshare}/scripts/tailscale_core_lib.sh" || exit 1
 ts_init || exit 1
 ts_parse_request "$@"
-case $ACTION in check|update|rollback) ;; *) ts_reply '{"accepted":false,"error":"invalid_action"}'; exit 1;; esac
+# Validate the whole request before taking the lock or a task ID. An update
+# may carry the page's retention choice; without it the saved choice applies.
+[ -z "$ID" ] || shift
+[ "$#" = 0 ] || shift
+KEEP=
+case $ACTION in
+    check|rollback|cleanup) ;;
+    update)
+        case $#:${1:-} in 0:) ;; 1:0|1:1) KEEP=$1;;
+            *) ts_reply '{"accepted":false,"error":"invalid_action"}'; exit 1;; esac;;
+    *) ts_reply '{"accepted":false,"error":"invalid_action"}'; exit 1;;
+esac
 ts_lock || { ts_reply '{"accepted":false,"error":"busy"}'; exit 1; }
 trap 'ts_unlock' EXIT
 trap 'ts_job_write failed interrupted "操作已中断，请重新读取运行状态；下次服务启动或核心操作时会检查恢复记录"; exit 1' HUP INT TERM
@@ -13,7 +24,11 @@ if ! ts_core_recover; then
     ts_job_write failed recovery_required '上次核心操作未能恢复，请保留操作日志并生成诊断摘要'
     exit 1
 fi
-case $ACTION in check) ts_core_check;; update) ts_core_update;; rollback) ts_core_rollback;; esac
+if [ -n "$KEEP" ] && ! dbus set "tailscale_core_keep_previous=$KEEP" >/dev/null 2>&1; then
+    ts_job_write failed configuration '无法保存旧核心保留设置，未执行更新；请检查存储空间后重试'
+    exit 1
+fi
+case $ACTION in check) ts_core_check;; update) ts_core_update;; rollback) ts_core_rollback;; cleanup) ts_core_cleanup;; esac
 result=$?
 case $result in 0) ts_job_write success complete '核心操作完成';; 2) :;; *) ts_job_write failed failed '核心操作未完成，请查看操作日志和当前核心版本';; esac
 exit "$result"

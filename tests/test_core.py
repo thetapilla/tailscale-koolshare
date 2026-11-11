@@ -25,6 +25,7 @@ CORE_COMMANDS = r'''
         kind='manifest' if args[1].endswith('manifest.json') else 'archive'
         if read('fault.json','')=='fetch-'+kind:sys.exit(1)
         Path(args[2]).write_text(json.dumps(read('feed.json',{})))
+        if read('mirror.json','') in (kind,'both'):print('mirror')
     elif args[0]=='verify':
         if read('fault.json','')=='signature':sys.exit(1)
         print(json.dumps(read('feed.json',{})))
@@ -309,6 +310,29 @@ class CoreTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_untouched()
 
+    def test_mirror_downloads_and_total_failures_are_explained_in_the_log(self):
+        events = lambda: (self.run / "events.log").read_text() if (self.run / "events.log").exists() else ""
+        self.offer(self.descriptor("1.102.5", "r1", "b" * 40))
+        self.stub_lifecycle()
+        self.entry("tailscale_core", "101", "check")
+        self.assertNotIn("镜像", events())
+        # The helper names the mirror on its output when GitHub did not deliver.
+        for step, (mirrored, count) in enumerate((("manifest", 1), ("archive", 2), ("both", 4)), 2):
+            with self.subTest(mirrored=mirrored):
+                self.offer(self.descriptor("1.102.5", "r%d" % step, "b" * 40))
+                self.write("mirror.json", mirrored)
+                self.entry("tailscale_core", str(100 + step), "update")
+                self.assertEqual(json.loads((self.web / f"tailscale3_{100 + step}.json").read_text())["state"], "success")
+                self.assertEqual(events().count("已改从镜像下载"), count)
+        self.write("mirror.json", "")
+        for fault in ("fetch-manifest", "fetch-archive"):
+            with self.subTest(fault=fault):
+                before = events().count("从 GitHub 和镜像下载均失败")
+                self.offer(self.descriptor("1.102.6", "r1", "b" * 40))
+                self.write("fault.json", fault)
+                self.assertNotEqual(self.shell("ts_lock; ts_job_begin 110; ts_core_update", check=False).returncode, 0)
+                self.assertEqual(events().count("从 GitHub 和镜像下载均失败"), before + 1)
+
     def test_feed_version_and_build_downgrades_are_rejected(self):
         for version, build in (("1.100.0", "r9"), ("1.102.4", "r1")):
             with self.subTest(version=version, build=build):
@@ -348,6 +372,147 @@ class CoreTests(unittest.TestCase):
         self.assertFalse((self.data / previous).exists())
         self.assertTrue((self.data / self.old / "tailscale.combined").exists())
         self.assertEqual(os.readlink(self.data / "previous"), self.old)
+
+    def cores(self):
+        return sorted(path.name for path in (self.data / "cores").iterdir())
+
+    def stub_lifecycle(self):
+        """Let the public entry script run a whole transaction without a daemon."""
+        with (self.ks / "scripts/tailscale_core_lib.sh").open("a") as script:
+            script.write(LIFECYCLE)
+
+    def test_update_keeps_the_replaced_core_by_default_and_drops_unreachable_ones(self):
+        orphan = self.make_core("1.98.0", "r1", "f" * 40)
+        leftover = self.data / "cores/.candidate-77"
+        leftover.mkdir()
+        (leftover / "partial").write_text("interrupted earlier copy")
+        self.stub_lifecycle()
+        self.entry("tailscale_core", "301", "update")
+        self.assertEqual(os.readlink(self.data / "current"), self.new)
+        self.assertEqual(os.readlink(self.data / "previous"), self.old)
+        self.assertEqual(self.cores(), sorted((self.old.split("/")[1], self.new.split("/")[1])))
+        self.assertFalse((self.data / orphan).exists())
+        self.assertNotIn("tailscale_core_keep_previous", self.read("config.json"))
+        self.assertIn("已删除 2 个无法再回退到的旧版核心", (self.run / "events.log").read_text())
+        status = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+        self.assertEqual((status["can_rollback"], status["can_cleanup"], status["keep_previous"]), (True, True, True))
+
+    def test_update_without_retention_deletes_every_other_core_after_commit(self):
+        earlier = self.make_core("1.100.0", "r1", "e" * 40)
+        (self.data / "previous").symlink_to(earlier)
+        self.stub_lifecycle()
+        self.entry("tailscale_core", "302", "update", "0")
+        self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], "0")
+        self.assertEqual(os.readlink(self.data / "current"), self.new)
+        self.assertFalse(os.path.lexists(self.data / "previous"))
+        self.assertEqual(self.cores(), [self.new.split("/")[1]])
+        self.assertEqual(self.lifecycle(), [f"stop {self.old}", f"start {self.new}"])
+        self.assertEqual(self.state.read_text(), "original-identity-and-current-preferences")
+        self.assertEqual(json.loads((self.web / "tailscale3_302.json").read_text())["state"], "success")
+        status = json.loads(self.entry("tailscale_fettle").stdout)["core"]
+        self.assertEqual((status["can_rollback"], status["can_cleanup"], status["keep_previous"]), (False, False, False))
+        # The saved choice also applies to a request that carries none.
+        (self.data / "current").unlink()
+        (self.data / "current").symlink_to(self.make_core("1.102.4", "r2", "a" * 40))
+        self.entry("tailscale_core", "303", "update")
+        self.assertEqual(self.cores(), [self.new.split("/")[1]])
+        # Choosing to keep is saved the same way.
+        (self.data / "current").unlink()
+        (self.data / "current").symlink_to(self.make_core("1.102.4", "r2", "a" * 40))
+        self.entry("tailscale_core", "304", "update", "1")
+        self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], "1")
+        self.assertEqual(os.readlink(self.data / "previous"), self.old)
+
+    def test_failed_update_without_retention_keeps_the_working_core(self):
+        (self.mock / "fail-start-target").write_text(self.new)
+        self.stub_lifecycle()
+        result = self.entry("tailscale_core", "305", "update", "0", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(os.readlink(self.data / "current"), self.old)
+        self.assertTrue((self.data / self.old / "tailscale.combined").exists())
+        self.assertEqual(json.loads((self.web / "tailscale3_305.json").read_text())["state"], "rolled_back")
+
+    def test_unsaved_retention_choice_stops_the_update(self):
+        env = dict(self.env, DBUS_FAIL_ONCE_KEY="tailscale_core_keep_previous")
+        result = subprocess.run([backend.SHELL, str(self.ks / "scripts/tailscale_core"), "306", "update", "0"],
+                                env=env, text=True, capture_output=True, timeout=40)
+        self.assertNotEqual(result.returncode, 0)
+        job = json.loads((self.web / "tailscale3_306.json").read_text())
+        self.assertEqual((job["state"], job["phase"]), ("failed", "configuration"))
+        self.assert_untouched()
+
+    def test_retention_argument_is_validated_before_any_task_or_write(self):
+        for args in (("update", "2"), ("update", ""), ("update", "1", "1"), ("update", "yes"), ("purge",)):
+            with self.subTest(args=args):
+                result = self.entry("tailscale_core", "307", *args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_action"})
+                self.assertFalse((self.web / "tailscale3_307.json").exists())
+                self.assertNotIn("tailscale_core_keep_previous", self.read("config.json"))
+        self.assert_untouched()
+
+    def test_manual_cleanup_keeps_only_the_active_core(self):
+        earlier = self.make_core("1.100.0", "r1", "e" * 40)
+        orphan = self.make_core("1.98.0", "r1", "f" * 40)
+        (self.data / "previous").symlink_to(earlier)
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("not part of the core store")
+        (self.data / "cores/foreign-link").symlink_to(outside)
+        self.entry("tailscale_core", "308", "cleanup")
+        self.assertEqual(self.read("reply.json"), {"accepted": True, "job_id": "308"})
+        self.assertEqual(self.cores(), [self.old.split("/")[1]])
+        self.assertFalse(os.path.lexists(self.data / "previous"))
+        self.assertFalse((self.data / orphan).exists())
+        # A link is removed, never followed.
+        self.assertEqual((outside / "keep").read_text(), "not part of the core store")
+        self.assertEqual(json.loads((self.web / "tailscale3_308.json").read_text())["state"], "success")
+        self.assertIn("已删除 3 个旧版核心", (self.web / "tailscale3_308.log").read_text())
+        self.assert_untouched()
+        self.entry("tailscale_core", "309", "cleanup")
+        self.assertEqual(json.loads((self.web / "tailscale3_309.json").read_text())["state"], "success")
+        self.assertIn("没有可清理的旧版核心", (self.web / "tailscale3_309.log").read_text())
+
+    def test_cleanup_refuses_to_leave_only_a_damaged_core(self):
+        earlier = self.make_core("1.100.0", "r1", "e" * 40)
+        (self.data / "previous").symlink_to(earlier)
+        (self.data / self.old / "tailscale.combined").write_text("version:1.102.4\ncorrupted\n")
+        result = self.entry("tailscale_core", "310", "cleanup", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(os.readlink(self.data / "previous"), earlier)
+        self.assertTrue((self.data / earlier / "tailscale.combined").exists())
+        self.assertEqual(json.loads((self.web / "tailscale3_310.json").read_text())["state"], "failed")
+        self.assertIn("已保留旧核心", (self.web / "tailscale3_310.log").read_text())
+
+    def test_pruning_never_runs_inside_a_pending_transaction_or_without_the_lock(self):
+        earlier = self.make_core("1.100.0", "r1", "e" * 40)
+        self.assertNotEqual(self.shell("ts_core_prune all", check=False).returncode, 0)
+        (self.data / "update.txn").write_text("{}")
+        for mode in ("unreachable", "all"):
+            self.assertNotEqual(self.shell("ts_lock; ts_core_prune " + mode, check=False).returncode, 0)
+        (self.data / "update.txn").unlink()
+        self.assertNotEqual(self.shell("ts_lock; ts_core_prune everything", check=False).returncode, 0)
+        self.assertTrue((self.data / earlier).exists())
+        self.shell('ts_lock; ts_core_prune unreachable; [ "$CORE_PRUNED" = 1 ]')
+        self.assertFalse((self.data / earlier).exists())
+
+    def test_storage_cleanup_reclaims_unreachable_cores_before_the_rollback_target(self):
+        previous = self.make_core("1.100.0", "r1", "e" * 40)
+        (self.data / "previous").symlink_to(previous)
+        orphan = self.make_core("1.98.0", "r1", "f" * 40)
+        self.write("space.json", [8000, 100000])
+        self.shell("ts_lock; ts_core_space 4096")
+        self.assertFalse((self.data / orphan).exists())
+        self.assertEqual(os.readlink(self.data / "previous"), previous)
+        self.assertTrue((self.data / previous / "tailscale.combined").exists())
+        self.assertNotIn("已删除上一核心", (self.run / "events.log").read_text() if (self.run / "events.log").exists() else "")
+        # Without anything unreachable left, the rollback target is given up and reported.
+        self.write("space.json", [8000, 100000])
+        self.shell("ts_lock; ts_core_space 4096")
+        self.assertFalse((self.data / previous).exists())
+        self.assertFalse(os.path.lexists(self.data / "previous"))
+        self.assertIn("已删除上一核心以腾出空间", (self.run / "events.log").read_text())
+        self.assert_untouched()
 
     def test_stale_candidate_and_copy_failure_are_cleaned(self):
         candidate = self.data / "cores/.candidate-103"

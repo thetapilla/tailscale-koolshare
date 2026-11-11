@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.3.0"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.4.0"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -57,7 +57,7 @@ input:disabled { opacity:.5; cursor:default; }
 var tailscalePage;
 function menu_hook(title, tab) {
     tabtitle[tabtitle.length - 1] = new Array('', 'Tailscale');
-    tablink[tablink.length - 1] = new Array('', 'Module_tailscale.asp');
+    tablink[tablink.length - 1] = new Array('', 'Module_tailscaleks.asp');
 }
 function init() {
     show_menu(menu_hook);
@@ -153,9 +153,13 @@ function init() {
 <input id="core_check" class="button_gen" type="button" value="检查更新" disabled="disabled" />
 <input id="core_update" class="button_gen" type="button" value="更新核心" disabled="disabled" />
 <input id="core_rollback" class="button_gen" type="button" value="回退上一核心" disabled="disabled" />
+<input id="core_cleanup" class="button_gen" type="button" value="清理旧版核心" disabled="disabled" />
 <div id="core_rollback_target" class="ts_help" style="display:none;"></div>
 <div class="ts_help">先检查更新，再安装更新源提供的核心。保留有上一版本时，可手动回退。</div>
-</td></tr></table></div>
+</td></tr>
+<tr><th><label for="core_keep_previous">更新时保留旧核心</label></th><td><input id="core_keep_previous" type="checkbox" checked="checked" disabled="disabled" />
+<div class="ts_help">勾选时，更新后保留被替换的核心，可用「回退上一核心」换回。取消勾选可节省存储空间：更新成功后删除旧核心，之后无法回退。此选项在点击「更新核心」时保存。</div>
+<div class="ts_help">「清理旧版核心」会立即删除当前核心以外的所有核心。</div></td></tr></table></div>
 <div id="task_panel" class="ts_box ts_section" style="display:none;" role="region" aria-label="操作进度">
 <div><span id="job_title"></span><span class="ts_badge">任务 <span id="job_id"></span></span></div>
 <div id="job_state" class="SimpleNote" role="status" aria-live="polite"></div>

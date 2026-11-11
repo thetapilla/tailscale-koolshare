@@ -7,6 +7,10 @@ import struct
 import tarfile
 
 MAX_BINARY = 12 * 1024 * 1024
+# Software-center module name: the archive directory, the page and the package
+# file prefix must all carry it. The marketplace plugin "tailscale" is a
+# different product, so this name must stay distinct from it.
+MODULE = "tailscaleks"
 ARCH_MACHINE = {"arm": (1, 40), "arm64": (2, 183)}
 
 
@@ -25,7 +29,7 @@ def check_elf(path, arch, maximum=None):
     return len(data), hashlib.sha256(data).hexdigest()
 
 
-def archive_tree(source, output, prefix="tailscale"):
+def archive_tree(source, output, prefix=MODULE):
     """Stable ordering, modes, uid/gid, timestamps, and gzip header."""
     source, output = Path(source), Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

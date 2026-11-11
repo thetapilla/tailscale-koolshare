@@ -8,13 +8,15 @@
     var later = options.setTimeout || setTimeout, cancel = options.clearTimeout || clearTimeout;
     var storage = options.storage, ask = options.confirm || function () { return true; };
     var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable', 'tailscale_accept_dns', 'tailscale_custom_routes_enable', 'tailscale_app_connector'];
-    var buttons = ['apply_settings', 'core_check', 'core_update', 'core_rollback', 'run_status', 'run_netcheck', 'run_diagnostics'];
+    var buttons = ['apply_settings', 'core_check', 'core_update', 'core_rollback', 'core_cleanup', 'run_status', 'run_netcheck', 'run_diagnostics'];
     // Software-center httpdb accepts request IDs of at most eight digits.
     var maxRequestId = 99999999, lastId = Math.floor(Math.random() * maxRequestId), timer = null, xhr = null;
     var started = false, stopped = false, inFlight = false, epoch = 0;
     var configReady = false, dirty = false, busy = false, pending = null, submitted = null, job = null, logTarget = null;
     var configDue = 0, statusDue = 0, interfacesDue = 0, jobDue = 0, logDue = 0;
-    var canUpdate = false, canRollback = false, statusGood = false, lastStatus = null;
+    var canUpdate = false, canRollback = false, canCleanup = false, statusGood = false, lastStatus = null;
+    // The retention choice is saved by the update request, not by "apply settings".
+    var keepTouched = false;
     var configNotice = '', statusNotice = '', statusReadNotice = '', baseline = '', refreshingStatus = false;
     var jobStarted = 0, jobPaused = false, JOB_WINDOW = 15 * 60 * 1000;
     var routeRows = [], routeSerial = 0, baselineRoutes = '', legacyDraft = 0, routesNotice = '';
@@ -188,6 +190,8 @@
         for (i = 0; i < buttons.length; i++) { if (node(buttons[i])) { node(buttons[i]).disabled = locked; } }
         if (node('core_update')) { node('core_update').disabled = locked || !statusGood || !canUpdate; }
         if (node('core_rollback')) { node('core_rollback').disabled = locked || !statusGood || !canRollback; }
+        if (node('core_cleanup')) { node('core_cleanup').disabled = locked || !statusGood || !canCleanup; }
+        if (node('core_keep_previous')) { node('core_keep_previous').disabled = locked || !statusGood; }
         visible('job_resume', jobPaused);
         text('settings_notice', settingTask ? (jobPaused ? '设置结果尚未确认' : pending || submitted ? '正在提交设置…' : job.confirmed ? '正在应用设置…' : '正在确认设置结果…') :
             !configReady ? (configNotice ? '读取设置失败，正在重试…' : '正在读取设置…') : routesNotice || (dirty ? '设置尚未应用' : ''));
@@ -300,6 +304,8 @@
         var available = coreLabel(core.available, core.available_build), previous = coreLabel(core.previous, core.previous_build);
         canUpdate = core.update_available === true;
         canRollback = core.can_rollback === true;
+        canCleanup = core.can_cleanup === true;
+        if (!keepTouched && node('core_keep_previous') && typeof core.keep_previous === 'boolean') { node('core_keep_previous').checked = core.keep_previous; }
         text('plugin_version', plain(data.plugin_version) || '版本未知');
         text('core_current', coreLabel(current, current === installed ? core.installed_build : '') || '版本不可用');
         text('core_latest', available ? available + (core.update_available === false ? '（与当前核心相同）' : '') : '暂无检查结果');
@@ -474,6 +480,8 @@
             if (terminal) {
                 if (job.reloadConfig) { configDue = 0; configReady = false; if (data.state === 'success') { dirty = false; } else { restoreDraft(job); } }
                 refreshingStatus = data.state === 'success' && (job.method === 'tailscale_config' || (job.method === 'tailscale_core' && /^(update|rollback)$/.test(job.intent)));
+                // The backend saved the choice with this request; show the saved value again.
+                if (job.method === 'tailscale_core' && job.intent === 'update') { keepTouched = false; }
                 busy = false;
                 job = null;
                 jobPaused = false;
@@ -578,11 +586,18 @@
         });
         bind('apply_settings', 'click', apply);
         bind('core_check', 'click', function () { action('tailscale_core', ['check'], '检查核心更新'); });
+        bind('core_keep_previous', 'change', function () { if (!busy && statusGood) { keepTouched = true; } });
         bind('core_update', 'click', function () {
-            if (!busy && canUpdate && statusGood && ask('更新核心可能短暂中断 Tailscale 连接。是否继续？')) { action('tailscale_core', ['update'], '更新核心'); }
+            var keep = !node('core_keep_previous') || node('core_keep_previous').checked;
+            if (!busy && canUpdate && statusGood && ask('更新核心可能短暂中断 Tailscale 连接。' + (keep ? '' : '更新成功后将删除旧核心，之后无法回退。') + '是否继续？')) {
+                action('tailscale_core', ['update', keep ? '1' : '0'], '更新核心');
+            }
         });
         bind('core_rollback', 'click', function () {
             if (!busy && canRollback && statusGood && ask('回退核心可能短暂中断 Tailscale 连接。是否继续？')) { action('tailscale_core', ['rollback'], '回退核心'); }
+        });
+        bind('core_cleanup', 'click', function () {
+            if (!busy && canCleanup && statusGood && ask('将删除当前核心以外的所有旧版核心，之后无法回退。是否继续？')) { action('tailscale_core', ['cleanup'], '清理旧版核心'); }
         });
         bind('run_status', 'click', function () { action('tailscale_status', [], '连接详情'); });
         bind('run_netcheck', 'click', function () { action('tailscale_ncheck', [], '网络检查'); });

@@ -8,6 +8,10 @@ KSROOT=${TSKS_ROOT:-/koolshare}
 RUN=${TSKS_RUN:-/tmp/tailscale3}
 DATA=$KSROOT/tailscale
 STATE=$KSROOT/configs/tailscale/tailscaled.state
+# Software-center identity. Versions up to 3.3.0 registered as "tailscale", the
+# name of the marketplace plugin, which let the software center offer that
+# different plugin as an update. Settings and paths keep their names.
+MODULE=tailscaleks
 STAGE=$KSROOT/.tailscale-install.$$
 TOUCHED=0
 COMMITTED=0
@@ -30,7 +34,7 @@ check_package_paths() {
 
 check_package() {
     "$VERIFIED_HELPER" check-tree "$PKG" || fail '安装包文件校验失败'
-    [ "$(cat "$PKG/version")" = 3.3.0 ] || fail '插件版本无效'
+    [ "$(cat "$PKG/version")" = 3.4.0 ] || fail '插件版本无效'
 }
 
 verify_helper() {
@@ -72,7 +76,7 @@ space_preflight() {
     local path rel size total=0 available memory
     # Copies stay on JFFS. Count only selected payload, regular-file backups,
     # and the adopted/fresh core; retain 8 MiB beyond the full transaction.
-    for path in "$PKG"/scripts/tailscale_* "$PKG"/init.d/*tailscale.sh "$PKG"/webs/Module_tailscale.asp "$PKG"/res/icon-tailscale.png "$PKG"/res/tailscale3.js "$PKG"/res/LICENSE*; do
+    for path in "$PKG"/scripts/tailscale_* "$PKG"/init.d/*tailscale.sh "$PKG/webs/Module_$MODULE.asp" "$PKG/res/icon-$MODULE.png" "$PKG"/res/tailscale3.js "$PKG"/res/LICENSE*; do
         [ -f "$path" ] || continue
         size=$(wc -c <"$path" | tr -d ' '); total=$((total + size + 4096))
         rel=${path#"$PKG/"}
@@ -83,7 +87,7 @@ space_preflight() {
     for path in "$PAYLOAD/tsks-helper" "$PKG/uninstall.sh" "$PKG/release.pub"; do
         size=$(wc -c <"$path" | tr -d ' '); total=$((total + size + 4096))
     done
-    for path in "$KSROOT/bin/tsks-helper" "$KSROOT/bin/tailscale" "$KSROOT/bin/tailscaled" "$KSROOT/bin/tailscale.combined" "$KSROOT/scripts/uninstall_tailscale.sh" "$DATA/release.pub" "$STATE"; do
+    for path in "$KSROOT/bin/tsks-helper" "$KSROOT/bin/tailscale" "$KSROOT/bin/tailscaled" "$KSROOT/bin/tailscale.combined" "$KSROOT/scripts/uninstall_$MODULE.sh" "$KSROOT/scripts/uninstall_tailscale.sh" "$KSROOT/webs/Module_tailscale.asp" "$KSROOT/res/icon-tailscale.png" "$DATA/release.pub" "$STATE"; do
         if [ -f "$path" ] && [ ! -L "$path" ]; then
             size=$(wc -c <"$path" | tr -d ' '); total=$((total + size + 4096))
         fi
@@ -178,7 +182,7 @@ prepare_files() {
     local path rel
     mkdir -p "$STAGE/new" "$STAGE/backup" "$STAGE/dbus" || fail '无法准备安装暂存文件'
     : >"$STAGE/files"
-    for path in "$PKG"/scripts/tailscale_* "$PKG"/init.d/*tailscale.sh "$PKG"/webs/Module_tailscale.asp "$PKG"/res/icon-tailscale.png "$PKG"/res/tailscale3.js; do
+    for path in "$PKG"/scripts/tailscale_* "$PKG"/init.d/*tailscale.sh "$PKG/webs/Module_$MODULE.asp" "$PKG/res/icon-$MODULE.png" "$PKG"/res/tailscale3.js; do
         [ -f "$path" ] || fail '安装包缺少插件文件'
         rel=${path#"$PKG/"}
         mkdir -p "$STAGE/new/${rel%/*}" || fail '无法准备文件目录'
@@ -193,10 +197,13 @@ prepare_files() {
     done
     mkdir -p "$STAGE/new/bin" "$STAGE/new/tailscale" || fail '无法准备安装目录'
     cp -p "$PAYLOAD/tsks-helper" "$STAGE/new/bin/tsks-helper" &&
-        cp -p "$PKG/uninstall.sh" "$STAGE/new/scripts/uninstall_tailscale.sh" &&
+        cp -p "$PKG/uninstall.sh" "$STAGE/new/scripts/uninstall_$MODULE.sh" &&
         cp "$PKG/release.pub" "$STAGE/new/tailscale/release.pub" || fail '无法准备管理文件'
     ln -s ../tailscale/current/tailscale "$STAGE/new/bin/tailscale" && ln -s ../tailscale/current/tailscaled "$STAGE/new/bin/tailscaled" || fail '无法准备命令链接'
-    printf '%s\n' bin/tsks-helper bin/tailscale bin/tailscaled bin/tailscale.combined scripts/uninstall_tailscale.sh tailscale/release.pub tailscale/current >>"$STAGE/files"
+    printf '%s\n' bin/tsks-helper bin/tailscale bin/tailscaled "scripts/uninstall_$MODULE.sh" tailscale/release.pub tailscale/current >>"$STAGE/files"
+    # Retired files have no replacement: the legacy core location and the page,
+    # icon and uninstaller of the former software-center identity.
+    printf '%s\n' bin/tailscale.combined scripts/uninstall_tailscale.sh webs/Module_tailscale.asp res/icon-tailscale.png >>"$STAGE/files"
     chmod 755 "$STAGE/new/bin/tsks-helper" "$STAGE/new/scripts/"* "$STAGE/new/init.d/"*
     chmod 644 "$STAGE/new/webs/"* "$STAGE/new/res/"* "$STAGE/new/tailscale/release.pub"
     while IFS= read -r rel; do
@@ -206,8 +213,12 @@ prepare_files() {
             mkdir -p "$STAGE/backup/${rel%/*}" && cp -a "$path" "$STAGE/backup/$rel" || fail '无法备份现有文件'
         fi
     done <"$STAGE/files"
-    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_accept_dns tailscale_custom_routes_enable tailscale_custom_routes tailscale_app_connector tailscale_version softcenter_module_tailscale_version softcenter_module_tailscale_install softcenter_module_tailscale_name softcenter_module_tailscale_title softcenter_module_tailscale_description; do
+    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_accept_dns tailscale_custom_routes_enable tailscale_custom_routes tailscale_app_connector tailscale_version; do
         dbus get "$key" >"$STAGE/dbus/$key" || fail '无法备份插件设置'
+    done
+    for key in version install name title description author md5; do
+        dbus get "softcenter_module_${MODULE}_$key" >"$STAGE/dbus/softcenter_module_${MODULE}_$key" &&
+            dbus get "softcenter_module_tailscale_$key" >"$STAGE/dbus/softcenter_module_tailscale_$key" || fail '无法备份插件设置'
     done
 }
 
@@ -352,8 +363,8 @@ while IFS= read -r rel; do
     [ "$rel" = tailscale/current ] && continue
     if [ -e "$STAGE/new/$rel" ] || [ -L "$STAGE/new/$rel" ]; then
         mv -f "$STAGE/new/$rel" "$KSROOT/$rel" || fail '无法替换插件文件'
-    elif [ "$rel" = bin/tailscale.combined ]; then
-        rm -f "$KSROOT/$rel" || fail '无法迁移旧核心文件'
+    else
+        rm -f "$KSROOT/$rel" || fail '无法移除旧版文件'
     fi
 done <"$STAGE/files"
 "$VERIFIED_HELPER" atomic-link "$SELECTED" "$DATA/current" || fail '无法切换核心链接'
@@ -364,8 +375,14 @@ done
 HELPER=$KSROOT/bin/tsks-helper
 ts_start || fail '服务就绪检查失败'
 # Registration follows successful readiness, including disabled fresh installs.
-for pair in tailscale_version=3.3.0 softcenter_module_tailscale_version=3.3.0 softcenter_module_tailscale_install=1 softcenter_module_tailscale_name=tailscale softcenter_module_tailscale_title=Tailscale 'softcenter_module_tailscale_description=连接 Tailscale 网络，共享局域网和互联网出口'; do
+for pair in tailscale_version=3.4.0 version=3.4.0 install=1 "name=$MODULE" title=Tailscale 'description=连接 Tailscale 网络，共享局域网和互联网出口' 'author=ThetaPilla, sadog'; do
+    case $pair in tailscale_version=*) ;; *) pair=softcenter_module_${MODULE}_$pair;; esac
     dbus set "$pair" || fail '无法注册插件'
 done
+# The former identity must not remain: the software center would list it as an
+# installed marketplace plugin and offer the marketplace version as its update.
+for key in version install name title description author md5; do
+    [ -z "$(dbus get "softcenter_module_tailscale_$key")" ] || dbus remove "softcenter_module_tailscale_$key" || fail '无法移除旧的软件中心登记'
+done
 COMMITTED=1
-say "Tailscale 3.3.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"
+say "Tailscale 3.4.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"

@@ -21,10 +21,11 @@
 | 恢复次数记录 | `/koolshare/configs/tailscale/watchdog-ledger` |
 | 运行目录 | `/tmp/tailscale3`，下文记为 `RUN` |
 | LocalAPI socket | `RUN/tailscaled.sock` |
-| 生命周期锁 | `RUN/operation.lock`，使用非阻塞 `flock` |
+| 生命周期锁 | `RUN/operation.lock`，使用非阻塞 `flock`；固件发起的生命周期请求按秒轮询等待 |
 | 辅助程序 | `/koolshare/bin/tsks-helper` |
 | 发布公钥 | `DATA/release.pub` |
-| 前端 | `/koolshare/webs/Module_tailscale.asp` 与 `/koolshare/res/tailscale3.js` |
+| 前端 | `/koolshare/webs/Module_tailscaleks.asp` 与 `/koolshare/res/tailscale3.js` |
+| 软件中心模块名 | `tailscaleks`；登记键为 `softcenter_module_tailscaleks_<字段>` |
 | 公开任务结果 | `/tmp/upload/tailscale3_<job-id>.json` 和 `.log`，浏览器通过 `/_temp/` 读取 |
 
 每个核心目录包含 `tailscale.combined`、`descriptor.json`，以及名为 `tailscale` 和 `tailscaled` 的相对入口链接。公开任务目录只存放状态和经过脱敏的日志；身份文件、核心事务快照和密钥保存在私有目录。
@@ -40,7 +41,7 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 | `tailscale_status` | 无 | 连接详情任务 |
 | `tailscale_tsnets` | `1` | 接口地址与流量 |
 | `tailscale_ncheck` | 无 | 网络检查任务 |
-| `tailscale_core` | `check`、`update`、`rollback` | 核心管理任务 |
+| `tailscale_core` | `check`、`update [0\|1]`、`rollback`、`cleanup` | 核心管理任务 |
 | `tailscale_job` | 任务 ID | 查询已有任务 |
 | `tailscale_diagnostics` | 无 | 诊断摘要任务 |
 
@@ -51,6 +52,8 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 ```
 
 锁冲突返回 `{"accepted":false,"error":"busy"}`。响应丢失时，前端先按原任务 ID 查询结果，避免重复提交变更。
+
+固件的 WAN 和 NAT 钩子各自在后台运行，可能同时进入插件，而且没有调用方重试。不带请求 ID 的 `start`、`stop`、`restart` 在锁被占用时每秒重试取锁，最长 120 秒，取得后记录等待时长；超时返回 `busy` 并写入固件系统日志。带请求 ID 的页面请求仍立即返回 `busy`。`start_nat` 不等待：它留下 `RUN/nat-pending`，由下一次每分钟维护补做。固件发起的生命周期请求最终失败时（包括未完成的核心事务未能恢复而没有执行），以 `tailscale-plugin` 标签写入固件系统日志，供重启后排查。
 
 脚本回复统一经过 `ts_reply`。软件中心的 httpdb 会把回调正文直接放入外层 JSON 的字符串字段，因此回传前必须进行 JSON 字符串转义，并去掉转义结果最外层的引号。回调使用 `POST /_resp/<请求 ID>`，由辅助程序完成转义，curl 以二进制正文发送，保留换行、反斜杠和 Unicode 的编码。
 
@@ -73,7 +76,7 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 `core_version` 是用于展示和发布版本比较的版本号；LocalAPI 不可用时回退到已安装描述符中的版本。`core_version_long` 保留 daemon 上报的完整版本字符串，用于诊断；尚未取得 LocalAPI 版本时为空字符串。版本规范化规则见下文辅助程序接口。
 
-`core` 还包含 `installed_build`、`available_build`、`update_available`、`previous` 和 `previous_build`。构建号来自对应描述符，可以是 `rN`、`legacy` 或空字符串。`update_available` 仅在存在有效更新结果且目标 `cores/<version>-<build>-<arch>` 与当前指针不同时为 `true`，与更新事务的目标判断一致。页面只在运行版本与已安装版本相符时附上已安装构建号。
+`core` 还包含 `installed_build`、`available_build`、`update_available`、`previous`、`previous_build`、`can_cleanup` 和 `keep_previous`。`can_cleanup` 表示核心目录中存在当前核心以外的条目；`keep_previous` 是已保存的旧核心保留选择，未设置或值无效时为 `true`。构建号来自对应描述符，可以是 `rN`、`legacy` 或空字符串。`update_available` 仅在存在有效更新结果且目标 `cores/<version>-<build>-<arch>` 与当前指针不同时为 `true`，与更新事务的目标判断一致。页面只在运行版本与已安装版本相符时附上已安装构建号。
 
 接口流量响应为 `{"interfaces":[{"if":"tailscale0","ip":"...","rx":0,"tx":0}]}`。`rx`、`tx` 为字节计数。连接详情任务通过有时间上限的 CLI 调用生成状态文本，并经日志脱敏后显示。
 
@@ -104,6 +107,24 @@ httpdb 将请求 ID 放在脚本参数 `$1`，方法参数从 `$2` 开始。支�
 
 IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则。插件负责的非默认条目由启用的本机 LAN 网段和启用的自定义列表合并、保序去重；两者均关闭时该部分为空。LAN 加 32 个独立自定义网段可合并为 33 条，出口节点默认路由由独立选项控制。Tailscale 自身的 netfilter 保持启用；自定义网段复用现有转发和 NAT 路径。插件 NAT 链放在既有 Fullcone 等 POSTROUTING 钩子之后。
 
+## 防火墙规则维护
+
+| 术语 | 含义 |
+| --- | --- |
+| 固件重建 | 固件用 `iptables-restore` 整表替换 filter 或 nat 表，表内原有规则和自定义链全部消失 |
+| NAT 事件 | 固件应用 nat 表后调用的 `start_nat`；它在同一轮重建替换 filter 表之前就可能运行 |
+| 插件规则 | 插件创建的 `TSKS_*` 链及其在内置链上的跳转 |
+| daemon 规则 | tailscaled 创建的 `ts-input`、`ts-forward`、`ts-postrouting` 链及跳转；tailscaled 只在首次配置路由时安装，被清除后不会重装 |
+| 规则列表 | `iptables -t filter -S` 与 `iptables -t nat -S` 的成功输出 |
+
+插件以规则列表为准判断规则是否存在，不依赖事件顺序。列表命令失败或超时视为未知，本轮不做判断。只检查 IPv4：固件在同一轮重建中处理 IPv6 的 filter 表，重新应用时两个地址族一并处理。
+
+每分钟维护在取得状态采样后读取规则列表。daemon 规则的三个跳转（`INPUT`→`ts-input`、`FORWARD`→`ts-forward`、nat `POSTROUTING`→`ts-postrouting`）任一缺失，且后端状态为 `Running`、主 WAN 已连接时，以自动启动方式重启服务，由 tailscaled 重新安装。重启沿用持久化的连接意图，不消耗自动恢复限额，也不受自动恢复开关影响。`RUN/netfilter-repairs` 记录连续重启次数：看到三个跳转齐全时清零，取得操作锁的 `start`、`stop`、`restart`、`web_submit` 和 `start_nat` 也会清零，因锁被占用而推迟的 NAT 事件在补做时清零一次；达到 3 次后停止重启并记录一次日志。每次重启前先写入并读回计数，无法记录时不重启。其他后端状态下 tailscaled 尚未安装规则，不视为丢失；WAN 未连接时重启会让 daemon 失去网络映射，因此推迟。
+
+插件规则在以下任一情况下重新应用：Tailscale 地址与上次成功应用时不同，存在 `RUN/nat-pending`，或规则列表中缺少插件跳转。后两项不要求已取得 Tailscale 地址。
+
+`start_nat` 只重新应用插件规则，从不重启服务：固件在一轮重建中可能多次触发 NAT 事件，且事件可能早于 filter 表被替换，逐次重启会在规则仍被清除期间耗尽重启次数。daemon 规则由随后的每分钟维护恢复。新的重建可以解释新的丢失，因此 `start_nat` 清零 `RUN/netfilter-repairs`。
+
 ## 宣告列表归属
 
 | 术语 | 含义 |
@@ -128,7 +149,11 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则。插件负责的非�
 
 ## 核心事务与自动恢复
 
-更新依次执行签名校验、资源预检、下载解包、原子指针切换和本地健康检查。`DATA/update.txn` 记录事务阶段，`DATA/update.state` 保存切换前的身份快照。成功切换记录上一核心；失败时尝试恢复原指针和状态。显式生命周期或核心操作先恢复未完成事务；自动恢复任务遇到未完成事务时跳过，安装与卸载则拒绝继续。
+`tailscale_core update` 可带一个参数 `0` 或 `1`，表示更新后是否保留旧核心；参数在取锁前校验，受理后写入 `tailscale_core_keep_previous`，写入失败则不执行更新。不带参数时使用已保存的值，未设置或值无效时按保留处理。该键不属于配置快照，不经「应用设置」提交。
+
+更新依次执行签名校验、资源预检、下载解包、原子指针切换和本地健康检查。`DATA/update.txn` 记录事务阶段，`DATA/update.state` 保存切换前的身份快照。成功切换记录上一核心；失败时尝试恢复原指针和状态。事务提交并清除记录后才按保留选择删除核心：保留时删除 `current`、`previous` 都不指向的核心目录，不保留时另外删除 `previous` 及其目标。删除失败只写警告，更新结果仍为成功。
+
+`cleanup` 删除 `DATA/cores` 下除当前核心以外的全部条目并移除 `previous`。删除回退目标前先校验当前核心的哈希与版本，未通过则不删除。存在未完成事务或未持有锁时拒绝删除；只处理 `DATA/cores` 的直接子项，遇到符号链接只删除链接本身。资源预检空间不足时按同一规则先删除无指针指向的核心，仍不足再删除上一核心。显式生命周期或核心操作先恢复未完成事务；自动恢复任务遇到未完成事务时跳过，安装与卸载则拒绝继续。
 
 核心切换后的自检比较规范化后的发布版本，带源码提交后缀时另核对签名描述符中的源码提交前缀。自检对本地接口和设备信息的短暂不可用进行有限重试；已授权设备重新要求登录、已知身份改变、版本或源码不符仍判定失败。控制面尚未同步设备 ID，但原节点密钥仍存在且本地生命周期为 `Starting` 或 `Running` 时，可以完成切换并等待后续同步。
 
@@ -157,7 +182,7 @@ IPv4/IPv6 开关控制外层 UDP 41641 的防火墙规则。插件负责的非�
 | `routes-wire ENCODED` | 严格解码 `b64.` + 无填充 base64url UTF-8 数据，再执行相同网段校验 |
 | `routes-plan SOCKET LIST EXIT CONNECTOR` | 读取偏好及按需读取学习记录，按归属规则输出 `keep` 或 `set<TAB>非默认条目列表`；失败退出 1 并输出固定英文原因 |
 | `appc-prime SOCKET` | 查询分配给本机的精确域名并等待学习，输出分配、查询、学习计数及拒绝标志；本地读取错误退出 1，部分查询失败返回统计 |
-| `fetch URL DEST MAX_BYTES` | 有大小和时间上限的 HTTPS 下载，仅接受允许的发布及 CDN 主机 |
+| `fetch URL DEST MAX_BYTES` | 有大小和时间上限的 HTTPS 下载，仅接受允许的发布、CDN 及镜像主机；发布地址失败后改用镜像，由镜像完成时输出 `mirror` |
 | `verify ENVELOPE PUBKEY ARCH` | 校验签名与清单，输出所选架构的扁平描述符 |
 | `extract ARCHIVE DESCRIPTOR DEST` | 校验归档与核心哈希、大小、结构及 ELF 架构，安全解包 |
 | `keygen PRIVATE_FILE PUBLIC_FILE` | 生成十六进制 Ed25519 密钥文件，供构建主机使用 |
@@ -203,14 +228,30 @@ https://github.com/thetapilla/tailscale-koolshare/releases/download/core-v<VERSI
 
 核心配方包含 `ts_omit_clientupdate`，从编译期移除内置更新入口。版本发现和核心替换由插件的签名通道负责。
 
+## 下载镜像
+
+| 术语 | 含义 |
+| --- | --- |
+| 发布地址 | `https://github.com/thetapilla/tailscale-koolshare/releases/download/` 下的文件 |
+| 镜像 | `https://tscore.thetapilla.xyz/`，按发布地址之后的相对路径保存同一文件的副本 |
+| 稳定清单 | `core-stable/manifest.json`，签名的更新清单 |
+
+镜像只是第二条下载线路，不参与信任：清单的签名和归档的哈希仍由插件按公钥校验，镜像内容被替换只会导致更新失败。镜像只接受稳定清单和 `core-v<VERSION>-<BUILD>/tailscale-core_<VERSION>_<BUILD>_<ARCH>.tar.gz` 两类路径，不接受查询参数、端口和重定向；清单中签名的下载地址仍是发布地址。
+
+`fetch` 先请求发布地址，允许重定向到 GitHub 的资源主机，总时限 180 秒。连接失败、状态码不是 200、超出大小上限、30 秒没有收到数据或超过总时限时，改为请求镜像，总时限 480 秒，同样在 30 秒没有数据时放弃。两处都失败时返回两处的原因，目标文件不写入。请求的 `User-Agent` 为 `tsks-helper`。
+
+核心发布工作流的 `mirror` 任务在稳定清单更新后运行 `tools/mirror_core.py`：验证清单签名，按清单核对每个归档的大小和 SHA-256，先上传归档、最后上传清单，因此镜像上的清单不会指向尚未上传的归档。归档以不可变缓存策略保存，清单要求每次重新验证。已存在且大小相符的归档不重复上传。
+
 ## 插件包约定
 
 `tools/bundled_core.json` 独立指定安装包预装的核心版本和构建号。`prepare_bundle.py` 从对应不可变核心 Release 读取原签名清单和两个架构归档，验证签名、哈希、结构、架构及共同来源后导入打包输入。插件打包复用原签名封装，不重新签名核心；安装器升级时仍优先保留已有有效核心。
 
-安装包只有一个 `tailscale/` 根目录，包含插件文件、版本、公钥、签名核心清单、`manifest.sha256` 和 `payload/<arch>/`。每个架构 payload 包含核心、辅助程序和描述符。通用包包含两种架构及五个平台标记，平台包仅含相应架构，安装器只安装所选架构。
+安装包只有一个 `tailscaleks/` 根目录，包含插件文件、版本、公钥、签名核心清单、`manifest.sha256` 和 `payload/<arch>/`。每个架构 payload 包含核心、辅助程序和描述符。通用包包含两种架构及五个平台标记，平台包仅含相应架构，安装器只安装所选架构。
+
+软件中心以模块名对应已安装插件与在线目录，并按 `_` 拆分登记键，因此模块名不含下划线和连字符，且必须与安装包根目录、`webs/Module_<模块名>.asp`、`res/icon-<模块名>.png` 和 `scripts/uninstall_<模块名>.sh` 一致。3.3.0 及更早版本使用插件市场原版的模块名 `tailscale`；安装器把旧登记键和旧文件列入事务，成功后移除，失败时恢复。设置键（`tailscale_*`）、`DATA`、设备身份和脚本文件名不随模块名改变。登记字段为 `version`、`install`、`name`、`title`、`description` 和 `author`。
 
 安装器先检查清单路径和目录中的链接，再选择本机辅助程序。执行辅助程序前，使用固件的 `sha256sum` 或 OpenSSL 核对该程序的清单摘要；两者均不可用时停止安装。通过引导校验后，由辅助程序验证整个安装目录，再加载后台库。核心安装、更新及回滚的 SHA-256 校验直接使用辅助程序。
 
 升级失败恢复旧版本时，安装器还原文件、DBus 和身份快照，再直接从还原的 state 启动旧 daemon。此阶段不重新应用候选版托管偏好、不请求连接或登录；就绪检查通过后恢复定时任务及网络规则。状态存储错误或未能确认就绪时保留安装备份并报告失败。
 
-平台对应关系为 `hnd`、`qca`、`ipq32` → `arm`；`ipq64`、`mtk` → `arm64`。规范输出目录为仓库相邻的 `../dist/`，文件名为 `tailscale_<VERSION>_<PLATFORM>.tar.gz`，共六个安装包及 `SHA256SUMS`。包内版本在归档前写入；页面的脚本 URL 附带内容哈希，同版本替换脚本后也会更新浏览器缓存标识。文件排序、权限、所有者及时间戳统一规范化。
+平台对应关系为 `hnd`、`qca`、`ipq32` → `arm`；`ipq64`、`mtk` → `arm64`。规范输出目录为仓库相邻的 `../dist/`，文件名为 `tailscaleks_<VERSION>_<PLATFORM>.tar.gz`，共六个安装包及 `SHA256SUMS`。包内版本在归档前写入；页面的脚本 URL 附带内容哈希，同版本替换脚本后也会更新浏览器缓存标识。文件排序、权限、所有者及时间戳统一规范化。

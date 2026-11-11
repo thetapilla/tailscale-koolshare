@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const create = require('../plugin/res/tailscale3.js');
-const html = fs.readFileSync(path.join(__dirname, '../plugin/webs/Module_tailscale.asp'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '../plugin/webs/Module_tailscaleks.asp'), 'utf8');
 const wire = value => 'b64.' + Buffer.from(value, 'utf8').toString('base64url');
 const source = fs.readFileSync(path.join(__dirname, '../plugin/res/tailscale3.js'), 'utf8');
 
@@ -61,7 +61,7 @@ function harness(initialStorage = {}) {
     function status(extra = {}) { return { schema: 1, enabled: true, plugin_version: '3.0.0', core_version: '1.102.4', backend_state: 'Running', online: true,
         health_codes: [], health_messages: [], auth_url: '', monitoring_available: true,
         app_connector: { advertise: false, tags: [], assigned_domains: [], learned: {}, error: '' },
-        watchdog: { enabled: true, last_recovery: '', count_24h: 0 }, core: { installed: '1.102.4', available: '1.104.0', update_available: true, can_rollback: true }, ...extra }; }
+        watchdog: { enabled: true, last_recovery: '', count_24h: 0 }, core: { installed: '1.102.4', available: '1.104.0', update_available: true, can_rollback: true, can_cleanup: true, keep_previous: true }, ...extra }; }
     function boot() {
         app.init();
         reply(next(), [{ tailscale_enable: '1', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1', tailscale_watchdog_enable: '1' }], true);
@@ -217,7 +217,7 @@ test('slow repeated config and status failures cannot starve interface polling',
 test('ACK is not success; one task locks every toggle and action until its matching terminal state', () => {
     const h = harness(); h.boot(); h.click('core_update');
     const write = h.next('tailscale_core');
-    assert.deepEqual(write.body.params, ['update']);
+    assert.deepEqual(write.body.params, ['update', '1']);
     assert.equal(h.confirmations.length, 1);
     for (const id of ['tailscale_enable', 'tailscale_watchdog_enable', 'apply_settings', 'core_check', 'core_update', 'run_netcheck']) { assert.equal(h.nodes[id].disabled, true); }
     h.accept(write, true);
@@ -922,4 +922,65 @@ test('connector state uses lifecycle progress for expected startup API gaps and 
     assert.equal(h.nodes.app_connector_status.textContent, '等待操作完成');
     h.finishJob(reach(h, 'tailscale_job'), 'failed');
     assert.equal(h.nodes.app_connector_status.textContent, '无法读取应用连接器状态');
+});
+
+test('core management offers a cleanup action and a retention choice outside the settings snapshot', () => {
+    assert.match(html, /id="core_cleanup"[^>]*value="清理旧版核心"/);
+    assert.match(html, /<label for="core_keep_previous">更新时保留旧核心<\/label>/);
+    // Unknown until the first status arrives, the page must not default to deleting.
+    assert.match(html, /id="core_keep_previous" type="checkbox" checked="checked"/);
+    const h = harness(); h.boot();
+    assert.equal(h.nodes.core_keep_previous.checked, true);
+    assert.equal(h.nodes.core_keep_previous.disabled, false);
+    h.change('core_keep_previous', false);
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
+    h.click('apply_settings');
+    assert.equal(h.next('tailscale_config').body.params[1].length, 10);
+});
+
+test('an update carries the retention choice, warns before deleting, and then shows the saved value', () => {
+    const h = harness(); h.boot();
+    h.change('core_keep_previous', false);
+    // A status read must not undo a choice the user has not submitted yet.
+    h.reply(reach(h, 'tailscale_fettle'), h.status());
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    h.click('core_update');
+    assert.match(h.confirmations[0], /更新成功后将删除旧核心，之后无法回退。是否继续？$/);
+    const write = h.next('tailscale_core');
+    assert.deepEqual(write.body.params, ['update', '0']);
+    assert.deepEqual(write.body.fields, {});
+    assert.equal(h.nodes.core_keep_previous.disabled, true);
+    h.accept(write);
+    h.finishJob(reach(h, 'tailscale_job'), 'success');
+    const saved = { ...h.status().core, keep_previous: false, can_rollback: false, can_cleanup: false };
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: saved })); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(h.nodes.core_cleanup.disabled, true);
+    // Once saved, the page follows the backend again.
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...saved, keep_previous: true } })); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, true);
+    const kept = harness(); kept.boot(); kept.click('core_update');
+    assert.doesNotMatch(kept.confirmations[0], /删除旧核心/);
+});
+
+test('cleanup is confirmed, runs as one core task, and is unavailable when nothing can be removed', () => {
+    const h = harness(); h.boot();
+    h.click('core_cleanup');
+    assert.match(h.confirmations[0], /将删除当前核心以外的所有旧版核心，之后无法回退/);
+    const write = h.next('tailscale_core');
+    assert.deepEqual(write.body.params, ['cleanup']);
+    assert.equal(h.nodes.job_title.textContent, '清理旧版核心');
+    for (const id of ['core_cleanup', 'core_update', 'core_keep_previous', 'apply_settings']) { assert.equal(h.nodes[id].disabled, true); }
+    h.accept(write);
+    h.finishJob(reach(h, 'tailscale_job'), 'success');
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...h.status().core, can_rollback: false, can_cleanup: false } })); h.advance();
+    assert.equal(h.nodes.core_cleanup.disabled, true);
+    assert.equal(h.nodes.core_rollback.disabled, true);
+    assert.equal(h.nodes.core_update.disabled, false);
+    for (const core of [{ ...h.status().core, can_cleanup: undefined }, { ...h.status().core, can_cleanup: 'true' }]) {
+        const other = harness(); other.app.init(); other.reply(other.next(), [{}]);
+        other.reply(other.next('tailscale_fettle'), other.status({ core })); other.advance();
+        assert.equal(other.nodes.core_cleanup.disabled, true);
+    }
 });

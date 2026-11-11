@@ -13,6 +13,8 @@ from pathlib import Path
 import subprocess
 import uuid
 
+from artifact_utils import MODULE
+
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
 PLATFORMS = {"hnd": "arm", "qca": "arm", "ipq32": "arm", "ipq64": "arm64", "mtk": "arm64"}
@@ -33,7 +35,7 @@ def main():
     version = (ROOT / "VERSION").read_text().strip()
     selected = list(PLATFORMS) if args.platform == "all" else [args.platform]
     for name in ["universal", *selected]:
-        archive = dist / f"tailscale_{version}_{name}.tar.gz"
+        archive = dist / f"{MODULE}_{version}_{name}.tar.gz"
         if not archive.is_file():
             parser.error(f"missing release archive: {archive}")
     for arch in ("arm64", "arm"):

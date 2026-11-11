@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -25,6 +26,20 @@ import (
 
 const maxCore int64 = 12 * 1024 * 1024
 const maxArchive int64 = 13 * 1024 * 1024
+
+// Release downloads come from GitHub. The mirror holds copies under the same
+// relative path and is not trusted: the signed feed and the hashes it carries
+// still decide what is accepted, so the mirror can only fail, never forge.
+const releasePrefix = "https://github.com/thetapilla/tailscale-koolshare/releases/download/"
+const mirrorHost = "tscore.thetapilla.xyz"
+
+var mirrorPath = regexp.MustCompile(`^/(core-stable/manifest\.json|core-v[0-9]+\.[0-9]+\.[0-9]+-r[1-9][0-9]{0,5}/tailscale-core_[0-9]+\.[0-9]+\.[0-9]+_r[1-9][0-9]{0,5}_(arm|arm64)\.tar\.gz)$`)
+
+// A source that stops sending is abandoned after downloadIdle so the next one
+// gets its turn. The mirror is slower from some networks and has longer in total.
+const downloadIdle = 30 * time.Second
+const releaseTotal = 180 * time.Second
+const mirrorTotal = 480 * time.Second
 
 var versionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 var buildRE = regexp.MustCompile(`^r[1-9][0-9]{0,5}$`)
@@ -235,24 +250,102 @@ func trustedURL(s string, redirect bool) bool {
 		return strings.HasPrefix(u.Path, "/thetapilla/tailscale-koolshare/releases/download/")
 	case "release-assets.githubusercontent.com", "objects.githubusercontent.com":
 		return redirect
+	case mirrorHost:
+		// Only the published files, requested directly.
+		return !redirect && u.RawQuery == "" && u.RawPath == "" && mirrorPath.MatchString(u.Path)
 	}
 	return false
 }
+
+// mirrorURL returns the mirror copy of a release download, or "" when the
+// mirror does not carry that file.
+func mirrorURL(src string) string {
+	if !strings.HasPrefix(src, releasePrefix) {
+		return ""
+	}
+	m := "https://" + mirrorHost + "/" + src[len(releasePrefix):]
+	if !trustedURL(m, false) {
+		return ""
+	}
+	return m
+}
+
+type source struct {
+	url      string
+	redirect func(*http.Request, []*http.Request) error
+	total    time.Duration
+}
+
+func releaseRedirect(r *http.Request, via []*http.Request) error {
+	if len(via) > 5 || !trustedURL(r.URL.String(), true) {
+		return errors.New("redirect not allowed")
+	}
+	return nil
+}
+func noRedirect(*http.Request, []*http.Request) error { return errors.New("redirect not allowed") }
+
+// fetch downloads a release file, falling back to the mirror when GitHub fails.
+// It prints "mirror" when the mirror supplied the file.
 func fetch(src, dest string, limit int64) error {
 	if !trustedURL(src, false) {
 		return errors.New("download URL not allowed")
 	}
-	c := &http.Client{Timeout: 180 * time.Second, CheckRedirect: func(r *http.Request, v []*http.Request) error {
-		if len(v) > 5 || !trustedURL(r.URL.String(), true) {
-			return errors.New("redirect not allowed")
+	sources := []source{{src, releaseRedirect, releaseTotal}}
+	if m := mirrorURL(src); m != "" {
+		sources = append(sources, source{m, noRedirect, mirrorTotal})
+	}
+	used, e := fetchFrom(sources, dest, limit, downloadIdle)
+	if e == nil && used > 0 {
+		fmt.Println("mirror")
+	}
+	return e
+}
+
+// fetchFrom stores the first complete download and reports which source gave it.
+func fetchFrom(sources []source, dest string, limit int64, idle time.Duration) (int, error) {
+	var failures []string
+	for i, s := range sources {
+		e := download(s, dest, limit, idle)
+		if e == nil {
+			return i, nil
 		}
-		return nil
-	}}
-	r, e := c.Get(src)
+		failures = append(failures, e.Error())
+	}
+	return -1, errors.New(strings.Join(failures, "; then: "))
+}
+
+// progress postpones the stall timer whenever the body delivers data.
+type progress struct {
+	body  io.Reader
+	stall *time.Timer
+	idle  time.Duration
+}
+
+func (p *progress) Read(b []byte) (int, error) {
+	n, e := p.body.Read(b)
+	if n > 0 {
+		p.stall.Reset(p.idle)
+	}
+	return n, e
+}
+
+func download(s source, dest string, limit int64, idle time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.total)
+	defer cancel()
+	stall := time.AfterFunc(idle, cancel)
+	defer stall.Stop()
+	req, e := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 	if e != nil {
 		return e
 	}
+	req.Header.Set("User-Agent", "tsks-helper")
+	c := &http.Client{CheckRedirect: s.redirect}
+	r, e := c.Do(req)
+	if e != nil {
+		return downloadError(ctx, e)
+	}
 	defer r.Body.Close()
+	stall.Reset(idle)
 	if r.StatusCode != 200 {
 		return fmt.Errorf("download HTTP %d", r.StatusCode)
 	}
@@ -265,7 +358,7 @@ func fetch(src, dest string, limit int64) error {
 	}
 	name := f.Name()
 	defer os.Remove(name)
-	n, e := io.Copy(f, io.LimitReader(r.Body, limit+1))
+	n, e := io.Copy(f, io.LimitReader(&progress{r.Body, stall, idle}, limit+1))
 	if e == nil && n > limit {
 		e = errors.New("download limit exceeded")
 	}
@@ -274,12 +367,23 @@ func fetch(src, dest string, limit int64) error {
 	}
 	closeErr := f.Close()
 	if e != nil {
-		return e
+		return downloadError(ctx, e)
 	}
 	if closeErr != nil {
 		return closeErr
 	}
 	return os.Rename(name, dest)
+}
+
+// downloadError names the timer that ended a transfer instead of "context canceled".
+func downloadError(ctx context.Context, e error) error {
+	switch ctx.Err() {
+	case context.Canceled:
+		return errors.New("download stalled")
+	case context.DeadlineExceeded:
+		return errors.New("download timed out")
+	}
+	return e
 }
 func extract(src, meta, dest string) error {
 	b, e := readLimited(meta, 65536)

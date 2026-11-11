@@ -27,7 +27,7 @@ if (!['127.0.0.1', 'localhost', '[::1]'].includes(upstream.hostname)) {
     throw new Error('The test backend must be a loopback address');
 }
 const jquery = fs.readFileSync(path.join(firmware, 'www/js/jquery.js'));
-const html = fs.readFileSync(path.join(plugin, 'webs/Module_tailscale.asp'), 'utf8')
+const html = fs.readFileSync(path.join(plugin, 'webs/Module_tailscaleks.asp'), 'utf8')
     .replace(/<%\s*nvram_get\("sc_skin"\);\s*%>/g, 'ASUSWRT');
 // A minimal Shell/httpdb export is insufficient for visual interaction tests.
 // Missing styles can hide the switch while still allowing JavaScript tests to run.
@@ -143,7 +143,7 @@ const server = http.createServer((req, res) => {
         return;
     }
     let data = '', contentType = 'application/javascript';
-    if (url.pathname === '/' || url.pathname === '/Module_tailscale.asp') { data = html; contentType = 'text/html; charset=utf-8'; }
+    if (url.pathname === '/' || url.pathname === '/Module_tailscaleks.asp') { data = html; contentType = 'text/html; charset=utf-8'; }
     else if (url.pathname === '/js/jquery.js') { data = jquery; }
     else if (url.pathname === '/res/tailscale3.js') { data = fs.readFileSync(path.join(plugin, 'res/tailscale3.js')); }
     else if (url.pathname === '/res/softcenter.js') { data = fs.readFileSync(path.join(firmware, 'rom/etc/koolshare/res/softcenter.js')); }
@@ -166,7 +166,7 @@ const server = http.createServer((req, res) => {
 
 (async () => {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const url = 'http://127.0.0.1:' + server.address().port + '/Module_tailscale.asp';
+    const url = 'http://127.0.0.1:' + server.address().port + '/Module_tailscaleks.asp';
     const browser = await chromium.launch({ headless: true, executablePath: option('--chromium') });
     const context = await browser.newContext();
     await context.route('**/*', route => {

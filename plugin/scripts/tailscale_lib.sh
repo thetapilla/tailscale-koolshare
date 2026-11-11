@@ -80,6 +80,24 @@ ts_unlock() {
     exec 9>&-
     TS_LOCKED=0
 }
+# BusyBox flock cannot bound a blocking wait, so poll the non-blocking lock.
+ts_lock_wait() {
+    local remaining=$1
+    TS_LOCK_WAITED=0
+    while ! ts_lock; do
+        [ "$remaining" -gt 0 ] || return 1
+        sleep 1
+        remaining=$((remaining - 1))
+        TS_LOCK_WAITED=$((TS_LOCK_WAITED + 1))
+    done
+}
+
+# RUN is cleared by the reboot whose startup needs explaining. The firmware log
+# is the only record of a firmware-triggered operation that survives it.
+ts_syslog() {
+    which logger >/dev/null 2>&1 || return 0
+    logger -t tailscale-plugin "$1" || :
+}
 
 ts_reply() {
     if [ -n "${ID:-}" ]; then
@@ -194,7 +212,7 @@ ts_routes_validate() {
     IFS="$(printf '\t')" read -r index entry reason <"$error_file"
     rm -f "$error_file"
     case $index in ''|*[!0-9]*) ROUTES_DETAIL='无法校验网段，请检查插件文件是否完整';;
-        *) ROUTES_DETAIL="$index $entry：$reason";; esac
+        *) ROUTES_DETAIL="$index ${entry}：$reason";; esac
     return 1
 }
 
@@ -389,6 +407,8 @@ ts_firewall_apply() {
     local binary allowed tailip index status_source=${1:-}
     # Consume only events that precede this refresh. A concurrent NAT event
     # leaves a new marker for the next minute task while fd9 is held here.
+    # Replaying a deferred event renews the rule repairs like handling one.
+    [ ! -f "$RUN/nat-pending" ] || rm -f "$RUN/netfilter-repairs"
     rm -f "$RUN/nat-pending"
     # Only a fully successful apply may establish the address cache. A failed
     # refresh must be retried by maintenance even when addresses stay the same.
@@ -451,6 +471,67 @@ ts_firewall_remove() {
             ts_ipt "$binary" -t "$table" -X "$chain" 2>/dev/null || :
         done
     done
+}
+
+# The firmware replaces whole tables when it rebuilds its firewall, and its NAT
+# event may run before the filter table is replaced. Compare against the live
+# IPv4 rules instead of trusting event order; the firmware rebuilds IPv6 filter
+# rules in the same pass. A failed listing means unknown, never missing.
+ts_hooks_read() {
+    # Written to files: a command substitution would discard the cached result
+    # of the wait-option probe and repeat it for every listing.
+    ts_ipt iptables -t filter -S >"$RUN/rules-filter" 2>/dev/null &&
+        ts_ipt iptables -t nat -S >"$RUN/rules-nat" 2>/dev/null
+}
+ts_hook() { grep -Eq -e "^-A $2 -j $3[[:space:]]*\$" "$RUN/rules-$1"; }
+
+ts_plugin_hooks_present() {
+    ts_hook filter INPUT TSKS_INPUT && ts_hook filter OUTPUT TSKS_OUTPUT &&
+        ts_hook filter FORWARD TSKS_FORWARD || return 1
+    # The NAT chains exist only when the LAN subnet could be determined.
+    ts_lan || return 0
+    ts_hook nat POSTROUTING TSKS_POSTROUTING && ts_hook nat PREROUTING TSKS_PREROUTING
+}
+
+# tailscaled installs its ts-* chains when it first configures routing and never
+# re-adds them. Once the firmware clears them, inbound and forwarded tailnet
+# traffic is dropped while the control connection still reports healthy.
+# Call after ts_hooks_read. True only when the running daemon lost its rules.
+ts_netfilter_lost() {
+    [ "$(ts_get "$1" ok)" = true ] && [ "$(ts_get "$1" backend_state)" = Running ] || return 1
+    if ts_hook filter INPUT ts-input && ts_hook filter FORWARD ts-forward &&
+            ts_hook nat POSTROUTING ts-postrouting; then
+        rm -f "$RUN/netfilter-repairs"
+        return 1
+    fi
+    # A restarted daemon has no network map until it reaches the control plane.
+    # While the WAN is down, keep the map that still serves traffic inside the LAN.
+    ts_wan_connected
+}
+
+# Restarting is the supported way to make the daemon install its rules again.
+# Only the minute task does it: the firmware may raise several NAT events during
+# one rebuild, each before the filter table is replaced, and a restart per event
+# would spend every attempt while the rules are still being removed.
+# Returns 0 after a successful restart, 1 after a failed one and 2 when it gave
+# up: a daemon that never shows its rules must not be restarted every minute.
+ts_netfilter_repair() {
+    local count
+    count=$(cat "$RUN/netfilter-repairs" 2>/dev/null)
+    ts_uint "$count" || count=0
+    if [ "$count" -ge 3 ]; then
+        # Say it once: only a recorded notice is known not to repeat.
+        if [ "$count" = 3 ] && { printf '4\n' >"$RUN/netfilter-repairs"; } 2>/dev/null; then
+            ts_job_log 'Tailscale 自身的防火墙规则在连续 3 次重启后仍缺失，已停止自动修复；请生成诊断摘要并检查固件防火墙'
+        fi
+        return 2
+    fi
+    count=$((count + 1))
+    # Fail closed: an attempt that cannot be recorded would never reach the limit.
+    { printf '%s\n' "$count" >"$RUN/netfilter-repairs"; } 2>/dev/null &&
+        [ "$(cat "$RUN/netfilter-repairs" 2>/dev/null)" = "$count" ] || return 2
+    ts_job_log '固件重建防火墙后 Tailscale 自身的规则已丢失，正在重启服务以恢复'
+    ts_restart automatic || { ts_job_log '恢复 Tailscale 防火墙规则时服务重启失败，请查看诊断摘要'; return 1; }
 }
 
 ts_waiting_for_control() {
@@ -610,7 +691,7 @@ ts_start() {
     if [ "$APP_CONNECTOR" = 1 ] && { [ "$changed" = 1 ] || [ "$current_connector" = false ]; }; then
         ts_appc_prime
     fi
-    [ "$route_count" = 0 ] || ts_job_log "已宣告 $route_count 条网段：$routes；请在管理控制台批准"
+    [ "$route_count" = 0 ] || ts_job_log "已宣告 $route_count 条网段：${routes}；请在管理控制台批准"
 }
 
 # Self queries are best effort: DNS policy and control-plane propagation may
@@ -687,13 +768,18 @@ ts_watch_save() {
         mv -f "$RUN/watchdog-state.new" "$RUN/watchdog-state"
 }
 
-ts_wan_healthy() {
-    local primary connected link code
+ts_wan_connected() {
+    local primary connected link
     primary=$(nvram get wan_primary 2>/dev/null)
     case $primary in 0|1) ;; *) primary=0;; esac
     connected=$(nvram get "wan${primary}_state_t" 2>/dev/null)
     link=$(nvram get "wan${primary}_link" 2>/dev/null)
-    [ "$connected" = 2 ] && [ "$link" != 0 ] || return 1
+    [ "$connected" = 2 ] && [ "$link" != 0 ]
+}
+
+ts_wan_healthy() {
+    local code
+    ts_wan_connected || return 1
     # Requires a successful validated HTTPS response, not just carrier or ping.
     # /key is the public control-key endpoint (HTTPS 200), without credentials.
     code=$(curl --noproxy '*' -fsS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 8 \
@@ -733,17 +819,25 @@ ts_watch_confirm() {
     return 1
 }
 
-ts_address_maintenance() {
-    local sample=$1 ips applied
+# Keeps the plugin rules matching the daemon's addresses and the live tables,
+# independently of automatic service recovery. LISTED is 1 after ts_hooks_read.
+ts_firewall_maintenance() {
+    local sample=$1 listed=$2 ips applied reason=
     [ "$(ts_get "$sample" ok)" = true ] || return 0
-    ips=$(ts_get "$sample" ips) || return 0
-    case $ips in ''|'[]'|null) return 0;; esac
-    applied=$(ts_get "$RUN/firewall-status.json" ips) || applied=
-    [ "$ips" != "$applied" ] || [ -f "$RUN/nat-pending" ] || return 0
-    # This completes normal address-dependent setup after login or an address
-    # change, independently of automatic service recovery. Reuse the sample.
+    ips=$(ts_get "$sample" ips) || ips=
+    case $ips in ''|'[]'|null) ;; *)
+        # This completes address-dependent setup after login or an address change.
+        applied=$(ts_get "$RUN/firewall-status.json" ips) || applied=
+        [ "$ips" = "$applied" ] || reason='已根据当前 Tailscale 地址刷新防火墙规则';;
+    esac
+    [ ! -f "$RUN/nat-pending" ] || [ -n "$reason" ] || reason='已在防火墙重建后刷新插件规则'
+    if [ -z "$reason" ] && [ "$listed" = 1 ] && ! ts_plugin_hooks_present; then
+        reason='插件防火墙规则已被固件重建清除，已重新应用'
+    fi
+    [ -n "$reason" ] || return 0
+    # Reuse the sample instead of issuing another LocalAPI request.
     ts_firewall_apply "$sample" || return 1
-    ts_job_log '已根据当前 Tailscale 地址刷新防火墙规则'
+    ts_job_log "$reason"
 }
 
 ts_watchdog_run() {
@@ -752,10 +846,16 @@ ts_watchdog_run() {
     [ ! -e "$DATA/update.txn" ] && [ ! -L "$DATA/update.txn" ] || return 0
     ts_config_read || return 1
     [ "$ENABLE" = 1 ] && [ ! -f "$RUN/manual-stop" ] || return 0
-    local sampled=0
+    local sampled=0 listed=0 repair
     if ts_status_file "$RUN/watchdog-status.json"; then
         sampled=1
-        ts_address_maintenance "$RUN/watchdog-status.json" || ts_job_log '根据当前地址刷新防火墙规则失败，将在后续检查中重试'
+        ! ts_hooks_read || listed=1
+        if [ "$listed" = 1 ] && ts_netfilter_lost "$RUN/watchdog-status.json"; then
+            ts_netfilter_repair; repair=$?
+            # The restart applied every rule again and made this sample stale.
+            [ "$repair" = 2 ] || return "$repair"
+        fi
+        ts_firewall_maintenance "$RUN/watchdog-status.json" "$listed" || ts_job_log '刷新防火墙规则失败，将在后续检查中重试'
     fi
     [ "$WATCHDOG" = 1 ] || return 0
     NOW=$(ts_now)
@@ -820,6 +920,7 @@ ts_status_json() {
     local auth= monitoring=false version= version_long= installed= available= rollback=false error= now statusok=false
     local routes='{"advertised":[],"primary":[]}' app_connector='{"advertise":null,"tags":[],"assigned_domains":[],"wildcards":0,"learned":{},"error":"local_api_unavailable"}'
     local installed_build= available_build= update_available=false previous= previous_build= current_target= offered_target= available_arch=
+    local cleanup=false keep
     ts_config_read || { ENABLE=0; WATCHDOG=0; error=invalid_configuration; }
     if ts_status_file "$file"; then
         statusok=$(ts_get "$file" ok)
@@ -851,7 +952,10 @@ ts_status_json() {
     if [ -f "$KSROOT/scripts/tailscale_core_lib.sh" ]; then
         . "$KSROOT/scripts/tailscale_core_lib.sh"
         current_target=$(ts_core_target "$DATA/current") || current_target=
+        [ -z "$current_target" ] || ! ts_core_stale "$current_target" || cleanup=true
     fi
+    # An unreadable preference keeps the old core: never delete on doubt.
+    keep=$(ts_read_bool tailscale_core_keep_previous 1) || keep=1
     case $available:$available_build in *[!0-9.r:]*) current_target=;; esac
     if [ -n "$current_target" ] && printf '%s\n' "$available" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' &&
         printf '%s\n' "$available_build" | grep -Eq '^r[1-9][0-9]*$'; then
@@ -872,8 +976,8 @@ ts_status_json() {
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.3.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s}' \
-        "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback"
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.4.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s,"can_cleanup":%s,"keep_previous":%s}' \
+        "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback" "$cleanup" "$(ts_bool "$keep")"
     printf ',"core_version_long":%s,"routes":%s,"app_connector":%s' "$(ts_quote "$version_long")" "$routes" "$app_connector"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
     printf '}\n'
@@ -897,8 +1001,8 @@ ts_connector_restore_migration() {
 }
 
 ts_mutation() {
-    local action=$1 rc=0 bits= has_bits=0 routes= old_running=0 old_manual=0 applied=0
-    local TS_CONNECTOR_CAPTURE=0 TS_CONNECTOR_BEFORE=
+    local action=$1 rc=0 bits= has_bits=0 routes= old_running=0 old_manual=0 applied=0 patience=0
+    local TS_CONNECTOR_CAPTURE=0 TS_CONNECTOR_BEFORE= TS_LOCK_WAITED=0
     if [ "$action" = web_submit ] && [ "$#" -gt 1 ]; then
         bits=$2; has_bits=1
         if ! ts_bits_valid "$bits" || { [ "${#bits}" = 7 ] && [ "$#" != 2 ]; } ||
@@ -914,12 +1018,21 @@ ts_mutation() {
             routes=$ROUTES_VALUE
         fi
     fi
-    if ! ts_lock; then
+    # Nothing retries a firmware boot or WAN event, and the firmware runs its
+    # WAN and NAT hooks concurrently. A lifecycle request without a page behind
+    # it waits for the lock instead of being dropped; a page gets "busy" at once.
+    case $action in start|stop|restart) [ -n "$ID" ] || patience=120;; esac
+    if ! ts_lock && ! { [ "$patience" != 0 ] && ts_lock_wait "$patience"; }; then
         [ "$action" != start_nat ] || : >"$RUN/nat-pending"
+        [ "$patience" = 0 ] || ts_syslog "$action 未执行：等待其他操作超过 $patience 秒"
         ts_reply '{"accepted":false,"error":"busy"}'
         return 1
     fi
     trap 'ts_unlock' EXIT
+    [ "$TS_LOCK_WAITED" = 0 ] || ts_job_log "$action 请求等待其他操作 $TS_LOCK_WAITED 秒后开始执行"
+    # An explicit lifecycle request renews the bounded rule-repair attempts.
+    # So does a NAT event: a new rebuild explains a new loss of the rules.
+    rm -f "$RUN/netfilter-repairs"
     if [ -n "$ID" ]; then
         ts_job_begin "$ID" || return 1
         ts_reply "{\"accepted\":true,\"job_id\":\"$ID\"}"
@@ -928,10 +1041,12 @@ ts_mutation() {
         . "$KSROOT/scripts/tailscale_core_lib.sh" || return 1
         if ! ts_core_recover; then
             ts_job_write failed recovery '上次核心操作尚未恢复，请查看操作日志并生成诊断摘要'
+            [ -n "$ID" ] || ts_syslog "$action 失败：上次核心操作尚未恢复"
             return 1
         fi
     elif [ -e "$DATA/update.txn" ] || [ -L "$DATA/update.txn" ]; then
         ts_job_write failed recovery '核心恢复组件不可用，请检查插件文件是否完整'
+        [ -n "$ID" ] || ts_syslog "$action 失败：核心恢复组件不可用"
         return 1
     fi
     if [ "$has_bits" = 1 ]; then
@@ -977,6 +1092,7 @@ ts_mutation() {
     fi
     [ "$has_bits" = 0 ] || rm -f "$RUN/config.previous" "$RUN/config.routes.previous" "$RUN/config.routes.invalid"
     if [ "$rc" = 0 ]; then ts_job_write success complete '操作已完成'; else ts_job_write failed failed '操作失败，请查看下方日志了解原因'; fi
+    [ "$rc" = 0 ] || [ -n "$ID" ] || ts_syslog "$action 失败；原因见 $RUN/events.log"
     ts_unlock
     trap - EXIT
     return "$rc"

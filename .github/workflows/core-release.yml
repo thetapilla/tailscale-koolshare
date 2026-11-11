@@ -145,3 +145,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/publish_core.py
+  mirror:
+    # Copies the signed stable feed and its archives to the download mirror
+    # after a publish. A manual run repairs the mirror without a new release.
+    needs: [check, publish]
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.publish.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.publish.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    environment: core-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: helper
+        name: Resolve verifier toolchain from its own source
+        run: |
+          version=$(python3 tools/build_helper.py --prepare-toolchain)
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: ${{ steps.helper.outputs.version }}
+          cache: false
+      - name: Build signed feed verifier
+        env:
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+          GOENV: 'off'
+        run: |
+          mkdir -p build
+          go build -mod=readonly -buildvcs=false -trimpath -o build/tsks-helper ./cmd/tsks-helper
+      - name: Mirror the signed feed and its archives
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 tools/mirror_core.py
