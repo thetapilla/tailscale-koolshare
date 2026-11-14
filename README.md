@@ -42,13 +42,13 @@ Koolshare 软件中心的 Tailscale 插件<br>
 | 安装包后缀 | 适用机型 | 核心架构 |
 | --- | --- | --- |
 | `_hnd` | 下面没有列出的机型，例如 RT-AX86U Pro、RT-BE86U | ARM32 |
-| `_mtk` | 天选游戏路由（`TX-AX6000`）、TUF GAMING 小旋风 Pro（`TUF-AX4200Q`）、`RT-AX57_Go`、ROG 魔盒（`GS7`）、ROG 魔盒 Air（`GS7_Air`）、ROG 魔盒 X（`GS-BE7200X`）、灵耀魔方 Pro WiFi7 BE9400（`ZenWiFi_BT8P`） | ARM64 |
-| `_ipq64` | TUF GAMING 小旋风 Pro WiFi7（`TUF_6500`） | ARM64 |
-| `_ipq32` | 灵耀魔方 WiFi7 BE3600（`ZenWiFi_BD4`） | ARM32 |
+| `_mtk` | 天选游戏路由 `TX-AX6000`<br>TUF GAMING 小旋风 Pro `TUF-AX4200Q`<br>`RT-AX57_Go`<br>ROG 魔盒 `GS7`<br>ROG 魔盒 Air `GS7_Air`<br>ROG 魔盒 X `GS-BE7200X`<br>灵耀魔方 Pro WiFi7 BE9400 `ZenWiFi_BT8P` | ARM64 |
+| `_ipq64` | TUF GAMING 小旋风 Pro WiFi7 `TUF_6500` | ARM64 |
+| `_ipq32` | 灵耀魔方 WiFi7 BE3600 `ZenWiFi_BD4` | ARM32 |
 | `_qca` | `RT-AX89X` | ARM32 |
-| `_universal` | 以上全部机型 | ARM32 和 ARM64 |
+| `_universal` | 以上全部机型 | ARM32 + ARM64 |
 
-括号里是固件中的型号标识。HND 机型即使处理器是 64 位，也使用 ARM32 核心，请按上表选择，不要按处理器选。平台包的大小约为通用包的一半，装好后的内容与通用包相同。每个 Release 都附有 `SHA256SUMS`，可以用来核对下载是否完整。
+机型名称后面的编号是固件中的型号标识。HND 机型即使处理器是 64 位，也使用 ARM32 核心，请按上表选择，不要按处理器选。平台包的大小约为通用包的一半，装好后的内容与通用包相同。每个 Release 都附有 `SHA256SUMS`，可以用来核对下载是否完整。
 
 ## 与插件市场原版的关系
 
