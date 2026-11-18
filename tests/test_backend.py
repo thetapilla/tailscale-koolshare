@@ -179,6 +179,11 @@ elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
             if mode!='seconds':sys.exit(2)
             del args[0]
     if '-t' in args:i=args.index('-t');table=args[i+1];del args[i:i+2]
+    if name=='ip6tables' and table=='nat' and read('nat6-missing.json',False):
+        print("ip6tables: can't initialize ip6tables table `nat'",file=sys.stderr);sys.exit(3)
+    if name=='ip6tables' and table=='nat' and read('nat6-busy.json',0)>0:
+        write('nat6-busy.json',read('nat6-busy.json',0)-1)
+        print('Another app is currently holding the xtables lock.',file=sys.stderr);sys.exit(4)
     db=read('firewall.json',{})
     family=name.split('-')[0]; key=family+':'+table
     chains=db.setdefault(key,{c:[] for c in ['INPUT','OUTPUT','FORWARD','PREROUTING','POSTROUTING']})
@@ -187,9 +192,11 @@ elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
         for chain,rules in chains.items():
             for rule in rules:print('-A '+chain+' '+' '.join(rule))
         print('COMMIT');sys.exit(0)
-    if args==['-S']:
+    if args[:1]==['-S'] and len(args)<=2:
         if read('iptables-list-exit.json',0):sys.exit(4)
+        if len(args)==2 and args[1] not in chains:sys.exit(1)
         for chain,rules in chains.items():
+            if len(args)==2 and chain!=args[1]:continue
             for rule in rules:print('-A '+chain+' '+' '.join(rule))
         # The daemon's rules are not created through this fixture. They exist
         # unless a test clears them the way a firmware rebuild would.
@@ -211,9 +218,87 @@ elif name in ('iptables','ip6tables','iptables-save','ip6tables-save'):
     elif op=='-I':chains[chain].insert(int(rule[0])-1,rule[1:])
     elif op=='-D':
         if rule not in chains[chain]:sys.exit(1)
-        chains[chain].remove(rule)
+        # Another program may restore a deleted rule at once.
+        if read('ipt-restored.json','')!=key+':'+chain:chains[chain].remove(rule)
     else:raise RuntimeError(args)
     write('firewall.json',db)
+elif name=='ip':
+    family='-4'
+    while args and args[0] in ('-4','-6'):family=args.pop(0)
+    if args[:2]==['-o','addr']:
+        if len(args)!=7 or args[2:4]!=['show','dev'] or args[5:]!=['scope','global']:raise RuntimeError(args)
+        if read('lan6-fail.json',False):sys.exit(1)
+        for i,entry in enumerate(read('lan6.json',{}).get(args[4],[])):
+            print(str(i+2)+': '+args[4]+'    inet6 '+entry+' scope global dynamic \\       valid_lft 86400sec preferred_lft 14400sec')
+    elif args[:1]==['rule']:
+        # Rules are kept as the words given to "ip rule add".
+        rules=read('ip-rules.json',{'-4':[],'-6':[]});rest=args[2:]
+        def fields(words):
+            out={};i=0
+            while i<len(words):
+                if words[i]=='nop':out['action']='nop';i+=1
+                elif words[i] in ('pref','from','to','fwmark','iif','oif','lookup','goto'):out[words[i]]=words[i+1];i+=2
+                else:raise RuntimeError(words)
+            if 'goto' in out:out['action']='goto'
+            out.setdefault('action','lookup')
+            return out
+        if family in read('ip-rule-unsupported.json',[]):
+            # A kernel without policy routing for this family.
+            print('RTNETLINK answers: Address family not supported by protocol',file=sys.stderr)
+            if args[1]=='show':print('Dump terminated',file=sys.stderr)
+            sys.exit(2)
+        if args[1]=='show':
+            if family in read('ip-rule-show-fail.json',[]):sys.exit(2)
+            once=read('ip-rule-show-fail-once.json',[])
+            if family in once:once.remove(family);write('ip-rule-show-fail-once.json',once);sys.exit(2)
+            # Another program removes a rule just before a listing.
+            drop=read('ip-rule-drop.json',None)
+            if drop and drop['family']==family:
+                if drop['skip']:drop['skip']-=1;write('ip-rule-drop.json',drop)
+                else:
+                    rules[family].remove(next(rule for rule in rules[family] if fields(rule)['pref']==drop['pref']))
+                    write('ip-rules.json',rules);(root/'ip-rule-drop.json').unlink()
+            # iproute2 order: from, to, fwmark, iif, oif, lookup, then the action.
+            for rule in sorted(rules[family],key=lambda words:int(fields(words)['pref'])):
+                f=fields(rule);line=f['pref']+':\tfrom '+f.get('from','all')
+                for key in ('to','fwmark','iif','oif','lookup'):
+                    if key in f:line+=' '+key+' '+(f[key] if key!='lookup' else read('rt-tables.json',{}).get(f[key],f[key]))
+                if f['action']=='goto':
+                    line+=' goto '+f['goto']
+                    if not any(fields(other)['pref']==f['goto'] for other in rules[family]):line+=' [unresolved]'
+                elif f['action']=='nop':line+=' nop'
+                print(line)
+            sys.exit(0)
+        if args[1]=='add':
+            fail=read('ip-rule-fail.json','')
+            once=read('ip-rule-fail-once.json','')
+            if once and once in rest:
+                (root/'ip-rule-fail-once.json').unlink();sys.exit(2)
+            if fail and fail in rest:sys.exit(2)
+            # iproute2 adds with NLM_F_EXCL. Like the kernel's rule_exists, the
+            # check compares source and destination only when the new rule has
+            # them, and never the goto target.
+            want=fields(rest)
+            def exists(have):
+                if any(have.get(key)!=want.get(key) for key in ('pref','action','lookup','iif','oif','fwmark')):return False
+                return all(have.get(key)==want[key] for key in ('from','to') if key in want)
+            if any(exists(fields(rule)) for rule in rules[family]):
+                print('RTNETLINK answers: File exists',file=sys.stderr);sys.exit(2)
+            rules[family].append(rest)
+        elif args[1]=='del':
+            # Like the kernel's rule_find: every given selector must match; an
+            # action is compared only when given, the goto target never.
+            want=fields(rest)
+            def matches(rule):
+                have=fields(rule)
+                if ('nop' in rest or 'goto' in rest) and have['action']!=want['action']:return False
+                return all(have.get(key)==want[key] for key in ('pref','from','to','fwmark','iif','oif','lookup') if key in want)
+            match=next((rule for rule in rules[family] if matches(rule)),None)
+            if match is None:sys.exit(2)
+            rules[family].remove(match)
+        else:raise RuntimeError(args)
+        write('ip-rules.json',rules)
+    else:raise RuntimeError(args)
 else:raise RuntimeError(name)
 '''
 
@@ -241,7 +326,7 @@ class BackendTests(unittest.TestCase):
         self.command = self.mock / "mock-command"
         self.command.write_text(MOCK.replace("#!/usr/bin/env python3", "#!" + sys.executable))
         self.command.chmod(0o755)
-        for name in ("dbus", "nvram", "flock", "curl", "cru", "iptables", "ip6tables", "iptables-save", "ip6tables-save"):
+        for name in ("dbus", "nvram", "flock", "curl", "cru", "iptables", "ip6tables", "iptables-save", "ip6tables-save", "ip"):
             (self.mock / name).symlink_to(self.command)
         (self.ks / "bin/tsks-helper").symlink_to(self.command)
         for name in ("tailscale", "tailscaled"):
@@ -1623,6 +1708,631 @@ class BackendTests(unittest.TestCase):
         (self.web / "tailscale3_301.log").symlink_to(victim)
         self.assertNotEqual(self.shell('TS_JOB=301; ts_job_log hello', check=False).returncode, 0)
         self.assertEqual(victim.read_text(), "private-content")
+
+    LAN_RULES = {
+        "-4": [["pref", "5271", "nop"], ["pref", "5268", "to", "100.64.0.0/10", "iif", "br0", "goto", "5270"],
+               ["pref", "5269", "iif", "br0", "goto", "5271"]],
+        "-6": [["pref", "5271", "nop"], ["pref", "5268", "to", "fd7a:115c:a1e0::/48", "iif", "br0", "goto", "5270"],
+               ["pref", "5269", "iif", "br0", "goto", "5271"]]}
+    # tailscaled's rules that forwarded traffic can match; the others need its mark.
+    TAILSCALE_RULES = [["pref", "5210", "fwmark", "0x80000/0xff0000", "lookup", "main"], ["pref", "5270", "lookup", "52"]]
+    # Other programs' rules at and around the plugin's priorities.
+    FOREIGN_RULES = [["pref", "5268", "fwmark", "0x1", "lookup", "100"], ["pref", "5269", "iif", "br0", "lookup", "200"],
+                     ["pref", "5271", "fwmark", "0x2", "lookup", "300"], ["pref", "5290", "iif", "br0", "lookup", "400"]]
+
+    def ip_rules(self):
+        path = self.mock / "ip-rules.json"
+        return json.loads(path.read_text()) if path.exists() else {"-4": [], "-6": []}
+
+    def lookups(self, family, destination, iif="br0"):
+        """Tables a forwarded packet consults, walking the rules as the kernel does."""
+        import ipaddress
+        def fields(words):
+            out = dict(zip(words[::2], words[1::2])) if "nop" not in words else {"pref": words[1], "action": "nop"}
+            out.setdefault("action", "goto" if "goto" in out else "lookup")
+            return out
+        rules = [fields(words) for words in sorted(self.ip_rules()[family], key=lambda words: int(words[1]))]
+        tables, index = [], 0
+        while index < len(rules):
+            rule = rules[index]
+            if ("fwmark" not in rule and rule.get("iif", iif) == iif and
+                    ("to" not in rule or ipaddress.ip_address(destination) in ipaddress.ip_network(rule["to"]))):
+                if rule["action"] == "goto":
+                    target = next((i for i, other in enumerate(rules) if other["pref"] == rule["goto"]), None)
+                    if target is not None:
+                        index = target
+                        continue
+                elif rule["action"] == "lookup":
+                    tables.append(rule["lookup"])
+            index += 1
+        return tables
+
+    def with_tailscale_rules(self, *extra):
+        rules = self.ip_rules()
+        for family in ("-4", "-6"):
+            rules[family] = self.TAILSCALE_RULES + [list(rule) for rule in extra] + rules[family]
+        self.write("ip-rules.json", rules)
+
+    def test_lan_devices_use_remote_routes_by_default_with_ipv6_masquerading(self):
+        self.write("lan6.json", {"br0": ["2001:DB8:1:2::1/64", "fd00:1:2:3::1/64", "fd7a:115c:a1e0::5/128",
+                                         "2001:db8:1:2::1/64", "2001:db8:9::1/129", "2001:db8:a::1"]})
+        self.shell("ts_firewall_apply; ts_firewall_apply")
+        fw = self.read("firewall.json")
+        self.assertEqual(fw["iptables:nat"]["TSKS_POSTROUTING"], [["-s", "192.168.50.0/24", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertEqual(fw["ip6tables:nat"]["POSTROUTING"], [["-j", "TSKS_POSTROUTING"]])
+        # Tailnet, duplicate and malformed entries are skipped; ip6tables masks the rest.
+        self.assertEqual(fw["ip6tables:nat"]["TSKS_POSTROUTING"], [
+            ["-s", "2001:db8:1:2::1/64", "-o", "tailscale0", "-j", "MASQUERADE"],
+            ["-s", "fd00:1:2:3::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.assertEqual((self.run / "firewall-lan6").read_text(), "2001:db8:1:2::1/64\nfd00:1:2:3::1/64\n")
+        # With no rules to keep, the minute task does not list them.
+        self.assertFalse((self.run / "firewall-rules").exists())
+        self.shell("ts_firewall_remove")
+        fw = self.read("firewall.json")
+        self.assertNotIn("TSKS_POSTROUTING", fw["ip6tables:nat"])
+        self.assertEqual(fw["ip6tables:nat"]["POSTROUTING"], [])
+
+    def test_lan_devices_kept_off_remote_routes_except_tailnet_addresses(self):
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply; ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), self.LAN_RULES)
+        # Masquerading stays: LAN devices still reach tailnet addresses.
+        self.assertEqual(len(self.read("firewall.json")["ip6tables:nat"]["TSKS_POSTROUTING"]), 1)
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes": "0", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        (self.mock / "calls.jsonl").unlink()
+        self.shell("ts_firewall_remove; ts_firewall_remove")
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        for family in ("-4", "-6"):
+            # The jump is removed first, so table 52 is never skipped for tailnet addresses.
+            prefs = [args[4] for args in self.calls("ip") if args[:3] == [family, "rule", "del"]]
+            self.assertEqual(prefs, ["5269", "5268", "5271"])
+        self.write("config.json", {"tailscale_enable": "0", "tailscale_accept_routes_lan": "0"})
+        self.write("ip-rules.json", self.LAN_RULES)
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+
+    def test_lan_rules_pass_over_only_the_rules_up_to_their_targets(self):
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.with_tailscale_rules(*self.FOREIGN_RULES)
+        before = self.ip_rules()
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        for family, remote, tailnet in (("-4", "192.168.60.1", "100.100.1.1"), ("-6", "2001:db8:60::1", "fd7a:115c:a1e0::9")):
+            # A VPN rule after table 52 still applies; only tailscaled's lookup is skipped.
+            self.assertEqual(self.lookups(family, remote), ["200", "400"])
+            # Tailnet addresses go on at 5270, past the other rule at 5269.
+            self.assertEqual(self.lookups(family, tailnet), ["52", "400"])
+            # Traffic from the router itself, or arriving from the tunnel, is unchanged.
+            self.assertEqual(self.lookups(family, remote, iif="lo"), ["52"])
+        self.write("config.json", {"tailscale_enable": "1"})
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), before)
+        self.assertEqual(self.lookups("-4", "192.168.60.1"), ["200", "52", "400"])
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply; ts_firewall_remove")
+        # Removal names every selector: the other rules at 5268, 5269 and 5271 stay.
+        self.assertEqual(self.ip_rules(), before)
+
+    def test_unchanged_lan_rules_are_not_removed_and_added_again(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        (self.mock / "calls.jsonl").unlink()
+        self.shell("ts_firewall_apply")
+        self.assertEqual([args for args in self.calls("ip") if args[1:2] == ["rule"] and args[2] in ("add", "del")], [])
+        # A stale form, such as one for an old LAN interface, and a copy left by
+        # a kernel that accepts duplicates go; a missing rule comes back.
+        rules = self.ip_rules()
+        rules["-4"] += [["pref", "5269", "iif", "br9", "goto", "5271"], ["pref", "5271", "nop"]]
+        rules["-6"] = [rule for rule in rules["-6"] if rule[1] != "5268"]
+        self.write("ip-rules.json", rules)
+        self.shell("ts_firewall_apply")
+        for family in ("-4", "-6"):
+            self.assertEqual(sorted(self.ip_rules()[family]), sorted(self.LAN_RULES[family]))
+
+    def test_maintenance_restores_lan_rules_another_program_removed(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_accept_routes_lan": "0"})
+        self.tick(20000)
+        self.assertEqual(self.ip_rules(), self.LAN_RULES)
+        self.tick(20060)
+        self.assertNotIn("路由规则被其他程序改动", self.events())
+        rules = self.ip_rules()
+        rules["-4"] = [rule for rule in rules["-4"] if rule[1] != "5269"]
+        self.write("ip-rules.json", rules)
+        self.tick(20120)
+        self.assertEqual(sorted(self.ip_rules()["-4"]), sorted(self.LAN_RULES["-4"]))
+        self.assertEqual(self.events().count("局域网设备的路由规则被其他程序改动，已重新应用"), 1)
+        # A listing that fails is unknown, never a change.
+        self.write("ip-rule-show-fail.json", ["-6"])
+        self.tick(20180)
+        self.assertEqual(self.events().count("局域网设备的路由规则被其他程序改动"), 1)
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_a_rule_a_delete_request_cannot_single_out_is_left_alone(self):
+        # The kernel deletes the first rule with the named selectors, ignoring
+        # a mark it was not given and the goto target. Here another program's
+        # jump at 5269 comes first, so deleting the plugin's would remove it.
+        foreign = ["pref", "5269", "fwmark", "0x1", "iif", "br0", "goto", "5300"]
+        self.write("ip-rules.json", {"-4": [foreign], "-6": []})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.write("config.json", {"tailscale_enable": "1"})
+        self.shell("ts_firewall_apply")
+        # The jump stays, and with it the rules it depends on.
+        self.assertEqual(self.ip_rules()["-4"], [foreign] + self.LAN_RULES["-4"])
+        self.assertEqual(self.ip_rules()["-6"], [])
+        self.assertIn("局域网设备的路由规则设置失败", self.events())
+        # Listed after the plugin's rule, it is not the one a request removes.
+        self.write("ip-rules.json", {"-4": self.LAN_RULES["-4"] + [foreign], "-6": []})
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules()["-4"], [foreign])
+
+    def test_a_failed_refresh_never_deletes_a_rule_twice(self):
+        # The plugin's jump for an old LAN interface comes before another
+        # program's jump with the same selectors. Deleting the plugin's once is
+        # right; a second request would remove the other program's.
+        foreign = ["pref", "5269", "fwmark", "0x1", "iif", "br9", "goto", "5300"]
+        self.write("ip-rules.json", {"-4": [["pref", "5271", "nop"], ["pref", "5268", "to", "100.64.0.0/10", "iif", "br9", "goto", "5270"],
+                                            ["pref", "5269", "iif", "br9", "goto", "5271"], foreign], "-6": []})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.write("ip-rule-fail.json", "5268")
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules()["-4"], [["pref", "5271", "nop"], foreign])
+        self.assertIn("局域网设备的路由规则设置失败", self.events())
+
+    def test_another_programs_jump_with_the_same_selectors_is_not_taken_for_the_plugins(self):
+        # The kernel refuses a rule like one it holds without comparing the
+        # goto target, so the plugin's jump cannot be added next to this one.
+        foreign = ["pref", "5269", "iif", "br0", "goto", "5400"]
+        self.with_tailscale_rules(foreign)
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        for family, remote in (("-4", "192.168.60.1"), ("-6", "2001:db8:60::1")):
+            self.assertEqual(self.ip_rules()[family], self.TAILSCALE_RULES + [foreign] + self.LAN_RULES[family][:2])
+            # LAN traffic still reaches table 52, and the apply says so.
+            self.assertEqual(self.lookups(family, remote), ["52"])
+        self.assertIn("局域网设备的路由规则设置失败", self.events())
+        self.assertTrue((self.run / "firewall-retry").exists())
+        self.assertFalse((self.run / "firewall-rules").exists())
+
+    def test_maintenance_finds_a_rule_removed_while_a_refresh_completed(self):
+        # Another program removes the jump right after the refresh listed the
+        # rules. The record holds the rules put in place, not a later listing.
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_accept_routes_lan": "0"})
+        self.write("ip-rule-drop.json", {"family": "-4", "pref": "5269", "skip": 1})
+        self.tick(20000)
+        self.tick(20060)
+        self.assertEqual(sorted(self.ip_rules()["-4"]), sorted(self.LAN_RULES["-4"]))
+        self.assertEqual(self.events().count("局域网设备的路由规则被其他程序改动，已重新应用"), 1)
+        self.assertFalse((self.mock / "ip-rule-drop.json").exists())
+
+    def test_a_kernel_without_ipv6_policy_routing_needs_no_ipv6_rules(self):
+        # Without IPv6 policy routing tailscaled has no IPv6 rule either.
+        self.write("ip-rule-unsupported.json", ["-6"])
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_accept_routes_lan": "0"})
+        self.tick(20000)
+        self.assertEqual(self.ip_rules(), {"-4": self.LAN_RULES["-4"], "-6": []})
+        self.assertEqual(self.events().count("路由规则"), 0)
+        self.assertFalse((self.run / "firewall-retry").exists())
+        self.assertTrue(all(line.startswith("-4 ") for line in (self.run / "firewall-rules").read_text().splitlines()))
+        self.tick(20060)
+        self.assertEqual(self.events().count("路由规则"), 0)
+        # IPv4 is still checked while IPv6 cannot be listed.
+        rules = self.ip_rules()
+        rules["-4"] = [rule for rule in rules["-4"] if rule[1] != "5269"]
+        self.write("ip-rules.json", rules)
+        self.tick(20120)
+        self.assertEqual(sorted(self.ip_rules()["-4"]), sorted(self.LAN_RULES["-4"]))
+        self.assertEqual(self.events().count("局域网设备的路由规则被其他程序改动，已重新应用"), 1)
+        self.assertEqual([args for args in self.calls("ip") if args[:3] in (["-6", "rule", "add"], ["-6", "rule", "del"])], [])
+
+    def test_an_unreadable_rule_listing_fails_even_with_no_rules_wanted(self):
+        # Rules from an earlier setting may still be there to remove.
+        self.write("ip-rules.json", self.LAN_RULES)
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("ip-rule-show-fail.json", ["-4"])
+        self.tick(20000)
+        self.assertEqual(self.ip_rules(), {"-4": self.LAN_RULES["-4"], "-6": []})
+        self.assertEqual(self.events().count("局域网设备的路由规则设置失败"), 1)
+        self.assertEqual((self.run / "firewall-retry").read_text(), "0\n")
+        self.write("ip-rule-show-fail.json", [])
+        self.tick(20060)
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.assertEqual(self.events().count("已补上之前未能设置的防火墙规则"), 1)
+
+    def uninstall(self):
+        # Installed, "current" is a link to a core directory.
+        current, core = self.ks / "tailscale/current", self.ks / "tailscale/cores/test"
+        core.parent.mkdir()
+        current.rename(core)
+        current.symlink_to("cores/test")
+        return subprocess.run([SHELL, str(ROOT / "plugin/uninstall.sh")], env=self.env, text=True, capture_output=True, timeout=30)
+
+    def test_uninstall_removes_lan_rules_that_stopping_could_not_list(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.write("ip-rule-show-fail-once.json", ["-4"])
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.assertNotIn("路由规则", result.stderr)
+
+    def test_uninstall_says_when_lan_rules_stay(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.write("ip-rule-show-fail.json", ["-4"])
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ip_rules(), {"-4": self.LAN_RULES["-4"], "-6": []})
+        self.assertIn("局域网设备的路由规则未能删除，重启路由器后会消失", result.stderr)
+
+    def test_a_jump_restored_as_fast_as_it_is_removed_does_not_hold_the_lock(self):
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.shell("ts_firewall_apply")
+        self.write("ipt-restored.json", "ip6tables:nat:POSTROUTING")
+        deletes = lambda: len([args for args in self.calls("ip6tables") if args[-4:] == ["-D", "POSTROUTING", "-j", "TSKS_POSTROUTING"]])
+        before = deletes()
+        self.shell("ts_firewall_apply")
+        self.assertEqual(deletes() - before, 16)
+        # Masquerading is not confirmed: IPv6 stays off remote routes and the
+        # refresh is tried again.
+        self.assertFalse((self.run / "firewall-nat6").exists())
+        self.assertTrue((self.run / "firewall-retry").exists())
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": self.LAN_RULES["-6"]})
+        self.assertEqual(self.events().count("局域网 IPv6 的来源改写设置失败"), 1)
+        before = deletes()
+        self.shell("ts_firewall_remove")
+        self.assertEqual(deletes() - before, 16)
+
+    def test_a_named_table_52_changes_nothing(self):
+        # iproute2 lists a table by the name rt_tables gives it. The plugin's
+        # rules name no table, so they are recognized either way.
+        self.write("rt-tables.json", {"52": "tailscale"})
+        self.with_tailscale_rules()
+        tailscale = self.ip_rules()
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), {family: tailscale[family] + self.LAN_RULES[family] for family in ("-4", "-6")})
+        (self.mock / "calls.jsonl").unlink()
+        self.shell("ts_firewall_apply; ts_firewall_apply")
+        self.assertEqual([args for args in self.calls("ip") if args[1:2] == ["rule"] and args[2] in ("add", "del")], [])
+        self.assertNotIn("路由规则设置失败", self.events())
+        # Stopping removes every rule of the plugin and only those.
+        self.shell("ts_stop >/dev/null")
+        self.assertEqual(self.ip_rules(), tailscale)
+
+    def test_failures_that_may_pass_are_retried_three_times(self):
+        failure = "局域网设备的路由规则设置失败"
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_accept_routes_lan": "0"})
+        self.write("ip-rule-fail-once.json", "5269")
+        self.tick(20000)
+        self.assertEqual((self.run / "firewall-retry").read_text(), "0\n")
+        self.assertEqual(self.ip_rules()["-4"], self.LAN_RULES["-4"][:2])
+        self.assertEqual(self.events().count(failure), 1)
+        self.tick(20060)
+        self.assertEqual(self.ip_rules(), self.LAN_RULES)
+        self.assertFalse((self.run / "firewall-retry").exists())
+        self.assertEqual(self.events().count("已补上之前未能设置的防火墙规则"), 1)
+        # A failure that stays is tried three times after each refresh. Only
+        # the refresh logs it.
+        self.write("ip-rules.json", {"-4": [], "-6": []})
+        self.write("ip-rule-fail.json", "5269")
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.events().count(failure), 2)
+        attempts = lambda: len([args for args in self.calls("ip") if args[1:3] == ["rule", "add"] and "5269" in args])
+        before = attempts()
+        for now in range(20120, 20420, 60):
+            self.tick(now)
+        self.assertEqual(attempts() - before, 3 * 2)
+        self.assertEqual((self.run / "firewall-retry").read_text(), "3\n")
+        self.assertEqual(self.events().count(failure), 2)
+        self.assertEqual(self.events().count("已补上之前未能设置的防火墙规则"), 1)
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_busy_ipv6_nat_is_retried_but_a_missing_table_is_not(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.write("nat6-busy.json", 2)
+        self.tick(20000)
+        # Meanwhile LAN IPv6 traffic stays off the tunnel, as without IPv6 NAT.
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": self.LAN_RULES["-6"]})
+        self.assertTrue((self.run / "firewall-retry").exists())
+        self.tick(20060)
+        self.assertEqual(self.read("firewall.json")["ip6tables:nat"]["TSKS_POSTROUTING"],
+                         [["-s", "2001:db8:1:2::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.assertTrue((self.run / "firewall-nat6").exists())
+        self.assertEqual(self.events().count("局域网 IPv6 的来源改写设置失败"), 1)
+        self.assertEqual(self.events().count("已补上之前未能设置的防火墙规则"), 1)
+        self.write("nat6-missing.json", True)
+        self.shell("ts_firewall_apply")
+        self.assertFalse((self.run / "firewall-retry").exists())
+        self.assertEqual(self.events().count("局域网 IPv6 的来源改写设置失败"), 1)
+
+    def test_lan_rules_are_in_place_before_the_daemon_starts(self):
+        # A start that stops at the daemon never reaches the firewall apply.
+        start = 'ts_daemon_start() { return 1; }; ts_start'
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.assertNotEqual(self.shell(start, check=False).returncode, 0)
+        self.assertEqual(self.ip_rules(), self.LAN_RULES)
+        # Turning the option on leaves the removal to the firewall apply.
+        self.write("config.json", {"tailscale_enable": "1"})
+        self.assertNotEqual(self.shell(start, check=False).returncode, 0)
+        self.assertEqual(self.ip_rules(), self.LAN_RULES)
+
+    def test_lan_ipv6_stays_off_the_tunnel_without_ipv6_nat(self):
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.write("nat6-missing.json", True)
+        self.shell("ts_firewall_apply")
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": self.LAN_RULES["-6"]})
+        fw = self.read("firewall.json")
+        self.assertNotIn("ip6tables:nat", fw)
+        self.assertEqual(fw["iptables:nat"]["TSKS_POSTROUTING"], [["-s", "192.168.50.0/24", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertIn(["-j", "TSKS_FORWARD"], fw["ip6tables:filter"]["FORWARD"])
+        self.assertEqual(self.events(), "")
+
+    def test_restoring_an_older_release_applies_only_the_rules_it_manages(self):
+        # A failed install restores a release that may predate IPv6
+        # masquerading and the LAN policy rules; it could never remove them.
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.shell("ts_firewall_apply")
+        self.shell("ts_stop >/dev/null")
+        for nat6 in (False, True):
+            with self.subTest(nat6_missing=nat6):
+                self.write("nat6-missing.json", nat6)
+                self.shell("TS_RESTORED=1; ts_firewall_apply")
+                fw = self.read("firewall.json")
+                self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+                self.assertNotIn("TSKS_POSTROUTING", fw.get("ip6tables:nat", {}))
+                self.assertEqual(fw["iptables:nat"]["TSKS_POSTROUTING"], [["-s", "192.168.50.0/24", "-o", "tailscale0", "-j", "MASQUERADE"]])
+                self.assertNotIn("路由规则设置失败", self.events())
+
+    def test_routing_rule_failure_is_reported_without_failing_the_apply(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_accept_routes_lan": "0"})
+        self.write("ip-rule-fail.json", "goto")
+        self.shell("ts_firewall_apply")
+        for family in ("-4", "-6"):
+            self.assertFalse(any("goto" in rule for rule in self.ip_rules()[family]))
+        self.assertIn("局域网设备的路由规则设置失败", self.events())
+        self.assertTrue((self.run / "firewall-lan6").exists())
+        self.assertFalse((self.run / "firewall-rules").exists())
+        self.assertIn(["-j", "TSKS_POSTROUTING"], self.read("firewall.json")["iptables:nat"]["POSTROUTING"])
+        # A jump left without its tailnet exception would skip table 52 for
+        # tailnet addresses too, so a failed exception takes the jump away.
+        rules = {family: self.TAILSCALE_RULES + [rule for rule in self.LAN_RULES[family] if rule[1] != "5268"] for family in ("-4", "-6")}
+        self.write("ip-rules.json", rules)
+        self.write("ip-rule-fail.json", "5268")
+        self.shell("ts_firewall_apply")
+        for family, tailnet in (("-4", "100.100.1.1"), ("-6", "fd7a:115c:a1e0::9")):
+            self.assertEqual(self.ip_rules()[family], self.TAILSCALE_RULES + [["pref", "5271", "nop"]])
+            self.assertEqual(self.lookups(family, tailnet), ["52"])
+
+    def test_lan_ipv6_prefix_change_reapplies_rules_on_the_next_tick(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        masquerade = lambda: self.read("firewall.json")["ip6tables:nat"]["TSKS_POSTROUTING"]
+        self.tick(20000)
+        self.assertEqual(masquerade(), [["-s", "2001:db8:1:2::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        count = len(self.rule_changes())
+        self.tick(20060)
+        self.assertEqual(len(self.rule_changes()), count)
+        self.write("lan6.json", {"br0": ["2001:db8:7:8::1/64"]})
+        self.tick(20120)
+        self.assertEqual(masquerade(), [["-s", "2001:db8:7:8::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertIn("已根据局域网 IPv6 地址刷新防火墙规则", self.events())
+        count = len(self.rule_changes())
+        self.tick(20180)
+        self.assertEqual(len(self.rule_changes()), count)
+        self.write("lan6.json", {})
+        self.tick(20240)
+        self.assertEqual(masquerade(), [])
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_unreadable_lan_ipv6_addresses_keep_ipv6_off_the_tunnel_until_read(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.write("lan6-fail.json", True)
+        self.tick(20000)
+        # Unknown prefixes are not taken as "no prefixes, all masqueraded".
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": self.LAN_RULES["-6"]})
+        self.assertEqual((self.run / "firewall-lan6").read_text(), "unknown\n")
+        self.tick(20060)
+        self.assertNotIn("局域网 IPv6", self.events())
+        self.write("lan6-fail.json", False)
+        self.tick(20120)
+        self.assertEqual(self.read("firewall.json")["ip6tables:nat"]["TSKS_POSTROUTING"],
+                         [["-s", "2001:db8:1:2::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+        self.assertEqual(self.ip_rules(), {"-4": [], "-6": []})
+        self.assertEqual(self.events().count("已根据局域网 IPv6 地址刷新防火墙规则"), 1)
+
+    def test_lost_ipv6_masquerading_hook_is_restored_by_maintenance(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0"})
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.tick(20000)
+        self.assertTrue((self.run / "firewall-nat6").exists())
+        # Another program replaces only the IPv6 nat table; the IPv4 hooks stay.
+        fw = self.read("firewall.json")
+        fw["ip6tables:nat"] = {chain: [] for chain in ["INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING"]}
+        self.write("firewall.json", fw)
+        self.tick(20060)
+        self.assertIn(["-j", "TSKS_POSTROUTING"], self.read("firewall.json")["ip6tables:nat"]["POSTROUTING"])
+        self.assertEqual(self.events().count("插件防火墙规则已被固件重建清除，已重新应用"), 1)
+        # Without IPv6 NAT there is no hook to look for.
+        self.write("nat6-missing.json", True)
+        self.shell("ts_firewall_apply")
+        self.assertFalse((self.run / "firewall-nat6").exists())
+        self.tick(20120)
+        self.assertEqual(self.events().count("插件防火墙规则已被固件重建清除"), 1)
+        self.assertEqual(self.recoveries(), 0)
+
+    def test_direct_protocols_leave_lan_traffic_to_remote_routes_unchanged(self):
+        # 直连协议 only filters the router's own UDP 41641 to and from peers.
+        # The LAN rules depend on the remote-route settings alone.
+        self.write("lan6.json", {"br0": ["2001:db8:1:2::1/64"]})
+        self.with_tailscale_rules()
+        base = self.ip_rules()
+        drops = [["-p", "udp", "--dport", "41641", "-j", "DROP"]], [["-p", "udp", "--sport", "41641", "-j", "DROP"]]
+        for ipv4 in "01":
+            for ipv6 in "01":
+                for accept in "01":
+                    for lan in "01":
+                        with self.subTest(ipv4=ipv4, ipv6=ipv6, accept=accept, lan=lan):
+                            self.write("ip-rules.json", base)
+                            self.write("config.json", {"tailscale_enable": "1", "tailscale_ipv4_enable": ipv4, "tailscale_ipv6_enable": ipv6,
+                                                       "tailscale_accept_routes": accept, "tailscale_accept_routes_lan": lan})
+                            self.shell("ts_firewall_apply")
+                            fw = self.read("firewall.json")
+                            for binary, allowed in (("iptables", ipv4), ("ip6tables", ipv6)):
+                                chains = fw[binary + ":filter"]
+                                self.assertEqual((chains["TSKS_INPUT"], chains["TSKS_OUTPUT"]), ([], []) if allowed == "1" else drops)
+                                # Forwarded LAN traffic passes the same rules either way.
+                                self.assertEqual(chains["TSKS_FORWARD"], [["-i", "tailscale0", "-o", "br0", "-j", "ACCEPT"],
+                                                                          ["-i", "br0", "-o", "tailscale0", "-j", "ACCEPT"]])
+                            self.assertEqual(fw["iptables:nat"]["TSKS_POSTROUTING"], [["-s", "192.168.50.0/24", "-o", "tailscale0", "-j", "MASQUERADE"]])
+                            self.assertEqual(fw["ip6tables:nat"]["TSKS_POSTROUTING"], [["-s", "2001:db8:1:2::1/64", "-o", "tailscale0", "-j", "MASQUERADE"]])
+                            # With remote routes off, table 52 holds no remote routes to find.
+                            kept_off = accept == "1" and lan == "0"
+                            for family, remote, tailnet in (("-4", "192.168.60.1", "100.100.1.1"), ("-6", "2001:db8:60::1", "fd7a:115c:a1e0::9")):
+                                self.assertEqual(self.lookups(family, remote), [] if kept_off else ["52"])
+                                self.assertEqual(self.lookups(family, tailnet), ["52"])
+                            self.shell("ts_firewall_remove")
+                            self.assertEqual(self.ip_rules(), base)
+
+    def test_twelve_bit_submission_writes_lan_and_periodic_settings_under_lock(self):
+        self.env["REQUIRE_CONFIG_LOCK"] = "1"
+        self.entry("tailscale_config", "240", "web_submit", "010101011101", routes_wire(""))
+        config = self.read("config.json")
+        self.assertEqual(config["tailscale_app_connector"], "1")
+        self.assertEqual(config["tailscale_accept_routes_lan"], "0")
+        self.assertEqual(config["tailscale_app_connector_periodic"], "1")
+        self.assertEqual(json.loads((self.web / "tailscale3_240.json").read_text())["state"], "success")
+
+    def test_shorter_snapshots_keep_the_lan_and_periodic_settings(self):
+        for args in (("0101010",), ("010101011", routes_wire("")), ("0101010111", routes_wire(""))):
+            with self.subTest(width=len(args[0])):
+                self.write("config.json", {"tailscale_enable": "0", "tailscale_accept_routes_lan": "0",
+                                           "tailscale_app_connector_periodic": "1"})
+                self.entry("tailscale_config", "241", "web_submit", *args)
+                config = self.read("config.json")
+                self.assertEqual(config["tailscale_accept_routes_lan"], "0")
+                self.assertEqual(config["tailscale_app_connector_periodic"], "1")
+        original = self.read("config.json")
+        for bits in ("01010101110", "0101010111010"):
+            with self.subTest(bits=bits):
+                self.assertNotEqual(self.entry("tailscale_config", "242", "web_submit", bits, routes_wire(""), check=False).returncode, 0)
+                self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_config_snapshot"})
+                self.assertEqual(self.read("config.json"), original)
+
+    def test_twelve_bit_failed_apply_restores_lan_and_periodic_settings(self):
+        for saved in (None, "0", "1"):
+            with self.subTest(saved=saved):
+                config = {"tailscale_enable": "0", "tailscale_app_connector": "0"}
+                if saved is not None:
+                    config.update(tailscale_accept_routes_lan=saved, tailscale_app_connector_periodic=saved)
+                self.write("config.json", config)
+                result = self.shell('ts_pid_alive() { return 1; }; ts_restart() { return 1; }; ts_stop() { return 0; }; '
+                                    'ID=243; ts_mutation web_submit 100000000101 b64.', check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read("config.json"), config)
+
+    def primes(self):
+        return [args for args in self.calls("tsks-helper") if args[:1] == ["appc-prime"]]
+
+    def test_periodic_learning_queries_every_thirty_minutes_only_when_enabled(self):
+        base = {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_app_connector": "1"}
+        self.write("config.json", base)
+        self.tick(20000)
+        self.assertEqual(self.primes(), [])
+        self.write("config.json", dict(base, tailscale_app_connector_periodic="1"))
+        self.tick(20060)
+        self.assertEqual(len(self.primes()), 1)
+        self.assertEqual(self.events().count("定期学习完成，已学习 1 个地址"), 1)
+        self.tick(20120); self.tick(20060 + 1799)
+        self.assertEqual(len(self.primes()), 1)
+        self.tick(20060 + 1800)
+        self.assertEqual(len(self.primes()), 2)
+        # An unchanged count is not logged again.
+        self.assertEqual(self.events().count("定期学习完成"), 1)
+        self.write("appc-prime.json", {"assigned": 2, "primed": 2, "learned": 2, "wildcards": 0, "denied": False})
+        self.tick(20060 + 3600)
+        self.assertIn("定期学习完成，已学习 2 个地址", self.events())
+        # A clock set backwards does not postpone learning.
+        self.tick(10000)
+        self.assertEqual(len(self.primes()), 4)
+        # Learning needs a running backend and resumes once it runs.
+        self.write("status.json", dict(self.status, backend_state="Starting"))
+        self.tick(10000 + 1800)
+        self.assertEqual(len(self.primes()), 4)
+        self.write("status.json", self.status)
+        self.tick(10000 + 1860)
+        self.assertEqual(len(self.primes()), 5)
+        self.write("config.json", base)
+        self.tick(20000 + 7200)
+        self.assertEqual(len(self.primes()), 5)
+        self.assertFalse((self.run / "appc-periodic").exists())
+        self.assertEqual(self.recoveries(), 0)
+        self.assertEqual(self.calls("tailscale"), [])
+
+    def test_periodic_learning_reports_failures_and_denials_once(self):
+        self.write("config.json", {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_app_connector": "1",
+                                   "tailscale_app_connector_periodic": "1"})
+        self.write("appc-prime-exit.json", 1)
+        self.tick(20000); self.tick(21800)
+        self.assertEqual(len(self.primes()), 2)
+        self.assertEqual(self.events().count("定期学习暂未完成"), 1)
+        self.write("appc-prime-exit.json", 0)
+        self.write("appc-prime.json", {"assigned": 2, "primed": 0, "learned": 0, "wildcards": 0, "denied": True})
+        self.tick(23600); self.tick(25400)
+        self.assertEqual(self.events().count("定期学习的查询被访问控制拒绝"), 1)
+        self.write("appc-prime.json", {"assigned": 2, "primed": 2, "learned": 1, "wildcards": 0, "denied": False})
+        self.tick(27200)
+        self.assertIn("定期学习完成，已学习 1 个地址", self.events())
+        self.write("appc-prime-exit.json", 1)
+        self.tick(29000)
+        self.assertEqual(self.events().count("定期学习暂未完成"), 2)
+        # With only wildcard domains nothing is queried, so no count is reported.
+        self.write("appc-prime-exit.json", 0)
+        self.write("appc-prime.json", {"assigned": 1, "primed": 0, "learned": 0, "wildcards": 1, "denied": False})
+        self.tick(30800)
+        self.assertNotIn("已学习 0 个地址", self.events())
+        # Queries that taught the connector nothing are a failure, not a success.
+        self.write("appc-prime.json", {"assigned": 2, "primed": 0, "learned": 0, "wildcards": 0, "denied": False})
+        self.tick(32600); self.tick(34400)
+        self.assertEqual(self.events().count("定期学习暂未完成"), 3)
+        self.assertNotIn("已学习 0 个地址", self.events())
+
+    def test_turning_periodic_learning_off_and_on_forgets_its_schedule(self):
+        periodic = {"tailscale_enable": "1", "tailscale_watchdog_enable": "0", "tailscale_app_connector": "1",
+                    "tailscale_app_connector_periodic": "1"}
+        start = 'ts_daemon_start() { return 1; }; ts_start'
+        self.write("config.json", periodic)
+        self.tick(20000)
+        self.assertEqual(len(self.primes()), 1)
+        # Both applies happen before the next minute task.
+        for config in (dict(periodic, tailscale_app_connector_periodic="0"), periodic):
+            self.write("config.json", config)
+            self.shell(start, check=False)
+        self.tick(20060)
+        self.assertEqual(len(self.primes()), 2)
+        # Applying unrelated settings keeps the schedule.
+        self.shell(start, check=False)
+        self.tick(20120)
+        self.assertEqual(len(self.primes()), 2)
+
+    def test_stopping_the_service_and_periodic_learning_together_forgets_the_schedule(self):
+        # enable, ipv4, ipv6, advertise, accept, exit, watchdog, dns, custom,
+        # connector, LAN devices, periodic learning
+        for bits, kept in (("011110100110", False), ("011110100111", True)):
+            with self.subTest(bits=bits):
+                (self.run / "appc-periodic").write_text("at=20000\nlearned=1\nnotice=\n")
+                self.entry("tailscale_config", "250", "web_submit", bits, routes_wire(""))
+                self.assertEqual((self.run / "appc-periodic").exists(), kept)
 
 
 if __name__ == "__main__":

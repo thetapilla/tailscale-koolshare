@@ -43,7 +43,8 @@ const calls = [], scriptErrors = [];
 // ordinary scenarios below still exercise the extracted firmware's real httpdb.
 const lifecycle = { config: { tailscale_enable: '0', tailscale_ipv4_enable: '1', tailscale_ipv6_enable: '1',
     tailscale_advertise_routes: '0', tailscale_accept_routes: '0', tailscale_exit_node: '0', tailscale_watchdog_enable: '0',
-    tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_app_connector: '0', tailscale_custom_routes: '' },
+    tailscale_accept_dns: '0', tailscale_custom_routes_enable: '0', tailscale_app_connector: '0',
+    tailscale_accept_routes_lan: '1', tailscale_app_connector_periodic: '0', tailscale_custom_routes: '' },
     task: null, failNext: false, unavailableReads: 0 };
 // Status overlays cover signed-descriptor identities, connector states and delayed authorization
 // without downloading cores or registering a device on a real tailnet.
@@ -66,7 +67,8 @@ function lifecycleResponse(url, body) {
         if (task && Date.now() - task.started >= 8500) {
             task.state = task.fail ? 'failed' : 'success';
             if (!task.fail) {
-                Object.keys(lifecycle.config).slice(0, 10).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; });
+                // Like the backend, a shorter snapshot leaves the later settings unchanged.
+                Object.keys(lifecycle.config).slice(0, task.bits.length).forEach((key, index) => { lifecycle.config[key] = task.bits[index]; });
                 lifecycle.config.tailscale_custom_routes = task.routes;
             }
         }
@@ -294,13 +296,13 @@ const server = http.createServer((req, res) => {
         assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), true);
         await job('apply_settings', /^操作完成$/);
         const connectorSave = calls.slice(connectorAt).find(call => call.method === 'tailscale_config');
-        assert.match(connectorSave.params[1], /^[01]{9}1$/);
+        assert.match(connectorSave.params[1], /^[01]{9}1[01]{2}$/);
         await page.reload(); await ready();
         assert.equal(await page.locator('#tailscale_app_connector').isChecked(), true);
-        for (const draftLength of [7, 9, 10]) {
+        for (const draftLength of [7, 9, 10, 12]) {
             const oldDraft = draftLength === 7;
             const task = { id: String(999999999999980 + draftLength), title: '应用设置', method: 'tailscale_config',
-                draft: oldDraft ? '0100000' : draftLength === 9 ? '010000001' : '0100000010', routes: oldDraft ? undefined : '10.20.0.0/16', reloadConfig: true };
+                draft: oldDraft ? '0100000' : '010000001000'.slice(0, draftLength), routes: oldDraft ? undefined : '10.20.0.0/16', reloadConfig: true };
             await page.evaluate(task => sessionStorage.setItem('tailscale3_pending', JSON.stringify(task)), task);
             await page.reload(); await ready();
             assert.equal(await text('job_state'), '任务结果无法确认');
@@ -308,6 +310,8 @@ const server = http.createServer((req, res) => {
             assert.equal(await page.locator('#tailscale_accept_dns').isChecked(), oldDraft);
             assert.equal(await page.locator('#tailscale_custom_routes_enable').isChecked(), !oldDraft);
             assert.equal(await page.locator('#tailscale_app_connector').isChecked(), draftLength < 10);
+            // A draft without the LAN bit takes the saved value, which is on.
+            assert.equal(await page.locator('#tailscale_accept_routes_lan').isChecked(), draftLength < 12);
             assert.deepEqual(await routeInputs.evaluateAll(inputs => inputs.map(input => input.value)), oldDraft ? ['192.168.60.0/24', '2001:db8:1::/64'] : ['10.20.0.0/16']);
         }
         await page.reload(); await ready();

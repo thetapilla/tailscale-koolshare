@@ -317,12 +317,13 @@ ts_core_update() {
     ts_core_switch "$target" || return $?
     ts_core_retain
 }
-# Applies the saved retention choice once the new core is committed. The update
-# has already succeeded, so a failed deletion is reported and left for later.
+# Applies the retention choice once the new core is committed: the one the
+# update started with (TS_CORE_KEEP), else the saved one. The update has
+# already succeeded, so a failed deletion is reported and left for later.
 ts_core_retain() {
-    local keep mode=unreachable
+    local keep=${TS_CORE_KEEP:-} mode=unreachable
     # An unreadable preference keeps the old core: never delete on doubt.
-    keep=$(ts_read_bool tailscale_core_keep_previous 1) || keep=1
+    case $keep in 0|1) ;; *) keep=$(ts_read_bool tailscale_core_keep_previous 1) || keep=1;; esac
     [ "$keep" = 1 ] || mode=all
     if ! ts_core_prune "$mode"; then
         ts_job_log '旧版核心未能全部删除，可稍后使用「清理旧版核心」重试'

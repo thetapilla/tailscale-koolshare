@@ -80,10 +80,10 @@ function harness(initialStorage = {}) {
         maxSimultaneous: () => maxSimultaneous, timers };
 }
 
-test('native page keeps menu, all four skins, ten options, and unique HTML IDs', () => {
+test('native page keeps menu, all four skins, twelve options, and unique HTML IDs', () => {
     const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
     assert.equal(ids.length, new Set(ids).size);
-    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable', 'accept_dns', 'custom_routes_enable', 'app_connector']) { assert.ok(ids.includes('tailscale_' + key)); }
+    for (const key of ['enable', 'ipv4_enable', 'ipv6_enable', 'advertise_routes', 'accept_routes', 'exit_node', 'watchdog_enable', 'accept_dns', 'custom_routes_enable', 'app_connector', 'accept_routes_lan', 'app_connector_periodic']) { assert.ok(ids.includes('tailscale_' + key)); }
     for (const skin of ['ASUSWRT', 'ROG', 'TUF', 'TS']) { assert.ok(html.includes('[skin=' + skin + ']')); }
     assert.match(html, /show_menu\(menu_hook\)/);
     assert.match(html, /id="tailscale_exit_node"[^]*?<\/tr>\s*<tr><th><label for="tailscale_app_connector"/);
@@ -252,7 +252,7 @@ test('busy rejection releases controls and preserves draft settings', () => {
     const h = harness(); h.boot(); h.change('tailscale_accept_routes', true); h.click('apply_settings');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '1110101000', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '111010100010', 'b64.']);
     h.reply(write, { accepted: false, error: 'busy' }); h.advance();
     assert.equal(h.nodes.apply_settings.disabled, false);
     assert.equal(h.nodes.tailscale_accept_routes.checked, true);
@@ -268,7 +268,7 @@ test('switch only edits the draft; Apply submits once and locks concurrent chang
     assert.equal(h.nodes.settings_notice.textContent, '正在提交设置…');
     const write = h.next('tailscale_config');
     assert.deepEqual(write.body.fields, {});
-    assert.deepEqual(write.body.params, ['web_submit', '0110001000', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '011000100010', 'b64.']);
     assert.equal(h.app.apply(), false);
     h.accept(write); h.finishJob(h.next('tailscale_job'), 'success'); h.advance();
     const log = h.next(); log.finish(null, 'stopped');
@@ -433,7 +433,7 @@ test('core management remains available when structured status says the daemon i
 });
 
 
-test('queued save snapshots all ten settings without exposing DBus fields to httpdb', () => {
+test('queued save snapshots every setting without exposing DBus fields to httpdb', () => {
     const h = harness(); h.boot(); h.advance(5000);
     const inFlight = h.next('tailscale_fettle');
     h.change('tailscale_advertise_routes', true);
@@ -445,7 +445,7 @@ test('queued save snapshots all ten settings without exposing DBus fields to htt
     h.reply(inFlight, h.status());
     const save = h.next('tailscale_config');
     assert.deepEqual(save.body.fields, {});
-    assert.deepEqual(save.body.params, ['web_submit', '1111010000', 'b64.']);
+    assert.deepEqual(save.body.params, ['web_submit', '111101000010', 'b64.']);
     assert.ok(h.history.filter(r => r.body).every(r => Object.keys(r.body.fields).length === 0));
 });
 
@@ -523,7 +523,7 @@ test('all draft options including enable are applied in one snapshot and reverti
     assert.equal(h.nodes.daemon_state.textContent, '运行中');
     h.click('apply_settings');
     const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '0110011000', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '011001100010', 'b64.']);
     h.accept(write);
     assert.equal(h.nodes.settings_notice.textContent, '正在应用设置…');
     assert.equal(h.nodes.daemon_state.textContent, '正在停止…');
@@ -634,7 +634,7 @@ test('unconfirmed or expired jobs cannot continue suppressing service errors', (
     assert.equal(h.nodes.settings_notice.textContent, '正在确认设置结果…');
 });
 
-test('DNS and custom routes are independent draft settings in a ten-bit submission', () => {
+test('DNS and custom routes are independent draft settings in a twelve-bit submission', () => {
     const h = harness(); h.boot();
     assert.equal(h.nodes.tailscale_accept_dns.checked, false);
     assert.equal(h.nodes.custom_routes_editor.style.display, 'none');
@@ -647,7 +647,7 @@ test('DNS and custom routes are independent draft settings in a ten-bit submissi
     h.editRoute(2, '   ');
     assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
     h.click('apply_settings'); const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '1110001110', wire('192.168.60.0/24,2001:db8:1::/64')]);
+    assert.deepEqual(write.body.params, ['web_submit', '111000111010', wire('192.168.60.0/24,2001:db8:1::/64')]);
     assert.deepEqual(write.body.fields, {});
     assert.ok(h.rows().every(row => row.input.disabled && row.remove.disabled));
     assert.equal(h.nodes.custom_routes_add.disabled, true);
@@ -674,6 +674,7 @@ test('route edits compare the trimmed nonempty list, preserve collapsed rows, an
 
 test('at most 32 editable rows are available and deleting a row re-enables adding', () => {
     const h = harness(); h.boot(); h.change('tailscale_custom_routes_enable', true);
+    assert.equal(h.rows()[0].input.attrs.placeholder, '例如 192.168.60.0/24 或 123.45.67.89/32');
     for (let i = 1; i < 32; i++) { h.click('custom_routes_add'); }
     assert.equal(h.rows().length, 32); assert.equal(h.nodes.custom_routes_add.disabled, true);
     h.nodes.custom_routes_add.events.click(); assert.equal(h.rows().length, 32);
@@ -733,7 +734,7 @@ test('legacy seven-bit task drafts preserve the new configuration values read fr
     assert.equal(h.nodes.tailscale_accept_dns.checked, true);
     assert.equal(h.rows()[0].input.value, '10.20.0.0/16');
     h.click('apply_settings'); const write = reach(h, 'tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '1110001110', wire('10.20.0.0/16')]);
+    assert.deepEqual(write.body.params, ['web_submit', '111000111010', wire('10.20.0.0/16')]);
 });
 
 test('route baseline loads saved rows and successful normalization replaces the draft', () => {
@@ -802,6 +803,86 @@ test('httpdb explicitly rejects an oversized settings request without creating a
 });
 
 
+test('remote routes are named for what they accept and say which devices use them', () => {
+    assert.match(html, /<label for="tailscale_accept_routes">接受远程路由<\/label>/);
+    assert.match(html, /<label class="ts_advanced" for="tailscale_accept_routes_lan"><input id="tailscale_accept_routes_lan" type="checkbox" checked="checked" disabled="disabled" \/> 局域网设备也使用<\/label>/);
+    assert.match(html, /<label class="ts_advanced" for="tailscale_app_connector_periodic"><input id="tailscale_app_connector_periodic" type="checkbox" disabled="disabled" \/> 定期学习<\/label>/);
+    assert.match(html, /对方看到的来源是本机；固件不支持 IPv6 地址转换时，IPv6 网段除外。取消后只有本机使用，局域网设备访问这些网段时不经过 Tailnet。/);
+    assert.match(html, /本机只从经过它的 DNS 查询中学习地址/);
+    assert.match(html, /每 30 分钟自己查询一次分配的域名/);
+    // Neither claim holds without conditions: a LAN device's own lookups never
+    // reach the connector, and the sub-option decides whether LAN devices use routes.
+    assert.doesNotMatch(html, /访问远程局域网|允许本机和局域网设备访问|也能经已宣告的地址访问/);
+});
+
+test('the LAN option follows remote routes and is on unless saved off', () => {
+    const h = harness(); h.app.init();
+    h.reply(h.next(), [{ tailscale_enable: '1', tailscale_accept_routes: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    // Unset reads as the backend default instead of a change waiting to apply.
+    assert.equal(h.nodes.tailscale_accept_routes_lan.checked, true);
+    assert.equal(h.nodes.tailscale_accept_routes_lan.disabled, false);
+    assert.equal(h.nodes.settings_notice.textContent, '');
+    h.change('tailscale_accept_routes_lan', false);
+    assert.match(h.nodes.settings_notice.textContent, /尚未应用/);
+    h.change('tailscale_accept_routes', false);
+    assert.equal(h.nodes.tailscale_accept_routes_lan.disabled, true);
+    // The saved choice is kept while remote routes are off.
+    h.click('apply_settings');
+    assert.deepEqual(h.next('tailscale_config').body.params, ['web_submit', '100000000000', 'b64.']);
+    const off = harness(); off.app.init();
+    off.reply(off.next(), [{ tailscale_enable: '1', tailscale_accept_routes: '1', tailscale_accept_routes_lan: '0', tailscale_app_connector: '0' }]);
+    off.reply(off.next('tailscale_fettle'), off.status()); off.reply(off.next('tailscale_tsnets'), { interfaces: [] }); off.advance();
+    assert.equal(off.nodes.tailscale_accept_routes_lan.checked, false);
+    assert.equal(off.nodes.settings_notice.textContent, '');
+});
+
+test('periodic learning is available only with the connector and is the twelfth bit', () => {
+    const h = harness(); h.boot();
+    assert.equal(h.nodes.tailscale_app_connector_periodic.checked, false);
+    assert.equal(h.nodes.tailscale_app_connector_periodic.disabled, true);
+    h.change('tailscale_app_connector', true);
+    assert.equal(h.nodes.tailscale_app_connector_periodic.disabled, false);
+    h.change('tailscale_app_connector_periodic', true);
+    assert.equal(h.requests.length, 0);
+    h.click('apply_settings');
+    const write = h.next('tailscale_config');
+    assert.deepEqual(write.body.params, ['web_submit', '111000100111', 'b64.']);
+    assert.equal(h.nodes.tailscale_app_connector_periodic.disabled, true);
+    const saved = harness(); saved.app.init();
+    saved.reply(saved.next(), [{ tailscale_enable: '1', tailscale_app_connector: '1', tailscale_app_connector_periodic: '1' }]);
+    saved.reply(saved.next('tailscale_fettle'), saved.status()); saved.reply(saved.next('tailscale_tsnets'), { interfaces: [] }); saved.advance();
+    assert.equal(saved.nodes.tailscale_app_connector_periodic.checked, true);
+    assert.equal(saved.nodes.tailscale_app_connector_periodic.disabled, false);
+    assert.equal(saved.nodes.settings_notice.textContent, '');
+});
+
+test('while the connector setting awaits migration the later options stay unchanged', () => {
+    const h = harness(); h.app.init();
+    h.reply(h.next(), [{ tailscale_enable: '0', tailscale_accept_routes: '1', tailscale_accept_routes_lan: '0', tailscale_app_connector_periodic: '1' }]);
+    h.reply(h.next('tailscale_fettle'), h.status({ enabled: false, error: 'local_api_unavailable', app_connector: { advertise: null, error: 'local_api_unavailable' } }));
+    h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
+    // A nine-bit submission cannot carry them, so they cannot be edited yet.
+    assert.equal(h.nodes.tailscale_accept_routes_lan.disabled, true);
+    assert.equal(h.nodes.tailscale_app_connector_periodic.disabled, true);
+    assert.equal(h.nodes.app_connector_migration.style.display, '');
+    h.change('tailscale_enable', true); h.click('apply_settings');
+    assert.equal(h.next('tailscale_config').body.params[1], '100010000');
+});
+
+test('a twelve-bit draft is restored in full after a failed task', () => {
+    const saved = { id: '64535', method: 'tailscale_config', draft: '111010100101', routes: '', intent: 'apply' };
+    const h = harness({ tailscale3_pending: JSON.stringify(saved) }); h.app.init();
+    h.finishJob(h.next('tailscale_job'), 'running'); h.next().finish(null, 'applying');
+    const persisted = { tailscale_enable: '1', tailscale_accept_routes: '1', tailscale_accept_routes_lan: '1', tailscale_app_connector: '0', tailscale_app_connector_periodic: '1' };
+    h.reply(h.next(), [persisted]); h.reply(h.next('tailscale_fettle'), h.status()); h.reply(h.next('tailscale_tsnets'), { interfaces: [] });
+    h.advance(1500); h.finishJob(reach(h, 'tailscale_job'), 'failed');
+    h.reply(reach(h, '/_api/tailscale_'), [persisted]); h.advance();
+    assert.equal(h.nodes.tailscale_accept_routes_lan.checked, false);
+    assert.equal(h.nodes.tailscale_app_connector_periodic.checked, true);
+    h.click('apply_settings'); assert.equal(reach(h, 'tailscale_config').body.params[1], saved.draft);
+});
+
 test('connector edits are draft-only, independent of DNS, and become the tenth snapshot bit', () => {
     const h = harness(); h.boot(); h.change('tailscale_app_connector', true);
     assert.equal(h.nodes.tailscale_accept_dns.checked, false);
@@ -809,7 +890,7 @@ test('connector edits are draft-only, independent of DNS, and become the tenth s
     assert.match(h.nodes.settings_notice.textContent, /尚未应用/);
     h.click('apply_settings');
     const write = h.next('tailscale_config');
-    assert.deepEqual(write.body.params, ['web_submit', '1110001001', 'b64.']);
+    assert.deepEqual(write.body.params, ['web_submit', '111000100110', 'b64.']);
     assert.deepEqual(write.body.fields, {});
     assert.equal(h.nodes.tailscale_app_connector.disabled, true);
 });
@@ -829,7 +910,7 @@ test('seven and nine-bit drafts preserve the current connector setting and nine-
         assert.equal(h.nodes.tailscale_app_connector.checked, true);
         assert.deepEqual(h.rows().map(row => row.input.value), [bits.length === 7 ? '10.20.0.0/16' : '192.168.60.0/24']);
         h.click('apply_settings'); const write = reach(h, 'tailscale_config');
-        assert.equal(write.body.params[1], '1110001111');
+        assert.equal(write.body.params[1], '111000111110');
     }
 });
 
@@ -843,7 +924,7 @@ test('ten-bit drafts retain an explicit connector change after a failed task and
     h.advance(1500); h.finishJob(reach(h, 'tailscale_job'), 'failed');
     h.reply(reach(h, '/_api/tailscale_'), [persisted]); h.advance();
     assert.equal(h.nodes.tailscale_app_connector.checked, true);
-    h.click('apply_settings'); assert.equal(reach(h, 'tailscale_config').body.params[1], saved.draft);
+    h.click('apply_settings'); assert.equal(reach(h, 'tailscale_config').body.params[1], saved.draft + '10');
 });
 
 test('an unmigrated connector key adopts the core value without making the form dirty', () => {
@@ -856,7 +937,7 @@ test('an unmigrated connector key adopts the core value without making the form 
         assert.equal(h.nodes.tailscale_app_connector.disabled, false);
         assert.equal(h.nodes.settings_notice.textContent, '');
         assert.equal(h.nodes.app_connector_migration.style.display, 'none');
-        h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '100000000' + (advertise ? '1' : '0'));
+        h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '100000000' + (advertise ? '1' : '0') + '10');
     }
 });
 
@@ -877,7 +958,7 @@ test('an explicit persisted connector setting is available even while the daemon
     h.reply(h.next('tailscale_tsnets'), { interfaces: [] }); h.advance();
     assert.equal(h.nodes.tailscale_app_connector.disabled, false);
     assert.equal(h.nodes.tailscale_app_connector.checked, true);
-    h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '0000000001');
+    h.click('apply_settings'); assert.equal(h.next('tailscale_config').body.params[1], '000000000110');
 });
 
 test('connector status covers hidden, failed, untagged, unassigned, and learned states as plain text', () => {
@@ -929,39 +1010,149 @@ test('core management offers a cleanup action and a retention choice outside the
     assert.match(html, /<label for="core_keep_previous">更新时保留旧核心<\/label>/);
     // Unknown until the first status arrives, the page must not default to deleting.
     assert.match(html, /id="core_keep_previous" type="checkbox" checked="checked"/);
+    assert.match(html, /id="core_keep_notice" class="ts_notice ts_saving"/);
+    assert.match(html, /改动后立即保存，不需要点「应用设置」/);
     const h = harness(); h.boot();
     assert.equal(h.nodes.core_keep_previous.checked, true);
     assert.equal(h.nodes.core_keep_previous.disabled, false);
     h.change('core_keep_previous', false);
+    const save = h.next('tailscale_core');
+    assert.deepEqual(save.body.params, ['keep', '0']);
+    assert.deepEqual(save.body.fields, {});
+    h.reply(save, { accepted: true, keep_previous: false }, true); h.advance();
     assert.equal(h.nodes.settings_notice.textContent, '');
     assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_config').length, 0);
     h.click('apply_settings');
-    assert.equal(h.next('tailscale_config').body.params[1].length, 10);
+    assert.equal(h.next('tailscale_config').body.params[1].length, 12);
 });
 
-test('an update carries the retention choice, warns before deleting, and then shows the saved value', () => {
+test('the retention choice is saved as soon as it changes', () => {
     const h = harness(); h.boot();
     h.change('core_keep_previous', false);
-    // A status read must not undo a choice the user has not submitted yet.
-    h.reply(reach(h, 'tailscale_fettle'), h.status());
+    // The choice cannot change again, or start an update, until the router answers.
+    assert.equal(h.nodes.core_keep_previous.disabled, true);
+    assert.equal(h.nodes.core_update.disabled, true);
+    assert.equal(h.nodes.core_keep_notice.textContent, '保存中…');
+    h.change('core_keep_previous', true);
     assert.equal(h.nodes.core_keep_previous.checked, false);
+    const save = h.next('tailscale_core');
+    assert.deepEqual(save.body.params, ['keep', '0']);
+    // A one-step save opens no task panel.
+    assert.equal(h.nodes.job_title.textContent, '');
+    h.reply(save, { accepted: true, keep_previous: false }, true); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(h.nodes.core_keep_previous.disabled, false);
+    assert.equal(h.nodes.core_update.disabled, false);
+    assert.equal(h.nodes.core_keep_notice.textContent, '');
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_core').length, 1);
+    // The page follows the saved value, including a change made elsewhere.
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...h.status().core, keep_previous: false } })); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    h.reply(reach(h, 'tailscale_fettle'), h.status()); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, true);
+});
+
+test('a status read answered during saving keeps the new choice on screen', () => {
+    const h = harness(); h.boot();
+    h.advance(5000);
+    const status = h.next('tailscale_fettle');
+    h.change('core_keep_previous', false);
+    h.reply(status, h.status()); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(h.nodes.core_keep_notice.textContent, '保存中…');
+    h.reply(h.next('tailscale_core'), { accepted: true, keep_previous: false }); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(h.nodes.core_keep_notice.textContent, '');
+});
+
+test('a refused save restores the saved choice and says why', () => {
+    const h = harness(); h.boot();
+    h.change('core_keep_previous', false);
+    h.reply(h.next('tailscale_core'), { accepted: false, error: 'save_failed' }, true); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, true);
+    assert.equal(h.nodes.core_keep_previous.disabled, false);
+    assert.equal(h.nodes.core_keep_notice.textContent, '保存失败，请检查存储空间后重试');
+    h.change('core_keep_previous', false);
+    assert.equal(h.nodes.core_keep_notice.textContent, '保存中…');
+    h.reply(h.next('tailscale_core'), { accepted: false, error: 'invalid_action' }, true); h.advance();
+    assert.equal(h.nodes.core_keep_previous.checked, true);
+    assert.equal(h.nodes.core_keep_notice.textContent, '保存失败，请刷新页面后重试');
+});
+
+test('an unanswered save is not sent again; the next status read shows what was saved', () => {
+    const saves = h => h.history.filter(r => r.body && r.body.method === 'tailscale_core').length;
+    const h = harness(); h.boot();
+    h.change('core_keep_previous', false);
+    h.next('tailscale_core').finish('timeout'); h.advance();
+    assert.equal(h.nodes.core_keep_notice.textContent, '正在确认保存结果…');
+    assert.equal(h.nodes.core_keep_previous.disabled, true);
+    assert.equal(h.nodes.core_update.disabled, true);
+    // Another page may have saved a newer choice since: read, never resend.
+    const status = h.next();
+    assert.equal(status.body.method, 'tailscale_fettle');
+    status.finish('timeout'); h.advance();
+    assert.equal(h.nodes.core_keep_previous.disabled, true);
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...h.status().core, keep_previous: false } })); h.advance();
+    assert.equal(h.nodes.core_keep_notice.textContent, '');
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(h.nodes.core_keep_previous.disabled, false);
+    assert.equal(saves(h), 1);
+    // Here the router holds another choice: the page shows it and says so.
+    const other = harness(); other.boot();
+    other.change('core_keep_previous', false);
+    other.next('tailscale_core').finish('timeout'); other.advance();
+    other.reply(reach(other, 'tailscale_fettle'), other.status()); other.advance();
+    assert.equal(other.nodes.core_keep_previous.checked, true);
+    assert.equal(other.nodes.core_keep_previous.disabled, false);
+    assert.match(other.nodes.core_keep_notice.textContent, /^未能确认是否已保存，复选框显示路由器上的设置/);
+    assert.equal(saves(other), 1);
+});
+
+test('a page paused during a save checks the result instead of saving again', () => {
+    const saves = h => h.history.filter(r => r.body && r.body.method === 'tailscale_core').length;
+    const h = harness(); h.boot();
+    h.change('core_keep_previous', false);
+    h.next('tailscale_core');
+    h.app.stop(); h.app.resume();
+    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...h.status().core, keep_previous: false } })); h.advance();
+    assert.equal(h.nodes.core_keep_notice.textContent, '');
+    assert.equal(h.nodes.core_keep_previous.checked, false);
+    assert.equal(saves(h), 1);
+    // A choice still waiting for its turn was never sent, so it goes after resuming.
+    const queued = harness(); queued.boot();
+    queued.advance(5000);
+    const status = queued.next('tailscale_fettle');
+    queued.change('core_keep_previous', false);
+    queued.app.stop(); queued.app.resume();
+    assert.notEqual(status, null);
+    assert.deepEqual(reach(queued, 'tailscale_core').body.params, ['keep', '0']);
+});
+
+test('an update carries the retention choice its prompt described', () => {
+    const h = harness(); h.boot();
+    h.change('core_keep_previous', false);
+    h.reply(h.next('tailscale_core'), { accepted: true, keep_previous: false }); h.advance();
     h.click('core_update');
     assert.match(h.confirmations[0], /更新成功后将删除旧核心，之后无法回退。是否继续？$/);
     const write = h.next('tailscale_core');
     assert.deepEqual(write.body.params, ['update', '0']);
     assert.deepEqual(write.body.fields, {});
     assert.equal(h.nodes.core_keep_previous.disabled, true);
+    // A task in progress keeps the choice fixed and sends nothing.
+    h.change('core_keep_previous', true);
+    assert.equal(h.nodes.core_keep_previous.checked, false);
     h.accept(write);
     h.finishJob(reach(h, 'tailscale_job'), 'success');
     const saved = { ...h.status().core, keep_previous: false, can_rollback: false, can_cleanup: false };
     h.reply(reach(h, 'tailscale_fettle'), h.status({ core: saved })); h.advance();
     assert.equal(h.nodes.core_keep_previous.checked, false);
     assert.equal(h.nodes.core_cleanup.disabled, true);
-    // Once saved, the page follows the backend again.
-    h.reply(reach(h, 'tailscale_fettle'), h.status({ core: { ...saved, keep_previous: true } })); h.advance();
-    assert.equal(h.nodes.core_keep_previous.checked, true);
+    assert.equal(h.history.filter(r => r.body && r.body.method === 'tailscale_core').length, 2);
+    // A page that last read "keep" did not warn, so its update keeps the old
+    // core even if another page has saved "delete" since.
     const kept = harness(); kept.boot(); kept.click('core_update');
     assert.doesNotMatch(kept.confirmations[0], /删除旧核心/);
+    assert.deepEqual(kept.next('tailscale_core').body.params, ['update', '1']);
 });
 
 test('cleanup is confirmed, runs as one core task, and is unavailable when nothing can be removed', () => {

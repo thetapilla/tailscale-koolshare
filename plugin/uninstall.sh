@@ -19,6 +19,12 @@ if [ -e "$DATA/update.txn" ] || [ -L "$DATA/update.txn" ]; then
     exit 1
 fi
 ts_stop || exit 1
+# Stopping removed the LAN policy rules unless they could not be listed.
+# Nothing removes them once this library is gone, so try once more.
+if ! ts_lan_rules_clear; then
+    sleep 1
+    ts_lan_rules_clear || printf '%s\n' '局域网设备的路由规则未能删除，重启路由器后会消失；Tailscale 已停止，这些规则不再改变流量的去向。' >&2
+fi
 # Preserve identity and existing user settings. The connector preference is
 # re-imported from the core on a future installation.
 for name in tailscale_config tailscale_fettle tailscale_tsnets tailscale_status tailscale_ncheck tailscale_watchdog tailscale_lib.sh tailscale_core tailscale_core_lib.sh tailscale_job tailscale_diagnostics; do
@@ -39,7 +45,7 @@ rmdir "$DATA" 2>/dev/null || :
 for key in tailscale_app_connector tailscale_version; do
     dbus remove "$key" || exit 1
 done
-for key in version install name title description author; do
+for key in version install name title description author link; do
     dbus remove "softcenter_module_${MODULE}_$key" || exit 1
 done
 printf '%s\n' "Tailscale 已卸载。已保留连接身份（$KSROOT/configs/tailscale）和软件中心中的插件设置。"

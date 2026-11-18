@@ -18,7 +18,7 @@
 <script type="text/javascript" src="/popup.js"></script>
 <script type="text/javascript" src="/validator.js"></script>
 <script type="text/javascript" src="/res/softcenter.js"></script>
-<script type="text/javascript" src="/res/tailscale3.js?v=3.4.0"></script>
+<script type="text/javascript" src="/res/tailscale3.js?v=3.5.0"></script>
 <style type="text/css">
 .FormTitle, .FormTable, .FormTable th, .FormTable td, .FormTable_table, .FormTable_table th, .FormTable_table td {
     font-size:14px; font-family:Roboto-Light,"Microsoft JhengHei",sans-serif;
@@ -29,6 +29,7 @@
 .ts_section { margin-top:12px; }
 .ts_help { font-size:12px; color:#d4d8da; line-height:1.6; padding-top:4px; }
 .ts_notice { color:#ffdc86; white-space:pre-wrap; overflow-wrap:break-word; line-height:1.6; }
+.ts_saving { font-size:12px; margin-left:6px; }
 .ts_value { white-space:pre-wrap; overflow-wrap:break-word; }
 .ts_actions input { margin:3px 5px 3px 0; }
 .ts_actions a { display:inline-block; margin:3px 5px 3px 0; }
@@ -125,14 +126,19 @@ function init() {
 <div>本机主路由：<span id="routes_primary" class="ts_value"></span></div>
 <div>本机主路由表示当前由本机承担的网段。批准状态请在管理控制台查看。</div>
 </div></td></tr>
-<tr><th><label for="tailscale_accept_routes">访问远程局域网</label></th><td><input id="tailscale_accept_routes" type="checkbox" disabled="disabled" />
-<div class="ts_help">允许本机和局域网设备访问其他设备共享的子网。各处局域网应使用不同网段，避免路由冲突。</div></td></tr>
+<tr><th><label for="tailscale_accept_routes">接受远程路由</label></th><td><input id="tailscale_accept_routes" type="checkbox" disabled="disabled" />
+<label class="ts_advanced" for="tailscale_accept_routes_lan"><input id="tailscale_accept_routes_lan" type="checkbox" checked="checked" disabled="disabled" /> 局域网设备也使用</label>
+<div class="ts_help">使用 Tailnet 中其他设备宣告的网段，包括它们共享的局域网和应用连接器学到的地址。各处局域网应使用不同网段，避免路由冲突。</div>
+<div class="ts_help">勾选「局域网设备也使用」时，局域网设备也能经本机访问这些网段，对方看到的来源是本机；固件不支持 IPv6 地址转换时，IPv6 网段除外。取消后只有本机使用，局域网设备访问这些网段时不经过 Tailnet。</div></td></tr>
 <tr><th><label for="tailscale_accept_dns">使用 Tailscale DNS</label></th><td><input id="tailscale_accept_dns" type="checkbox" disabled="disabled" />
 <div class="ts_help">开启后，路由器自身的域名解析经过 Tailscale，可解析 Tailnet 设备名；局域网设备的解析不受影响。默认关闭，此时使用固件的 DNS 设置。</div></td></tr>
 <tr><th><label for="tailscale_exit_node">提供互联网出口</label></th><td><input id="tailscale_exit_node" type="checkbox" disabled="disabled" />
 <div class="ts_help">允许其他设备通过此路由器访问互联网。需先在管理控制台批准，再由其他设备选择此出口节点。</div></td></tr>
 <tr><th><label for="tailscale_app_connector">提供应用连接器</label></th><td><input id="tailscale_app_connector" type="checkbox" disabled="disabled" />
-<div class="ts_help">让 Tailnet 中的设备按域名经本机访问互联网。域名在管理控制台的 Apps 中配置；本机需带有应用指定的标签，并为该标签设置自动批准。设备使用 Tailscale DNS 查询这些域名时，本机会记下解析出的地址并对 Tailnet 宣告；局域网中未安装 Tailscale 的设备也能经已宣告的地址访问。只在需要作为出口的那台路由器上开启。</div>
+<label class="ts_advanced" for="tailscale_app_connector_periodic"><input id="tailscale_app_connector_periodic" type="checkbox" disabled="disabled" /> 定期学习</label>
+<div class="ts_help">让 Tailnet 中的设备按域名经本机访问互联网。域名在管理控制台的 Apps 中配置；本机需带有应用指定的标签，并为该标签设置自动批准。只在需要作为出口的那台路由器上开启。</div>
+<div class="ts_help">本机只从经过它的 DNS 查询中学习地址，再对 Tailnet 宣告。开启 Tailscale DNS 的设备查询这些域名时会经过本机；没开 Tailscale DNS 的设备和没装 Tailscale 的局域网设备自己解析域名，拿到的地址不一定已被学到。</div>
+<div class="ts_help">勾选「定期学习」后，本机每 30 分钟自己查询一次分配的域名，域名换了地址也能学到。本机查到的地址可能与其他设备查到的不同；通配域名无法这样学习。</div>
 <div id="app_connector_migration" class="ts_help" style="display:none;">服务启动后才能读取并更改此选项；本次应用会保留原设置。</div>
 <div id="app_connector_status" class="ts_help ts_value" style="display:none;" aria-live="polite"></div></td></tr>
 <tr><th><label for="tailscale_watchdog_enable">自动恢复连接</label></th><td><input id="tailscale_watchdog_enable" type="checkbox" disabled="disabled" />
@@ -157,8 +163,8 @@ function init() {
 <div id="core_rollback_target" class="ts_help" style="display:none;"></div>
 <div class="ts_help">先检查更新，再安装更新源提供的核心。保留有上一版本时，可手动回退。</div>
 </td></tr>
-<tr><th><label for="core_keep_previous">更新时保留旧核心</label></th><td><input id="core_keep_previous" type="checkbox" checked="checked" disabled="disabled" />
-<div class="ts_help">勾选时，更新后保留被替换的核心，可用「回退上一核心」换回。取消勾选可节省存储空间：更新成功后删除旧核心，之后无法回退。此选项在点击「更新核心」时保存。</div>
+<tr><th><label for="core_keep_previous">更新时保留旧核心</label></th><td><input id="core_keep_previous" type="checkbox" checked="checked" disabled="disabled" /><span id="core_keep_notice" class="ts_notice ts_saving" role="status" aria-live="polite"></span>
+<div class="ts_help">勾选时，更新后保留被替换的核心，可用「回退上一核心」换回。取消勾选可节省存储空间：更新成功后删除旧核心，之后无法回退。改动后立即保存，不需要点「应用设置」。</div>
 <div class="ts_help">「清理旧版核心」会立即删除当前核心以外的所有核心。</div></td></tr></table></div>
 <div id="task_panel" class="ts_box ts_section" style="display:none;" role="region" aria-label="操作进度">
 <div><span id="job_title"></span><span class="ts_badge">任务 <span id="job_id"></span></span></div>

@@ -145,11 +145,15 @@ ts_job_write() {
 
 ts_job_log() {
     # Callers pass generated safe messages, never CLI output, state or secrets.
+    # RUN/events.log keeps every line as the plugin's event history, which the
+    # diagnostic summary shows; TS_EVENTS=0 keeps the summary itself out of it.
     local line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" target
-    target="$RUN/events.log"
-    printf '%s\n' "$line" >>"$target"
-    if [ "$(wc -c <"$target")" -gt 32768 ]; then
-        tail -c 16384 "$target" >"$target.new" && mv -f "$target.new" "$target"
+    if [ "${TS_EVENTS:-1}" = 1 ]; then
+        target="$RUN/events.log"
+        printf '%s\n' "$line" >>"$target"
+        if [ "$(wc -c <"$target")" -gt 32768 ]; then
+            tail -c 16384 "$target" >"$target.new" && mv -f "$target.new" "$target"
+        fi
     fi
     if [ -n "${TS_JOB:-}" ]; then
         target="$WEB/tailscale3_$TS_JOB.log"
@@ -187,7 +191,9 @@ ts_config_read() {
     WATCHDOG=$(ts_read_bool tailscale_watchdog_enable 1) &&
     ACCEPT_DNS=$(ts_read_bool tailscale_accept_dns 0) &&
     CUSTOM=$(ts_read_bool tailscale_custom_routes_enable 0) &&
-    APP_CONNECTOR=$(ts_read_bool tailscale_app_connector 0) || return 1
+    APP_CONNECTOR=$(ts_read_bool tailscale_app_connector 0) &&
+    LAN_ROUTES=$(ts_read_bool tailscale_accept_routes_lan 1) &&
+    APPC_PERIODIC=$(ts_read_bool tailscale_app_connector_periodic 0) || return 1
     ts_routes_read || return 1
     # Validate even a disabled list: keep it available for later use, never
     # conceal a corrupt saved value by treating it as an empty list.
@@ -195,7 +201,7 @@ ts_config_read() {
 }
 
 ts_bits_valid() {
-    case ${#1} in 7|9|10) ;; *) return 1;; esac
+    case ${#1} in 7|9|10|12) ;; *) return 1;; esac
     case $1 in *[!01]*) return 1;; esac
 }
 
@@ -219,11 +225,12 @@ ts_routes_validate() {
 ts_config_keys() {
     printf '%s\n' tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable \
         tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable \
-        tailscale_accept_dns tailscale_custom_routes_enable tailscale_app_connector
+        tailscale_accept_dns tailscale_custom_routes_enable tailscale_app_connector \
+        tailscale_accept_routes_lan tailscale_app_connector_periodic
 }
 
 ts_config_snapshot() {
-    local key value count=0 bits=${1:-0000000000}
+    local key value count=0 bits=${1:-000000000000}
     [ "$TS_LOCKED" = 1 ] || return 1
     : >"$RUN/config.previous"
     rm -f "$RUN/config.routes.previous" "$RUN/config.routes.invalid"
@@ -272,7 +279,7 @@ ts_config_restore() {
         else return 1; fi
     fi
     while IFS='=' read -r key value; do
-        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable|tailscale_accept_dns|tailscale_custom_routes_enable|tailscale_app_connector) ;; *) return 1;; esac
+        case $key in tailscale_enable|tailscale_ipv4_enable|tailscale_ipv6_enable|tailscale_advertise_routes|tailscale_accept_routes|tailscale_exit_node|tailscale_watchdog_enable|tailscale_accept_dns|tailscale_custom_routes_enable|tailscale_app_connector|tailscale_accept_routes_lan|tailscale_app_connector_periodic) ;; *) return 1;; esac
         case $value in 0|1) dbus set "$key=$value" >/dev/null 2>&1 || failed=1;;
             '') dbus remove "$key" >/dev/null 2>&1 || failed=1;; *) return 1;; esac
     done <"$RUN/config.previous"
@@ -388,23 +395,261 @@ ts_legacy_cleanup() {
 }
 
 ts_chain() {
-    local binary=$1 table=$2 parent=$3 chain=$4
+    local binary=$1 table=$2 parent=$3 chain=$4 removed=0
     ts_ipt "$binary" -t "$table" -N "$chain" 2>/dev/null || :
     ts_ipt "$binary" -t "$table" -F "$chain" || return 1
     if [ "$table:$parent" = nat:POSTROUTING ]; then
         # Fullcone and other established NAT hooks get first opportunity;
         # plugin MASQUERADE is the final fallback for LAN-to-tailnet traffic.
-        while ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+        # A program restoring the jump meanwhile must not keep this loop, and
+        # the lock it holds, going forever.
+        while ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do
+            removed=$((removed + 1))
+            [ "$removed" -lt 16 ] || return 1
+        done
         ts_ipt "$binary" -t "$table" -A "$parent" -j "$chain"
     elif ! ts_ipt "$binary" -t "$table" -C "$parent" -j "$chain" 2>/dev/null; then
         ts_ipt "$binary" -t "$table" -I "$parent" 1 -j "$chain"
     fi
 }
 
+# IPv6 has no LAN subnet setting to read. Use the global addresses the LAN
+# interface has now; ip6tables masks each one to its prefix. Call after ts_lan.
+# Sets LAN6 to a bounded, newline-separated list of address/length entries.
+# Fails, with LAN6 empty, when the addresses cannot be read.
+ts_lan6() {
+    local listing
+    LAN6=
+    listing=$(ts_bound 5 ip -6 -o addr show dev "$LAN_IF" scope global 2>/dev/null) || return 1
+    LAN6=$(printf '%s\n' "$listing" | awk '
+        {
+            entry = ""
+            for (i = 1; i < NF; i++) if ($i == "inet6") { entry = tolower($(i + 1)); break }
+            if (entry !~ /^[0-9a-f:]+\/[0-9]+$/ || entry ~ /^fd7a:115c:a1e0:/) next
+            split(entry, part, "/")
+            if (part[2] + 0 < 1 || part[2] + 0 > 128 || seen[entry]++) next
+            if (++count <= 8) print entry
+        }')
+}
+
+# A peer accepts only sources inside this device's tailnet addresses and its
+# approved routes. Masquerade LAN IPv6 traffic into the tunnel, as the IPv4
+# rule does for the LAN subnet. LAN6_NAT=1 when every rule is in place. When
+# the addresses cannot be read, LAN6 is "unknown": no cached list matches it,
+# so the next minute task applies the rules again. LAN6_RETRY=1 when the
+# rules failed for a reason that may pass.
+ts_lan6_nat() {
+    local prefix
+    LAN6_NAT=0; LAN6_RETRY=0
+    ts_lan6 || { LAN6=unknown; return 0; }
+    which ip6tables >/dev/null 2>&1 || return 0
+    if ts_chain ip6tables nat POSTROUTING TSKS_POSTROUTING 2>/dev/null; then
+        LAN6_NAT=1
+        for prefix in $LAN6; do
+            ts_ipt ip6tables -t nat -A TSKS_POSTROUTING -s "$prefix" -o tailscale0 -j MASQUERADE || { LAN6_NAT=0; break; }
+        done
+        [ "$LAN6_NAT" = 0 ] || return 0
+    fi
+    # A kernel without IPv6 NAT has no such table, which ip6tables reports
+    # with status 3; ts_lan_rules then keeps LAN IPv6 traffic out of the
+    # tunnel. Any other failure, such as a busy firewall, is tried again.
+    ts_ipt ip6tables -t nat -S POSTROUTING >/dev/null 2>&1
+    [ "$?" = 3 ] || LAN6_RETRY=1
+}
+
+# tailscaled looks up its table 52 for every packet at priority 5270, so the
+# routes it accepts capture forwarded LAN traffic too. It leaves the numbers
+# around its rules free for local rules. LAN traffic that must stay off remote
+# routes jumps from 5269 to 5271, over that one lookup, so every other rule
+# still applies; 5268 first sends tailnet addresses on to 5270. No rule names
+# a table, so a name given to table 52 changes nothing. A rule is this
+# plugin's only in exactly this form, never by its priority alone.
+# Prints FAMILY's wanted rules in priority order.
+ts_lan_rules_wanted() {
+    local range=100.64.0.0/10
+    [ "$ACCEPT" = 1 ] || return 0
+    if [ "$1" = -6 ]; then
+        range=fd7a:115c:a1e0::/48
+        # Without IPv6 masquerading a peer drops LAN IPv6 sources. Keep that
+        # traffic on its usual path even when LAN devices may use remote routes.
+        [ "$LAN_ROUTES" = 0 ] || [ "$LAN6_NAT" != 1 ] || return 0
+    else
+        [ "$LAN_ROUTES" = 0 ] || return 0
+    fi
+    printf '%s\n' "5268 to $range iif $LAN_IF goto 5270" "5269 iif $LAN_IF goto 5271" '5271 nop'
+}
+
+# Prints FAMILY's live rules that have one of the forms above, in priority
+# order, as "ip rule show" words them (iproute2 prints "to" before "iif")
+# without "from all" or kernel flags such as [unresolved]. A delete request
+# names only these selectors, and the kernel removes the first rule that has
+# them, whatever else it matches on or jumps to. Each line therefore starts
+# with "=" when deleting it removes this rule, or "!" when another rule listed
+# earlier would be removed instead. Fails when the rules cannot be listed,
+# with status 2 when the kernel has no policy routing for FAMILY: then no rule
+# can send that family's traffic to table 52.
+ts_lan_rules_live() {
+    local listing range=100.64.0.0/10
+    [ "$1" = -4 ] || range=fd7a:115c:a1e0::/48
+    if ! listing=$(ts_bound 5 ip "$1" rule show 2>&1); then
+        case $listing in *'not supported'*) return 2;; esac
+        return 1
+    fi
+    printf '%s\n' "$listing" | awk -v range="$range" '
+        {
+            line = $1; sub(/:$/, "", line)
+            for (i = 2; i <= NF; i++) {
+                if ($i == "from" && $(i + 1) == "all") { i++; continue }
+                if ($i !~ /^\[/) line = line " " $i
+            }
+            n = split(line, w, " ")
+            if (w[1] != "5268" && w[1] != "5269" && w[1] != "5271") next
+            iif = ""; to = ""; action = ""
+            for (i = 2; i <= n; i++) {
+                if (w[i] == "iif") iif = w[i + 1]
+                else if (w[i] == "to") to = w[i + 1]
+                else if (w[i] == "goto" || w[i] == "nop") action = w[i]
+            }
+            # What a delete request for a rule of ours here would also match.
+            key = ""
+            if (w[1] == "5271" && action == "nop") key = "5271"
+            else if (w[1] == "5269" && action == "goto" && iif != "") key = "5269 " iif
+            else if (w[1] == "5268" && action == "goto" && to == range && iif != "") key = "5268 " iif
+            if (line == "5271 nop" ||
+                (n == 7 && w[1] == "5268" && w[2] == "to" && w[3] == range && w[4] == "iif" && w[6] == "goto" && w[7] == "5270") ||
+                (n == 5 && w[1] == "5269" && w[2] == "iif" && w[4] == "goto" && w[5] == "5271"))
+                print (key in other ? "!" : "=") line
+            else if (key != "") other[key] = 1
+        }'
+}
+
+# FAMILY add|del RULE, with RULE in the form above. The kernel refuses to add
+# a rule like one it holds, but compares neither the jump target nor the
+# conditions a request leaves out. A refusal therefore means another rule is
+# in the way, never that this one is in place: the listing showed it was not.
+ts_lan_rule_ip() {
+    local family=$1 command=$2 pref first second third fourth rest
+    read -r pref first second third fourth rest <<EOF
+$3
+EOF
+    case $pref:$first:$third in
+        5271:nop:) set -- pref 5271 nop;;
+        5268:to:iif) set -- pref 5268 to "$second" iif "$fourth" goto 5270;;
+        5269:iif:goto) set -- pref 5269 iif "$second" goto 5271;;
+        *) return 1;;
+    esac
+    ts_bound 5 ip "$family" rule "$command" "$@" >/dev/null 2>&1
+}
+
+ts_lan_rule_listed() {
+    case "
+$2
+" in *"
+$1
+"*) return 0;; esac
+    return 1
+}
+
+# Brings FAMILY's rules to the wanted set and adds them to LAN_RULES_SET. A
+# rule that stays is never removed, so a refresh cannot briefly send LAN
+# traffic through table 52. Removal starts with the jump and addition ends
+# with it: the lookup is never skipped for tailnet addresses.
+ts_lan_rules_sync() {
+    local family=$1 wanted live entry line plain= pref kept stuck=0 failed=0
+    wanted=$(ts_lan_rules_wanted "$family")
+    # Without a listing nothing can be told apart, so nothing is changed.
+    live=$(ts_lan_rules_live "$family")
+    case $? in 0) ;; 2) return 0;; *) return 1;; esac
+    for pref in 5269 5268 5271; do
+        kept=0
+        while IFS= read -r entry; do
+            line=${entry#?}
+            case $line in "$pref "*) ;; *) continue;; esac
+            plain="$plain$line
+"
+            # Keep one copy of a wanted rule; remove other forms and copies,
+            # but never by a request that would remove another rule first.
+            if [ "$kept" = 0 ] && ts_lan_rule_listed "$line" "$wanted"; then kept=1; continue; fi
+            # A jump that stays keeps the rules it depends on.
+            if [ "$stuck" = 1 ]; then failed=1; continue; fi
+            case $entry in '!'*) false;; *) ts_lan_rule_ip "$family" del "$line";; esac || {
+                failed=1
+                [ "$pref" != 5269 ] || stuck=1
+            }
+        done <<LIVE
+$live
+LIVE
+    done
+    for pref in 5271 5268 5269; do
+        while IFS= read -r line; do
+            case $line in "$pref "*) ;; *) continue;; esac
+            ! ts_lan_rule_listed "$line" "$plain" || continue
+            ts_lan_rule_ip "$family" add "$line" && continue
+            # The jump must not stay without the rules it depends on. List
+            # again: a request for a rule already gone would remove another.
+            live=$(ts_lan_rules_live "$family") || return 1
+            while IFS= read -r entry; do
+                case $entry in '=5269 '*) ts_lan_rule_ip "$family" del "${entry#?}" || :;; esac
+            done <<LIVE
+$live
+LIVE
+            return 1
+        done <<WANTED
+$wanted
+WANTED
+    done
+    [ "$failed" = 0 ] || return 1
+    while IFS= read -r line; do
+        [ -z "$line" ] || LAN_RULES_SET="$LAN_RULES_SET$family $line
+"
+    done <<WANTED
+$wanted
+WANTED
+}
+
+# Call after ts_lan and ts_lan6_nat. Fails when the rules may not match.
+# LAN_RULES_SET then lists the rules in place, each after its family.
+ts_lan_rules() {
+    local failed=0
+    LAN_RULES_SET=
+    ts_lan_rules_sync -4 || failed=1
+    ts_lan_rules_sync -6 || failed=1
+    return "$failed"
+}
+
+# Removes every rule in the forms above.
+ts_lan_rules_clear() {
+    local ACCEPT=0
+    ts_lan_rules
+}
+
+# True when a family's rules differ from those the last successful apply put
+# in place, as RUN/firewall-rules records them. With none recorded there is
+# nothing to check. A family that cannot be listed is unknown, never a change.
+ts_lan_rules_changed() {
+    local family live recorded
+    [ -f "$RUN/firewall-rules" ] || return 1
+    for family in -4 -6; do
+        live=$(ts_lan_rules_live "$family")
+        case $? in 0) ;; 2) live=;; *) continue;; esac
+        live=$(printf '%s\n' "$live" | awk -v family="$family" '$0 != "" { print family " " substr($0, 2) }')
+        recorded=$(grep -e "^$family " "$RUN/firewall-rules")
+        [ "$live" = "$recorded" ] || return 0
+    done
+    return 1
+}
+
+# True when the LAN interface's IPv6 prefixes differ from the applied ones.
+# An unreadable list is unknown, never a change.
+ts_lan6_changed() {
+    ts_lan && ts_lan6 || return 1
+    [ "$LAN6" != "$(cat "$RUN/firewall-lan6" 2>/dev/null)" ]
+}
+
 ts_firewall_apply() {
     ts_config_read || return 1
     [ "$ENABLE" = 1 ] || { ts_firewall_remove; return; }
-    local binary allowed tailip index status_source=${1:-}
+    local binary allowed tailip index retry=0 status_source=${1:-}
     # Consume only events that precede this refresh. A concurrent NAT event
     # leaves a new marker for the next minute task while fd9 is held here.
     # Replaying a deferred event renews the rule repairs like handling one.
@@ -412,7 +657,7 @@ ts_firewall_apply() {
     rm -f "$RUN/nat-pending"
     # Only a fully successful apply may establish the address cache. A failed
     # refresh must be retried by maintenance even when addresses stay the same.
-    rm -f "$RUN/firewall-status.json"
+    rm -f "$RUN/firewall-status.json" "$RUN/firewall-lan6" "$RUN/firewall-nat6" "$RUN/firewall-rules" "$RUN/firewall-retry"
     for binary in iptables ip6tables; do
         if ! which "$binary" >/dev/null 2>&1; then
             [ "$binary" = ip6tables ] && continue
@@ -439,6 +684,32 @@ ts_firewall_apply() {
         ts_chain iptables nat POSTROUTING TSKS_POSTROUTING &&
         ts_chain iptables nat PREROUTING TSKS_PREROUTING || return 1
         ts_ipt iptables -t nat -A TSKS_POSTROUTING -s "$LAN_CIDR" -o tailscale0 -j MASQUERADE || return 1
+        if [ "${TS_RESTORED:-0}" = 1 ]; then
+            # install.sh is restoring a release without this library, which
+            # neither masquerades LAN IPv6 traffic nor adds these policy rules
+            # and could not remove them.
+            LAN6=; LAN6_NAT=1
+            ts_lan_rules_clear || :
+        else
+            # A failure that may pass is tried again by the minute task. The
+            # first attempt logs it; the retries do not repeat it.
+            ts_lan6_nat
+            if [ "$LAN6_RETRY" = 1 ]; then
+                retry=1
+                [ -n "${TS_FIREWALL_RETRIES:-}" ] || ts_job_log '局域网 IPv6 的来源改写设置失败，局域网设备暂时不能经 Tailscale 访问 IPv6 地址；稍后会自动重试，结果可在诊断摘要中查看'
+            fi
+            [ "$LAN6_NAT" != 1 ] || : >"$RUN/firewall-nat6" || return 1
+            if ! ts_lan_rules; then
+                retry=1
+                [ -n "${TS_FIREWALL_RETRIES:-}" ] || ts_job_log '局域网设备的路由规则设置失败，局域网设备是否使用远程路由可能与设置不符；稍后会自动重试，结果可在诊断摘要中查看'
+            elif [ -n "$LAN_RULES_SET" ]; then
+                # Maintenance compares the live rules with this record of the
+                # rules put in place, so a change made since is found.
+                printf '%s' "$LAN_RULES_SET" >"$RUN/firewall-rules" || return 1
+            fi
+            [ "$retry" = 0 ] || printf '%s\n' "${TS_FIREWALL_RETRIES:-0}" >"$RUN/firewall-retry" || return 1
+        fi
+        printf '%s\n' "$LAN6" >"$RUN/firewall-lan6" || return 1
         if [ -n "$status_source" ]; then
             cp "$status_source" "$RUN/firewall-next.json" || return 1
         else
@@ -456,17 +727,25 @@ ts_firewall_apply() {
             done
             mv -f "$RUN/firewall-next.json" "$RUN/firewall-status.json" || return 1
         fi
+    else
+        # Without the LAN interface no rule can tell LAN traffic apart.
+        ts_lan_rules_clear || :
     fi
 }
 
 ts_firewall_remove() {
-    local binary item table parent chain
+    local binary item table parent chain removed
+    rm -f "$RUN/firewall-nat6" "$RUN/firewall-rules" "$RUN/firewall-retry"
+    ts_lan_rules_clear || :
     for binary in iptables ip6tables; do
         which "$binary" >/dev/null 2>&1 || continue
         ts_legacy_cleanup "$binary"
         for item in filter:INPUT:TSKS_INPUT filter:OUTPUT:TSKS_OUTPUT filter:FORWARD:TSKS_FORWARD nat:POSTROUTING:TSKS_POSTROUTING nat:PREROUTING:TSKS_PREROUTING; do
             table=${item%%:*}; item=${item#*:}; parent=${item%%:*}; chain=${item#*:}
-            while ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+            removed=0
+            while [ "$removed" -lt 16 ] && ts_ipt "$binary" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do
+                removed=$((removed + 1))
+            done
             ts_ipt "$binary" -t "$table" -F "$chain" 2>/dev/null || :
             ts_ipt "$binary" -t "$table" -X "$chain" 2>/dev/null || :
         done
@@ -490,7 +769,12 @@ ts_plugin_hooks_present() {
         ts_hook filter FORWARD TSKS_FORWARD || return 1
     # The NAT chains exist only when the LAN subnet could be determined.
     ts_lan || return 0
-    ts_hook nat POSTROUTING TSKS_POSTROUTING && ts_hook nat PREROUTING TSKS_PREROUTING
+    ts_hook nat POSTROUTING TSKS_POSTROUTING && ts_hook nat PREROUTING TSKS_PREROUTING || return 1
+    # The firmware rebuilds no IPv6 NAT table, but another program may replace
+    # it alone. Check the hook only where masquerading was set up.
+    [ -f "$RUN/firewall-nat6" ] || return 0
+    ts_ipt ip6tables -t nat -S POSTROUTING >"$RUN/rules-nat6" 2>/dev/null || return 0
+    ts_hook nat6 POSTROUTING TSKS_POSTROUTING
 }
 
 # tailscaled installs its ts-* chains when it first configures routing and never
@@ -613,8 +897,17 @@ ts_start() {
     case $startup in manual|automatic) ;; *) return 1;; esac
     ts_config_read || { ts_job_log '设置值无效，请在插件页面重新应用设置'; return 1; }
     ts_cron
+    # Turning periodic learning off forgets its schedule, so on again it runs
+    # at the next minute.
+    [ "$APP_CONNECTOR" = 1 ] && [ "$APPC_PERIODIC" = 1 ] || rm -f "$RUN/appc-periodic"
     [ "$ENABLE" = 1 ] || { ts_job_log 'Tailscale 未启用'; return 0; }
     local state want routes= remaining route route_count=0 plan changed=0 current_connector saved_connector
+    # Keep LAN devices off remote routes before the daemon can install any.
+    # The firewall apply below completes the rules.
+    if [ "$LAN_ROUTES" = 0 ] && ts_lan; then
+        LAN6_NAT=1
+        ts_lan_rules || :
+    fi
     ts_daemon_start || return 1
     # Reuse the ready sample's prefs. Do not issue another LocalAPI request;
     # a missing setting is migrated before any managed preference is changed.
@@ -822,7 +1115,7 @@ ts_watch_confirm() {
 # Keeps the plugin rules matching the daemon's addresses and the live tables,
 # independently of automatic service recovery. LISTED is 1 after ts_hooks_read.
 ts_firewall_maintenance() {
-    local sample=$1 listed=$2 ips applied reason=
+    local sample=$1 listed=$2 ips applied reason= retries
     [ "$(ts_get "$sample" ok)" = true ] || return 0
     ips=$(ts_get "$sample" ips) || ips=
     case $ips in ''|'[]'|null) ;; *)
@@ -834,10 +1127,77 @@ ts_firewall_maintenance() {
     if [ -z "$reason" ] && [ "$listed" = 1 ] && ! ts_plugin_hooks_present; then
         reason='插件防火墙规则已被固件重建清除，已重新应用'
     fi
+    # A new IPv6 prefix may reach the LAN after the WAN's NAT event.
+    if [ -z "$reason" ] && ts_lan6_changed; then
+        reason='已根据局域网 IPv6 地址刷新防火墙规则'
+    fi
+    # No firmware rebuild touches policy rules, but another program may.
+    if [ -z "$reason" ] && ts_lan_rules_changed; then
+        reason='局域网设备的路由规则被其他程序改动，已重新应用'
+    fi
+    # A refresh that met a failure which may pass is tried again, three times
+    # after each refresh at most; the refresh logged the failure.
+    if [ -z "$reason" ] && retries=$(cat "$RUN/firewall-retry" 2>/dev/null) && ts_uint "$retries" && [ "$retries" -lt 3 ]; then
+        TS_FIREWALL_RETRIES=$((retries + 1))
+        reason=retry
+    fi
     [ -n "$reason" ] || return 0
     # Reuse the sample instead of issuing another LocalAPI request.
     ts_firewall_apply "$sample" || return 1
-    ts_job_log "$reason"
+    if [ "$reason" != retry ]; then ts_job_log "$reason"
+    elif [ ! -f "$RUN/firewall-retry" ]; then ts_job_log '已补上之前未能设置的防火墙规则'
+    fi
+}
+
+# Periodic learning repeats the self query every 30 minutes, so learned
+# addresses follow DNS changes even when no device asks this connector.
+# RUN/appc-periodic keeps the schedule, the last reported count and notice.
+ts_appc_periodic() {
+    local sample=$1 file="$RUN/appc-periodic" result="$RUN/appc-periodic.$$" now last=0 reported= notice=
+    local key value assigned= primed= learned= wildcards= denied=
+    if [ "$APP_CONNECTOR" != 1 ] || [ "$APPC_PERIODIC" != 1 ]; then rm -f "$file"; return 0; fi
+    [ "$(ts_get "$sample" backend_state)" = Running ] || return 0
+    now=$(ts_now)
+    ts_uint "$now" || return 0
+    if [ -f "$file" ]; then
+        while IFS='=' read -r key value; do
+            case $key in
+                at) ! ts_uint "$value" || last=$value;;
+                learned) ! ts_uint "$value" || reported=$value;;
+                notice) case $value in failed|denied) notice=$value;; esac;;
+            esac
+        done <"$file"
+    fi
+    # A clock set backwards must not postpone learning by the same amount.
+    if [ "$last" != 0 ] && [ "$now" -ge "$last" ] && [ "$((now - last))" -lt 1800 ]; then return 0; fi
+    if ts_bound 20 "$HELPER" appc-prime "$SOCKET" >"$result" 2>/dev/null; then
+        assigned=$(ts_get "$result" assigned); primed=$(ts_get "$result" primed)
+        learned=$(ts_get "$result" learned); wildcards=$(ts_get "$result" wildcards)
+        denied=$(ts_get "$result" denied)
+    fi
+    rm -f "$result"
+    if ! ts_uint "$assigned" || ! ts_uint "$primed" || ! ts_uint "$learned" || ! ts_uint "$wildcards"; then
+        assigned=
+    elif [ "$denied" != true ] && [ "$assigned" -gt "$wildcards" ] && [ "$primed" = 0 ]; then
+        # Exact domains were queried, but no answer taught the connector.
+        assigned=
+    fi
+    if [ -z "$assigned" ]; then
+        [ "$notice" = failed ] || ts_job_log '应用连接器：定期学习暂未完成，30 分钟后重试'
+        notice=failed
+    elif [ "$denied" = true ]; then
+        [ "$notice" = denied ] || ts_job_log '应用连接器：定期学习的查询被访问控制拒绝，30 分钟后重试'
+        notice=denied
+    else
+        notice=
+        # Only exact domains are queried; with none, the count was not read.
+        if [ "$assigned" -gt "$wildcards" ]; then
+            [ "$learned" = "$reported" ] || ts_job_log "应用连接器：定期学习完成，已学习 $learned 个地址"
+            reported=$learned
+        fi
+    fi
+    { printf 'at=%s\nlearned=%s\nnotice=%s\n' "$now" "$reported" "$notice" >"$file.new" &&
+        mv -f "$file.new" "$file"; } 2>/dev/null || rm -f "$file.new"
 }
 
 ts_watchdog_run() {
@@ -856,6 +1216,7 @@ ts_watchdog_run() {
             [ "$repair" = 2 ] || return "$repair"
         fi
         ts_firewall_maintenance "$RUN/watchdog-status.json" "$listed" || ts_job_log '刷新防火墙规则失败，将在后续检查中重试'
+        ts_appc_periodic "$RUN/watchdog-status.json"
     fi
     [ "$WATCHDOG" = 1 ] || return 0
     NOW=$(ts_now)
@@ -976,7 +1337,7 @@ ts_status_json() {
     NOW=$(ts_now); ts_watch_read
     local last=
     [ "$WD_LAST" = 0 ] || last=$WD_LAST
-    printf '{"schema":1,"enabled":%s,"plugin_version":"3.4.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s,"can_cleanup":%s,"keep_previous":%s}' \
+    printf '{"schema":1,"enabled":%s,"plugin_version":"3.5.0","core_version":%s,"backend_state":%s,"online":%s,"health_codes":%s,"health_messages":%s,"auth_url":%s,"monitoring_available":%s,"watchdog":{"enabled":%s,"last_recovery":%s,"count_24h":%s},"core":{"installed":%s,"installed_build":%s,"available":%s,"available_build":%s,"update_available":%s,"previous":%s,"previous_build":%s,"can_rollback":%s,"can_cleanup":%s,"keep_previous":%s}' \
         "$(ts_bool "$ENABLE")" "$(ts_quote "$version")" "$(ts_quote "$backend")" "$online" "$codes" "$messages" "$(ts_quote "$auth")" "$monitoring" "$(ts_bool "$WATCHDOG")" "$(ts_quote "$last")" "$WD_COUNT" "$(ts_quote "$installed")" "$(ts_quote "$installed_build")" "$(ts_quote "$available")" "$(ts_quote "$available_build")" "$update_available" "$(ts_quote "$previous")" "$(ts_quote "$previous_build")" "$rollback" "$cleanup" "$(ts_bool "$keep")"
     printf ',"core_version_long":%s,"routes":%s,"app_connector":%s' "$(ts_quote "$version_long")" "$routes" "$app_connector"
     [ -z "$error" ] || printf ',"error":%s' "$(ts_quote "$error")"
@@ -1054,7 +1415,7 @@ ts_mutation() {
             ts_job_write failed configuration '无法备份当前设置，未应用更改；请检查存储空间后重试'
             return 1
         fi
-        if [ "${#bits}" = 10 ] && grep -qx 'tailscale_app_connector=' "$RUN/config.previous"; then
+        if [ "${#bits}" -ge 10 ] && grep -qx 'tailscale_app_connector=' "$RUN/config.previous"; then
             TS_CONNECTOR_CAPTURE=1
         fi
         ts_pid_alive && old_running=1
@@ -1072,6 +1433,9 @@ ts_mutation() {
         restart) ts_restart || rc=$?;;
         web_submit)
             if ts_config_read; then
+                # Turning periodic learning off forgets its schedule, also when
+                # the same submission stops the service.
+                [ "$APP_CONNECTOR" = 1 ] && [ "$APPC_PERIODIC" = 1 ] || rm -f "$RUN/appc-periodic"
                 if [ "$ENABLE" = 1 ]; then ts_restart || rc=$?; else : >"$RUN/manual-stop"; ts_stop || rc=$?; fi
             else ts_job_log '设置值无效，请在插件页面重新应用设置'; rc=1; fi;;
         start_nat) ts_firewall_apply || rc=$?;;

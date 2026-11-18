@@ -7,7 +7,11 @@
     var $ = options.$, doc = options.document, clock = options.now || function () { return Date.now(); };
     var later = options.setTimeout || setTimeout, cancel = options.clearTimeout || clearTimeout;
     var storage = options.storage, ask = options.confirm || function () { return true; };
-    var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable', 'tailscale_accept_dns', 'tailscale_custom_routes_enable', 'tailscale_app_connector'];
+    var keys = ['tailscale_enable', 'tailscale_ipv4_enable', 'tailscale_ipv6_enable', 'tailscale_advertise_routes', 'tailscale_accept_routes', 'tailscale_exit_node', 'tailscale_watchdog_enable', 'tailscale_accept_dns', 'tailscale_custom_routes_enable', 'tailscale_app_connector', 'tailscale_accept_routes_lan', 'tailscale_app_connector_periodic'];
+    // An unset key reads as the backend's default. The installer writes the
+    // other defaults; this one is on, so an unset value must not read as off.
+    var defaults = { tailscale_accept_routes_lan: '1' };
+    var draftPattern = /^(?:[01]{7}|[01]{9}|[01]{10}|[01]{12})$/;
     var buttons = ['apply_settings', 'core_check', 'core_update', 'core_rollback', 'core_cleanup', 'run_status', 'run_netcheck', 'run_diagnostics'];
     // Software-center httpdb accepts request IDs of at most eight digits.
     var maxRequestId = 99999999, lastId = Math.floor(Math.random() * maxRequestId), timer = null, xhr = null;
@@ -15,8 +19,11 @@
     var configReady = false, dirty = false, busy = false, pending = null, submitted = null, job = null, logTarget = null;
     var configDue = 0, statusDue = 0, interfacesDue = 0, jobDue = 0, logDue = 0;
     var canUpdate = false, canRollback = false, canCleanup = false, statusGood = false, lastStatus = null;
-    // The retention choice is saved by the update request, not by "apply settings".
-    var keepTouched = false;
+    // The retention choice is saved as soon as it changes, not by "apply settings".
+    // keepWant holds a choice being saved ('0' or '1'), keepSent whether its
+    // request went out; keepCheck holds one whose save had no definite
+    // answer, until the next status read.
+    var keepWant = null, keepDue = Infinity, keepSent = false, keepCheck = null;
     var configNotice = '', statusNotice = '', statusReadNotice = '', baseline = '', refreshingStatus = false;
     var jobStarted = 0, jobPaused = false, JOB_WINDOW = 15 * 60 * 1000;
     var routeRows = [], routeSerial = 0, baselineRoutes = '', legacyDraft = 0, routesNotice = '';
@@ -89,6 +96,11 @@
     function snapshot() {
         return keys.map(function (key) { return node(key).checked ? '1' : '0'; }).join('');
     }
+    function configured(value, key) {
+        if (value === '1' || value === 1 || value === true) { return '1'; }
+        if (value === '0' || value === 0 || value === false) { return '0'; }
+        return defaults[key] || '0';
+    }
     function routesDraft() {
         return routeRows.map(function (item) { return item.input.value.trim(); }).filter(Boolean).join(',');
     }
@@ -121,7 +133,7 @@
         item.row.className = 'ts_route_row';
         item.input.type = 'text'; item.input.className = 'input_32_table ts_route_input'; item.input.value = value || '';
         item.input.setAttribute('aria-label', '自定义共享网段 ' + (++routeSerial));
-        item.input.setAttribute('placeholder', '例如 192.168.60.0/24 或 119.188.240.179/32');
+        item.input.setAttribute('placeholder', '例如 192.168.60.0/24 或 123.45.67.89/32');
         item.input.setAttribute('spellcheck', 'false');
         item.button.type = 'button'; item.button.className = 'button_gen ts_route_delete'; item.button.value = '删除';
         item.error.className = 'ts_notice ts_route_hint'; item.error.setAttribute('aria-live', 'polite');
@@ -159,10 +171,11 @@
         }
     }
     function restoreDraft(task) {
-        if (task.method !== 'tailscale_config' || typeof task.draft !== 'string' || !/^(?:[01]{7}|[01]{9}|[01]{10})$/.test(task.draft)) { return; }
+        if (task.method !== 'tailscale_config' || typeof task.draft !== 'string' || !draftPattern.test(task.draft)) { return; }
         keys.slice(0, task.draft.length).forEach(function (key, index) { node(key).checked = task.draft.charAt(index) === '1'; });
-        legacyDraft = task.draft.length < 10 ? task.draft.length : 0;
-        connectorDraft = task.draft.length === 10;
+        // A shorter draft predates later keys; those are read from the router.
+        legacyDraft = task.draft.length < keys.length ? task.draft.length : 0;
+        connectorDraft = task.draft.length >= 10;
         if (task.draft.length >= 9 && typeof task.routes === 'string') { setRoutes(task.routes); }
         dirty = true;
     }
@@ -179,19 +192,31 @@
         return '';
     }
     function refreshStatus() { if (lastStatus) { renderStatus(lastStatus); } }
+    // Show the choice being saved; otherwise the value the router reports as saved.
+    function keepShown() {
+        var box = node('core_keep_previous'), core = lastStatus && lastStatus.core;
+        if (!box) { return; }
+        if (keepWant !== null) { box.checked = keepWant === '1'; }
+        else if (core && typeof core.keep_previous === 'boolean') { box.checked = core.keep_previous; }
+    }
     function controls() {
         var locked = busy || !configReady, task = activeTask(), settingTask = task && task.method === 'tailscale_config', i;
+        var full = connectorKnown || connectorDraft;
         for (i = 0; i < keys.length; i++) { if (node(keys[i])) { node(keys[i]).disabled = locked; } }
-        node('tailscale_app_connector').disabled = locked || !(connectorKnown || connectorDraft);
-        visible('app_connector_migration', configReady && !connectorKnown && !connectorDraft);
+        node('tailscale_app_connector').disabled = locked || !full;
+        // A sub-option applies only with its parent. Settings after the
+        // connector also need its value: a nine-bit submission cannot carry them.
+        node('tailscale_accept_routes_lan').disabled = locked || !full || !node('tailscale_accept_routes').checked;
+        node('tailscale_app_connector_periodic').disabled = locked || !full || !node('tailscale_app_connector').checked;
+        visible('app_connector_migration', configReady && !full);
         routeRows.forEach(function (item) { item.input.disabled = locked; item.button.disabled = locked; });
         if (node('custom_routes_add')) { node('custom_routes_add').disabled = locked || routeRows.length >= 32; }
         visible('custom_routes_editor', !!node('tailscale_custom_routes_enable').checked);
         for (i = 0; i < buttons.length; i++) { if (node(buttons[i])) { node(buttons[i]).disabled = locked; } }
-        if (node('core_update')) { node('core_update').disabled = locked || !statusGood || !canUpdate; }
+        if (node('core_update')) { node('core_update').disabled = locked || !statusGood || !canUpdate || keepWant !== null || keepCheck !== null; }
         if (node('core_rollback')) { node('core_rollback').disabled = locked || !statusGood || !canRollback; }
         if (node('core_cleanup')) { node('core_cleanup').disabled = locked || !statusGood || !canCleanup; }
-        if (node('core_keep_previous')) { node('core_keep_previous').disabled = locked || !statusGood; }
+        if (node('core_keep_previous')) { node('core_keep_previous').disabled = locked || !statusGood || keepWant !== null || keepCheck !== null; }
         visible('job_resume', jobPaused);
         text('settings_notice', settingTask ? (jobPaused ? '设置结果尚未确认' : pending || submitted ? '正在提交设置…' : job.confirmed ? '正在应用设置…' : '正在确认设置结果…') :
             !configReady ? (configNotice ? '读取设置失败，正在重试…' : '正在读取设置…') : routesNotice || (dirty ? '设置尚未应用' : ''));
@@ -242,17 +267,14 @@
             if (!dirty || legacyDraft) {
                 for (i = 0; i < keys.length; i++) {
                     if (node(keys[i]) && (!dirty || i >= legacyDraft)) {
-                        node(keys[i]).checked = i === 9 ? connector === '1' || connector === 1 || connector === true : data[keys[i]] === '1' || data[keys[i]] === 1 || data[keys[i]] === true;
+                        node(keys[i]).checked = configured(i === 9 ? connector : data[keys[i]], keys[i]) === '1';
                     }
                 }
                 if (!dirty || legacyDraft === 7) { setRoutes(typeof data.tailscale_custom_routes === 'string' ? data.tailscale_custom_routes : ''); }
                 legacyDraft = 0;
                 if (!dirty) { connectorDraft = false; }
             }
-            baseline = keys.map(function (key, index) {
-                var value = index === 9 ? connector : data[key];
-                return value === '1' || value === 1 || value === true ? '1' : '0';
-            }).join('');
+            baseline = keys.map(function (key, index) { return configured(index === 9 ? connector : data[key], key); }).join('');
             baselineRoutes = typeof data.tailscale_custom_routes === 'string' ? data.tailscale_custom_routes : '';
             dirty = snapshot() !== baseline || routesDraft() !== baselineRoutes;
             configReady = true;
@@ -267,7 +289,7 @@
         if (appc && typeof appc.advertise === 'boolean' && !connectorKnown) {
             connectorKnown = true;
             if (!connectorDraft) { node('tailscale_app_connector').checked = appc.advertise; }
-            baseline = baseline.slice(0, 9) + (appc.advertise ? '1' : '0');
+            baseline = baseline.slice(0, 9) + (appc.advertise ? '1' : '0') + baseline.slice(10);
             if (configReady) { dirty = snapshot() !== baseline || routesDraft() !== baselineRoutes; }
         }
         if (appc && appc.advertise === false) { visible('app_connector_status', false); return; }
@@ -305,7 +327,7 @@
         canUpdate = core.update_available === true;
         canRollback = core.can_rollback === true;
         canCleanup = core.can_cleanup === true;
-        if (!keepTouched && node('core_keep_previous') && typeof core.keep_previous === 'boolean') { node('core_keep_previous').checked = core.keep_previous; }
+        keepShown();
         text('plugin_version', plain(data.plugin_version) || '版本未知');
         text('core_current', coreLabel(current, current === installed ? core.installed_build : '') || '版本不可用');
         text('core_latest', available ? available + (core.update_available === false ? '（与当前核心相同）' : '') : '暂无检查结果');
@@ -358,6 +380,11 @@
             statusGood = true;
             statusReadNotice = '';
             refreshingStatus = false;
+            // Requests run one at a time, so this read followed the unanswered save.
+            if (keepCheck !== null) {
+                text('core_keep_notice', (data.core && data.core.keep_previous) === (keepCheck === '1') ? '' : '未能确认是否已保存，复选框显示路由器上的设置；如需更改，请重新选择');
+                keepCheck = null;
+            }
             renderStatus(data);
             statusDue = clock() + 5000;
         });
@@ -383,6 +410,40 @@
                 });
             }
             text('interfaces_notice', data.interfaces.length ? '' : '暂无 Tailscale 地址；连接后会自动刷新。');
+        });
+    }
+    // Without a definite answer the save is not sent again: another page may
+    // have saved a newer choice since. The next status read shows the saved
+    // value, and says when it differs from this choice.
+    function keepUnanswered() {
+        keepCheck = keepWant;
+        keepWant = null;
+        keepSent = false;
+        statusDue = 0;
+        text('core_keep_notice', '正在确认保存结果…');
+    }
+    function saveKeep() {
+        keepSent = true;
+        rpc('tailscale_core', ['keep', keepWant], '', null, function (error, response) {
+            var result = unpack(response), saved;
+            keepDue = Infinity;
+            keepSent = false;
+            if (error || !result || typeof result.accepted !== 'boolean') {
+                keepUnanswered();
+                keepShown();
+                controls();
+                return;
+            }
+            if (result.accepted) {
+                saved = typeof result.keep_previous === 'boolean' ? result.keep_previous : keepWant === '1';
+                if (lastStatus && lastStatus.core) { lastStatus.core.keep_previous = saved; }
+                text('core_keep_notice', '');
+            } else {
+                text('core_keep_notice', result.error === 'save_failed' ? '保存失败，请检查存储空间后重试' : '保存失败，请刷新页面后重试');
+            }
+            keepWant = null;
+            keepShown();
+            controls();
         });
     }
     function beginJob(action, uncertain) {
@@ -480,8 +541,6 @@
             if (terminal) {
                 if (job.reloadConfig) { configDue = 0; configReady = false; if (data.state === 'success') { dirty = false; } else { restoreDraft(job); } }
                 refreshingStatus = data.state === 'success' && (job.method === 'tailscale_config' || (job.method === 'tailscale_core' && /^(update|rollback)$/.test(job.intent)));
-                // The backend saved the choice with this request; show the saved value again.
-                if (job.method === 'tailscale_core' && job.intent === 'update') { keepTouched = false; }
                 busy = false;
                 job = null;
                 jobPaused = false;
@@ -520,10 +579,11 @@
             refreshStatus();
             controls();
         }
-        // Select the oldest due read so a slow, failing endpoint cannot starve
-        // the others. Ties retain task/config/status/interface order.
+        // Select the oldest due request so a slow, failing endpoint cannot starve
+        // the others. Ties retain save/task/config/status/interface order.
         due = Infinity;
-        [[job && !jobPaused ? jobDue : Infinity, readJob], [logTarget ? logDue : Infinity, readLog],
+        [[keepWant !== null ? keepDue : Infinity, saveKeep],
+            [job && !jobPaused ? jobDue : Infinity, readJob], [logTarget ? logDue : Infinity, readLog],
             [configDue, readConfig], [statusDue, readStatus], [interfacesDue, readInterfaces]].forEach(function (entry) {
             if (entry[0] < due) { due = entry[0]; next = entry[1]; }
         });
@@ -561,9 +621,10 @@
         if (busy || !configReady) { return false; }
         // httpdb writes fields before dispatch. Keep the snapshot in params so
         // only the locked backend operation can change persisted settings.
-        // An upgrade may leave this setting unset until the daemon can report
-        // its existing preference. A nine-bit request preserves it meanwhile.
-        bits = snapshot().slice(0, connectorKnown || connectorDraft ? 10 : 9);
+        // An upgrade may leave the connector setting unset until the daemon can
+        // report its existing preference. A nine-bit request preserves it, and
+        // the settings after it, meanwhile.
+        bits = snapshot().slice(0, connectorKnown || connectorDraft ? keys.length : 9);
         clearRouteErrors();
         return action('tailscale_config', ['web_submit', bits, routesWire(routesDraft())], '应用设置', {});
     }
@@ -586,10 +647,20 @@
         });
         bind('apply_settings', 'click', apply);
         bind('core_check', 'click', function () { action('tailscale_core', ['check'], '检查核心更新'); });
-        bind('core_keep_previous', 'change', function () { if (!busy && statusGood) { keepTouched = true; } });
+        bind('core_keep_previous', 'change', function () {
+            // A disabled box cannot change; show the saved or saving value again.
+            if (busy || !configReady || !statusGood || keepWant !== null || keepCheck !== null) { keepShown(); return; }
+            keepWant = node('core_keep_previous').checked ? '1' : '0';
+            keepDue = 0;
+            text('core_keep_notice', '保存中…');
+            controls();
+            schedule(0);
+        });
         bind('core_update', 'click', function () {
             var keep = !node('core_keep_previous') || node('core_keep_previous').checked;
-            if (!busy && canUpdate && statusGood && ask('更新核心可能短暂中断 Tailscale 连接。' + (keep ? '' : '更新成功后将删除旧核心，之后无法回退。') + '是否继续？')) {
+            // The request carries the choice the prompt described, even if
+            // another page saved a different one since this page last read it.
+            if (!busy && canUpdate && statusGood && keepWant === null && keepCheck === null && ask('更新核心可能短暂中断 Tailscale 连接。' + (keep ? '' : '更新成功后将删除旧核心，之后无法回退。') + '是否继续？')) {
                 action('tailscale_core', ['update', keep ? '1' : '0'], '更新核心');
             }
         });
@@ -608,7 +679,7 @@
         if (saved && validId(saved.id)) {
             lastId = Math.max(lastId, Number(saved.id));
             busy = true;
-            if (saved.method === 'tailscale_config' && typeof saved.draft === 'string' && /^(?:[01]{7}|[01]{9}|[01]{10})$/.test(saved.draft)) {
+            if (saved.method === 'tailscale_config' && typeof saved.draft === 'string' && draftPattern.test(saved.draft)) {
                 restoreDraft(saved);
             }
             beginJob({ id: String(saved.id), title: plain(saved.title) || '上次操作', method: plain(saved.method),
@@ -622,6 +693,8 @@
         stopped = true;
         epoch++;
         if (submitted) { beginJob(submitted, true); submitted = null; }
+        // A save already sent may have been written; one still queued was not.
+        if (keepWant !== null && keepSent) { keepUnanswered(); }
         if (timer !== null) { cancel(timer); timer = null; }
         if (xhr && typeof xhr.abort === 'function') { xhr.abort(); }
         xhr = null;

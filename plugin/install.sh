@@ -34,7 +34,7 @@ check_package_paths() {
 
 check_package() {
     "$VERIFIED_HELPER" check-tree "$PKG" || fail '安装包文件校验失败'
-    [ "$(cat "$PKG/version")" = 3.4.0 ] || fail '插件版本无效'
+    [ "$(cat "$PKG/version")" = 3.5.0 ] || fail '插件版本无效'
 }
 
 verify_helper() {
@@ -213,10 +213,10 @@ prepare_files() {
             mkdir -p "$STAGE/backup/${rel%/*}" && cp -a "$path" "$STAGE/backup/$rel" || fail '无法备份现有文件'
         fi
     done <"$STAGE/files"
-    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_accept_dns tailscale_custom_routes_enable tailscale_custom_routes tailscale_app_connector tailscale_version; do
+    for key in tailscale_enable tailscale_ipv4_enable tailscale_ipv6_enable tailscale_advertise_routes tailscale_accept_routes tailscale_exit_node tailscale_watchdog_enable tailscale_accept_dns tailscale_custom_routes_enable tailscale_custom_routes tailscale_app_connector tailscale_accept_routes_lan tailscale_app_connector_periodic tailscale_version; do
         dbus get "$key" >"$STAGE/dbus/$key" || fail '无法备份插件设置'
     done
-    for key in version install name title description author md5; do
+    for key in version install name title description author link md5; do
         dbus get "softcenter_module_${MODULE}_$key" >"$STAGE/dbus/softcenter_module_${MODULE}_$key" &&
             dbus get "softcenter_module_tailscale_$key" >"$STAGE/dbus/softcenter_module_tailscale_$key" || fail '无法备份插件设置'
     done
@@ -301,7 +301,15 @@ restore() {
             # intent again. Recreate only the daemon, cron and network rules.
             if ts_daemon_start >/dev/null 2>&1 && ts_restore_ready && ts_config_read; then
                 ts_cron
-                ts_firewall_apply >/dev/null 2>&1 || rc=1
+                # The restored release applies its own rules: an older one does
+                # not know rules this candidate adds and could never remove them,
+                # and a newer one may need rules this candidate does not know.
+                if [ -f "$KSROOT/scripts/tailscale_lib.sh" ]; then
+                    ( TS_RESTORED=0; . "$KSROOT/scripts/tailscale_lib.sh" && ts_init && ts_firewall_apply ) >/dev/null 2>&1 || rc=1
+                else
+                    TS_RESTORED=1
+                    ts_firewall_apply >/dev/null 2>&1 || rc=1
+                fi
             else rc=1; fi
         elif [ "$OLD_KIND" = legacy ] && [ -x "$KSROOT/bin/tailscaled" ]; then
             set -- "$KSROOT/bin/tailscaled" "--state=$STATE" "--socket=$OLD_SOCKET"
@@ -314,6 +322,9 @@ restore() {
             done
             [ "$tries" -lt 15 ] || rc=1
             SOCKET=$OLD_SOCKET
+            # The restored plugin has no such library; apply only the rules
+            # this candidate shares with it.
+            TS_RESTORED=1
             ts_firewall_apply >/dev/null 2>&1 || rc=1
         fi
     fi
@@ -368,21 +379,22 @@ while IFS= read -r rel; do
     fi
 done <"$STAGE/files"
 "$VERIFIED_HELPER" atomic-link "$SELECTED" "$DATA/current" || fail '无法切换核心链接'
-for pair in tailscale_enable:0 tailscale_ipv4_enable:1 tailscale_ipv6_enable:1 tailscale_advertise_routes:1 tailscale_accept_routes:1 tailscale_exit_node:0 tailscale_watchdog_enable:1 tailscale_accept_dns:0 tailscale_custom_routes_enable:0; do
+for pair in tailscale_enable:0 tailscale_ipv4_enable:1 tailscale_ipv6_enable:1 tailscale_advertise_routes:1 tailscale_accept_routes:1 tailscale_exit_node:0 tailscale_watchdog_enable:1 tailscale_accept_dns:0 tailscale_custom_routes_enable:0 tailscale_accept_routes_lan:1 tailscale_app_connector_periodic:0; do
     key=${pair%:*}; value=${pair#*:}
     [ -n "$(dbus get "$key")" ] || dbus set "$key=$value" || fail '无法设置默认参数'
 done
 HELPER=$KSROOT/bin/tsks-helper
 ts_start || fail '服务就绪检查失败'
 # Registration follows successful readiness, including disabled fresh installs.
-for pair in tailscale_version=3.4.0 version=3.4.0 install=1 "name=$MODULE" title=Tailscale 'description=连接 Tailscale 网络，共享局域网和互联网出口' 'author=ThetaPilla, sadog'; do
+# The software center's "官网 / GitHub" button opens the registered link.
+for pair in tailscale_version=3.5.0 version=3.5.0 install=1 "name=$MODULE" title=Tailscale 'description=连接 Tailscale 网络，共享局域网和互联网出口' 'author=ThetaPilla, sadog' link=https://github.com/thetapilla/tailscale-koolshare; do
     case $pair in tailscale_version=*) ;; *) pair=softcenter_module_${MODULE}_$pair;; esac
     dbus set "$pair" || fail '无法注册插件'
 done
 # The former identity must not remain: the software center would list it as an
 # installed marketplace plugin and offer the marketplace version as its update.
-for key in version install name title description author md5; do
+for key in version install name title description author link md5; do
     [ -z "$(dbus get "softcenter_module_tailscale_$key")" ] || dbus remove "softcenter_module_tailscale_$key" || fail '无法移除旧的软件中心登记'
 done
 COMMITTED=1
-say "Tailscale 3.4.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"
+say "Tailscale 3.5.0 安装完成（${PLATFORM} / ${ARCH}）；现有配置与连接身份已保留。"

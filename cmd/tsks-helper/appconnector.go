@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -404,6 +405,11 @@ type primeTiming struct {
 
 var defaultPrimeTiming = primeTiming{18 * time.Second, 5 * time.Second, 10 * time.Second, 250 * time.Millisecond, 8}
 
+// primeStart picks the domain a self query starts with, among n > 0.
+var primeStart = primeStartDefault
+
+func primeStartDefault(n int) int { return rand.IntN(n) }
+
 func appcPrime(c *http.Client, peerClient *http.Client, timing primeTiming) (primeResult, error) {
 	out := primeResult{}
 	ctx, cancel := context.WithTimeout(context.Background(), timing.total)
@@ -461,11 +467,19 @@ func appcPrime(c *http.Client, peerClient *http.Client, timing primeTiming) (pri
 			}
 		}()
 	}
-send:
+	exact := make([]string, 0, len(domains)-wildcards)
 	for _, domain := range domains {
-		if strings.HasPrefix(domain, "*.") {
-			continue
+		if !strings.HasPrefix(domain, "*.") {
+			exact = append(exact, domain)
 		}
+	}
+	// Stalled queries hold the workers until the budget ends. Each run starts
+	// at a random domain, so stalls cannot keep the same later domains
+	// unqueried on every periodic run.
+	start := primeStart(len(exact))
+	exact = append(exact[start:len(exact):len(exact)], exact[:start]...)
+send:
+	for _, domain := range exact {
 		for _, typ := range []uint16{1, 28} {
 			select {
 			case jobs <- job{domain, typ}:

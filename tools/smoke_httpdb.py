@@ -375,12 +375,18 @@ sys.exit(7)
         assert config["tailscale_accept_dns"] == "1" and config["tailscale_custom_routes_enable"] == "1", config
         assert config["tailscale_custom_routes"] == "192.0.2.0/24,2001:db8:abcd::/48", config
         assert config["tailscale_app_connector"] == "1", config
+        job("tailscale_config", ["web_submit", "011110111101", wire_routes(config["tailscale_custom_routes"])])
+        config = json.loads(request_http("/_api/tailscale_"))["result"][0]
+        assert config["tailscale_accept_routes_lan"] == "0" and config["tailscale_app_connector_periodic"] == "1", config
+        job("tailscale_config", ["web_submit", "0111101111", wire_routes(config["tailscale_custom_routes"])])
+        assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
         job("tailscale_config", ["web_submit", "011110111", wire_routes(config["tailscale_custom_routes"])])
         assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
         job("tailscale_config", ["web_submit", "0111101"])
         assert json.loads(request_http("/_api/tailscale_"))["result"][0] == config
         jobs_before = sorted(p.name for p in Path("/tmp/upload").glob("*.json"))
-        for params in (["web_submit", "0111101111"], ["web_submit", "0111101", "b64."], ["web_submit", "0111101111", "b64.", "extra"]):
+        for params in (["web_submit", "0111101111"], ["web_submit", "0111101", "b64."], ["web_submit", "0111101111", "b64.", "extra"],
+                       ["web_submit", "01111011110", "b64."]):
             _, invalid_snapshot = rpc("tailscale_config", params)
             assert invalid_snapshot == {"accepted": False, "error": "invalid_config_snapshot"}, invalid_snapshot
         assert sorted(p.name for p in Path("/tmp/upload").glob("*.json")) == jobs_before

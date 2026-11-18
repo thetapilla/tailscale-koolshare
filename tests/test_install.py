@@ -46,7 +46,10 @@ elif name=='dbus':
     if args[0]=='get':print(data.get(args[1],''))
     elif args[0]=='set':
         key,value=args[1].split('=',1);data[key]=value;write('config.json',data)
-    elif args[0]=='remove':data.pop(args[1],None);write('config.json',data)
+    elif args[0]=='remove':
+        if (root/'fail-dbus-remove').exists() and (root/'fail-dbus-remove').read_text()==args[1]:
+            (root/'fail-dbus-remove').unlink();sys.exit(1)
+        data.pop(args[1],None);write('config.json',data)
 elif name=='flock':
     try:fcntl.flock(int(args[-1]),fcntl.LOCK_UN if '-u' in args else fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:sys.exit(1)
@@ -104,6 +107,7 @@ ts_init() {
 ts_lock() { exec 9>"$RUN/operation.lock"; flock -n 9 || return; TS_LOCKED=1; }
 ts_unlock() { flock -u 9; exec 9>&-; }
 ts_stop() { printf '%s\n' stop >>"$MOCK_ROOT/lifecycle"; }
+ts_lan_rules_clear() { :; }
 ts_start() {
  printf 'start version=%s\n' "$(dbus get tailscale_version)" >>"$MOCK_ROOT/lifecycle"
  if [ -f "$MOCK_ROOT/migrate-connector" ] && [ -z "$(dbus get tailscale_app_connector)" ]; then
@@ -120,7 +124,16 @@ ts_daemon_start() { printf '%s\n' restore-daemon >>"$MOCK_ROOT/lifecycle"; }
 ts_restore_ready() { [ ! -f "$MOCK_ROOT/fail-restore-ready" ]; }
 ts_config_read() { return 0; }
 ts_cron() { printf '%s\n' cron >>"$MOCK_ROOT/lifecycle"; }
-ts_firewall_apply() { printf '%s\n' firewall >>"$MOCK_ROOT/lifecycle"; }
+# Restoring, the rules must be those the restored release manages.
+ts_firewall_apply() { printf 'firewall restored=%s\n' "${TS_RESTORED:-0}" >>"$MOCK_ROOT/lifecycle"; }
+'''
+
+
+# The library an existing installation leaves behind; restoring it after a
+# failed install must apply its own rules.
+OLD_LIBRARY = r'''#!/bin/sh
+ts_init() { RUN=$TSKS_RUN; }
+ts_firewall_apply() { printf 'firewall by restored release restored=%s\n' "${TS_RESTORED:-0}" >>"$MOCK_ROOT/lifecycle"; }
 '''
 
 
@@ -255,6 +268,7 @@ class InstallTests(unittest.TestCase):
             (target / name).symlink_to('tailscale.combined')
         (self.ks / 'tailscale/current').symlink_to('cores/1.90.2-r1-arm')
         (self.ks / 'tailscale/previous').symlink_to('cores/1.90.2-r1-arm')
+        (self.ks / 'scripts/tailscale_lib.sh').write_text(OLD_LIBRARY)
         return core
 
     def test_fresh_install_selects_only_local_arch_and_registers_after_start(self):
@@ -267,6 +281,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read('config.json')['tailscale_enable'], '0')
         self.assertEqual(self.read('config.json')['tailscale_accept_dns'], '0')
         self.assertEqual(self.read('config.json')['tailscale_custom_routes_enable'], '0')
+        self.assertEqual(self.read('config.json')['tailscale_accept_routes_lan'], '1')
+        self.assertEqual(self.read('config.json')['tailscale_app_connector_periodic'], '0')
         self.assertNotIn('tailscale_custom_routes', self.read('config.json'))
         self.assertNotIn('tailscale_app_connector', self.read('config.json'))
         self.assertIn('start version=\n', (self.mock / 'lifecycle').read_text())
@@ -276,7 +292,7 @@ class InstallTests(unittest.TestCase):
     FORMER_FILES = ('webs/Module_tailscale.asp', 'res/icon-tailscale.png', 'scripts/uninstall_tailscale.sh')
     FORMER_KEYS = {'softcenter_module_tailscale_' + key: value for key, value in (
         ('version', '2.0.0'), ('install', '1'), ('name', 'tailscale'), ('title', 'Tailscale'),
-        ('description', 'marketplace plugin'), ('md5', 'a' * 32))}
+        ('description', 'marketplace plugin'), ('link', 'https://example.invalid/marketplace'), ('md5', 'a' * 32))}
 
     def former_identity(self):
         """Registration and files left by the marketplace plugin or by 3.3.0 and older."""
@@ -298,7 +314,9 @@ class InstallTests(unittest.TestCase):
             'softcenter_module_tailscaleks_name': 'tailscaleks',
             'softcenter_module_tailscaleks_title': 'Tailscale',
             'softcenter_module_tailscaleks_description': '连接 Tailscale 网络，共享局域网和互联网出口',
-            'softcenter_module_tailscaleks_author': 'ThetaPilla, sadog'})
+            'softcenter_module_tailscaleks_author': 'ThetaPilla, sadog',
+            # The software center's "官网 / GitHub" button opens this address.
+            'softcenter_module_tailscaleks_link': 'https://github.com/thetapilla/tailscale-koolshare'})
         for rel in self.NEW_FILES:
             self.assertTrue((self.ks / rel).is_file(), rel)
         self.assertIn("'Module_tailscaleks.asp'", (self.ks / 'webs/Module_tailscaleks.asp').read_text())
@@ -306,7 +324,7 @@ class InstallTests(unittest.TestCase):
     def test_upgrade_retires_the_former_software_center_identity(self):
         self.legacy(); self.former_identity(); self.install()
         self.assertEqual(sorted(self.registration()), sorted(
-            'softcenter_module_tailscaleks_' + key for key in ('version', 'install', 'name', 'title', 'description', 'author')))
+            'softcenter_module_tailscaleks_' + key for key in ('version', 'install', 'name', 'title', 'description', 'author', 'link')))
         for rel in self.FORMER_FILES:
             self.assertFalse((self.ks / rel).exists(), rel)
         for rel in self.NEW_FILES:
@@ -318,6 +336,17 @@ class InstallTests(unittest.TestCase):
     def test_failed_upgrade_restores_the_former_identity_exactly(self):
         self.legacy(); self.former_identity(); before = self.read('config.json')
         (self.mock / 'fail-start').touch(); self.install(False)
+        self.assertEqual(self.read('config.json'), before)
+        for rel in self.FORMER_FILES:
+            self.assertEqual((self.ks / rel).read_text(), 'former ' + rel)
+        for rel in self.NEW_FILES:
+            self.assertFalse((self.ks / rel).exists(), rel)
+
+    def test_failed_registration_restores_the_former_identity_exactly(self):
+        # Fail after every new key, the link included, has been registered.
+        self.legacy(); self.former_identity(); before = self.read('config.json')
+        (self.mock / 'fail-dbus-remove').write_text('softcenter_module_tailscale_version')
+        self.install(False)
         self.assertEqual(self.read('config.json'), before)
         for rel in self.FORMER_FILES:
             self.assertEqual((self.ks / rel).read_text(), 'former ' + rel)
@@ -435,13 +464,16 @@ class InstallTests(unittest.TestCase):
         config = self.read('config.json')
         self.assertEqual(config['tailscale_accept_dns'], '0')
         self.assertEqual(config['tailscale_custom_routes_enable'], '0')
+        self.assertEqual(config['tailscale_accept_routes_lan'], '1')
+        self.assertEqual(config['tailscale_app_connector_periodic'], '0')
         self.assertNotIn('tailscale_custom_routes', config)
         self.assertNotIn('tailscale_app_connector', config)
 
     def test_upgrade_retains_existing_dns_and_custom_routes(self):
         self.current()
         custom = {'tailscale_app_connector': '1', 'tailscale_accept_dns': '1', 'tailscale_custom_routes_enable': '1',
-                  'tailscale_custom_routes': '119.188.240.179/32,2001:db8::/64'}
+                  'tailscale_custom_routes': '119.188.240.179/32,2001:db8::/64',
+                  'tailscale_accept_routes_lan': '0', 'tailscale_app_connector_periodic': '1'}
         self.write('config.json', dict(self.read('config.json'), **custom))
         self.install()
         config = self.read('config.json')
@@ -499,7 +531,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(state.read_bytes(), identity)
         calls = (self.mock / 'lifecycle').read_text().splitlines()
         self.assertEqual(len([value for value in calls if value.startswith('start version=')]), 1)
-        self.assertEqual(calls[-3:], ['restore-daemon', 'cron', 'firewall'])
+        self.assertEqual(calls[-3:], ['restore-daemon', 'cron', 'firewall by restored release restored=0'])
         self.assertNotIn('tailscale_accept_dns', self.read('config.json'))
         self.assertEqual((self.ks / 'scripts/tailscale_config').read_text(), 'never execute old opaque control file')
 
@@ -589,7 +621,7 @@ class InstallTests(unittest.TestCase):
         argv = (self.mock / 'legacy-argv').read_text().splitlines()
         self.assertEqual(argv, ['--state=' + str(self.ks / 'configs/tailscale/tailscaled.state'), '--socket=/var/run/tailscale/tailscaled.sock'])
         self.assertIn(['status', '/var/run/tailscale/tailscaled.sock'], self.calls('tsks-helper'))
-        self.assertIn('firewall', (self.mock / 'lifecycle').read_text())
+        self.assertIn('firewall restored=1', (self.mock / 'lifecycle').read_text())
         self.assertEqual(self.read('config.json'), config)
 
     def test_failed_fresh_start_preserves_newly_generated_identity(self):

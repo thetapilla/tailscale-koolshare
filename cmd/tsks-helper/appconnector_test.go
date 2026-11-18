@@ -347,6 +347,69 @@ func TestPrimeBoundedLargeAssignment(t *testing.T) {
 	}
 }
 
+// dnsName reads the question name of a well-formed DNS query.
+func dnsName(raw []byte) string {
+	var labels []string
+	for i := 12; i < len(raw) && raw[i] != 0; i += int(raw[i]) + 1 {
+		labels = append(labels, string(raw[i+1:i+1+int(raw[i])]))
+	}
+	return strings.Join(labels, ".")
+}
+
+func TestPrimeStartsWhereItIsTold(t *testing.T) {
+	defer func(original func(int) int) { primeStart = original }(primeStart)
+	for _, start := range []int{0, 4} {
+		var mu sync.Mutex
+		queried := map[string]bool{}
+		// Every query stalls until the query budget ends.
+		peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+			mu.Lock()
+			queried[dnsName(raw)] = true
+			mu.Unlock()
+			<-r.Context().Done()
+		}))
+		self := appSelf()
+		u, _ := url.Parse(peer.URL)
+		self.PeerAPIURL = []string{peer.URL}
+		self.TailscaleIPs = []string{u.Hostname()}
+		domains := []string{"*.wild.example"}
+		for i := 0; i < 5; i++ {
+			domains = append(domains, fmt.Sprintf("host%d.example", i))
+		}
+		attr, _ := json.Marshal(map[string]any{"connectors": []string{"*"}, "domains": domains})
+		self.CapMap["tailscale.com/app-connectors"] = []json.RawMessage{attr}
+		local := connectFixture(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "status") {
+				json.NewEncoder(w).Encode(map[string]any{"Self": self})
+			} else {
+				fmt.Fprint(w, `{}`)
+			}
+		})
+		primeStart = func(n int) int {
+			if n != 5 {
+				t.Errorf("start chosen among %d exact domains", n)
+			}
+			return start
+		}
+		// Two workers take the first domain's two queries, which hold them
+		// until the budget ends: only the starting domain is queried.
+		out, e := appcPrime(local, peer.Client(), primeTiming{500 * time.Millisecond, 30 * time.Millisecond, 50 * time.Millisecond, time.Millisecond, 2})
+		peer.Close()
+		mu.Lock()
+		got := fmt.Sprint(queried)
+		mu.Unlock()
+		if want := fmt.Sprint(map[string]bool{fmt.Sprintf("host%d.example", start): true}); e != nil || out.Assigned != 6 || out.Wildcards != 1 || got != want {
+			t.Fatalf("start %d: %+v %v queried %s, want %s", start, out, e, got, want)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		if n := primeStartDefault(5); n < 0 || n >= 5 {
+			t.Fatalf("default start %d out of range", n)
+		}
+	}
+}
+
 func TestFullStatusConnector(t *testing.T) {
 	for _, prefs := range []string{`{"AppConnector":{"Advertise":true}}`, `{"AppConnector":{"Advertise":false}}`, `{}`, `{"AppConnector":{"Advertise":"true"}}`} {
 		t.Run(prefs, func(t *testing.T) {

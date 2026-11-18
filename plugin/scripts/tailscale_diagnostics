@@ -7,6 +7,10 @@ ts_lock || { ts_reply '{"accepted":false,"error":"busy"}'; exit 1; }
 trap 'ts_unlock' EXIT
 ts_job_begin "$ID" || exit 1
 ts_reply "{\"accepted\":true,\"job_id\":\"$TS_JOB\"}"
+# Tasks without a page, such as the minute task, log only to the event
+# history. Read it before the summary starts; the summary is not an event.
+TS_EVENTS=0
+events=$(tail -n 20 "$RUN/events.log" 2>/dev/null) || events=
 ts_status_file "$RUN/diagnostics.json"
 ts_job_log 'Tailscale 诊断摘要'
 for field in version version_long backend_state online monitoring_available health_available health_codes health_messages; do
@@ -17,6 +21,28 @@ ts_job_log "Linux 内核：$(uname -r)"
 ts_job_log "系统运行时间（秒）：$(awk '{print int($1)}' "$TSKS_PROC/uptime")"
 ts_job_log "可用内存：$(awk '/^MemAvailable:/ {print $2 " KiB"}' "$TSKS_PROC/meminfo")"
 ts_job_log "JFFS 可用空间：$(df -Pk "$DATA" | awk 'END {print $4 " KiB"}')"
+ts_job_log '最近插件事件'
+if [ -z "$events" ]; then
+    ts_job_log '无'
+else
+    printf '%s\n' "$events" | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 || \
+        ts_job_log '无法读取插件事件，请稍后重试'
+fi
+# The policy rules around tailscaled's show which way LAN traffic takes.
+for family in -4 -6; do
+    ts_job_log "策略路由规则（IPv${family#-}，优先级 5200–5299）"
+    if ! rules=$(ts_bound 5 ip "$family" rule show 2>/dev/null); then
+        ts_job_log '无法读取'
+        continue
+    fi
+    rules=$(printf '%s\n' "$rules" | awk '{ p = $1; sub(/:$/, "", p) } p ~ /^[0-9]+$/ && p + 0 >= 5200 && p + 0 < 5300')
+    if [ -z "$rules" ]; then
+        ts_job_log '无'
+    else
+        printf '%s\n' "$rules" | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 || \
+            ts_job_log '无法读取策略路由规则，请稍后重试'
+    fi
+done
 if [ -f "$RUN/daemon.log" ] && [ ! -L "$RUN/daemon.log" ]; then
     ts_job_log '最近服务日志（已限制长度并隐藏识别到的凭据）'
     tail -c 8192 "$RUN/daemon.log" | "$HELPER" log "$WEB/tailscale3_$TS_JOB.log" 65536 || \

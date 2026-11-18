@@ -9,7 +9,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | [VERSION](../VERSION) | 插件版本。 |
-| [tools/bundled_core.json](../tools/bundled_core.json) | 安装包预装的核心版本和构建号，与插件版本分开指定。只能填已发布并签名的不可变核心 Release，按插件发布的需要更新。 |
+| [tools/bundled_core.json](../tools/bundled_core.json) | 安装包预装的核心版本和构建号，与插件版本分开指定。只能填已发布并签名的不可变核心 Release；每次发布插件新版本前，改为当时最新的核心 Release。 |
 | [tools/core_recipe.json](../tools/core_recipe.json) | 核心构建配方：基线源码校验值、UPX 版本及校验值、容器镜像摘要、功能标签、压缩参数和核心大小上限。`initial_version` 是源码构建的默认基线，不决定插件预装哪个版本。 |
 | [tools/helper_recipe.json](../tools/helper_recipe.json) | 辅助程序的工具链配方。辅助程序按自身的 `go.mod` 和这份配方选择工具链，使用独立的缓存目录和依赖锁。 |
 
@@ -59,6 +59,7 @@ python3 tools/smoke_install.py --lifecycle
 
 插件 Release 对应 [VERSION](../VERSION) 中的版本：
 
+- 打包前把 `bundled_core.json` 改为当时最新的核心 Release，即 Releases 列表里最新的 `core-v<VERSION>-<BUILD>`，也是核心稳定源指向的版本。
 - 标签为 `v<VERSION>`，标题只写版本号，例如 `3.4.0`。
 - 附件为六个标准安装包和同批的 `SHA256SUMS`。
 - 正文用中文，取 [CHANGELOG](../CHANGELOG.md) 中该版本的小节，末尾附一段安装包说明。正文里的相对链接改成指向该版本标签的绝对链接。

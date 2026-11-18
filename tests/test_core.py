@@ -75,6 +75,11 @@ ts_start() {
     local target
     target=$(readlink "$DATA/current")
     printf 'start %s\n' "$target" >>"$RUN/lifecycle"
+    # Another page saves a retention choice, once, while the update runs.
+    if [ -f "$MOCK_ROOT/save-keep-during-start" ]; then
+        dbus set "tailscale_core_keep_previous=$(cat "$MOCK_ROOT/save-keep-during-start")"
+        rm -f "$MOCK_ROOT/save-keep-during-start"
+    fi
     if [ -f "$MOCK_ROOT/fail-start-target" ] && [ "$(cat "$MOCK_ROOT/fail-start-target")" = "$target" ]; then
         printf 'candidate-mutated-identity' >"$STATE"
         return 1
@@ -423,6 +428,33 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], "1")
         self.assertEqual(os.readlink(self.data / "previous"), self.old)
 
+    def test_a_choice_saved_during_an_update_applies_to_the_next_one(self):
+        self.stub_lifecycle()
+        for request, saved_meanwhile, kept in ((("update", "1"), "0", True), (("update",), "0", True), (("update", "0"), "1", False)):
+            with self.subTest(request=request, saved_meanwhile=saved_meanwhile):
+                if (self.data / "previous").is_symlink():
+                    (self.data / "previous").unlink()
+                (self.data / "current").unlink()
+                (self.data / "current").symlink_to(self.old)
+                self.write("config.json", dict(self.read("config.json"), tailscale_core_keep_previous="1"))
+                (self.mock / "save-keep-during-start").write_text(saved_meanwhile)
+                self.entry("tailscale_core", "320", *request)
+                self.assertEqual(os.readlink(self.data / "current"), self.new)
+                self.assertEqual((self.data / self.old / "tailscale.combined").exists(), kept)
+                self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], saved_meanwhile)
+
+    def test_a_choice_saved_while_an_update_recovers_stays_the_newer_one(self):
+        # Page A's update carries "do not keep". It first recovers an
+        # interrupted update, and meanwhile page B saves "keep".
+        self.stub_lifecycle()
+        self.journal("switched")
+        (self.mock / "save-keep-during-start").write_text("1")
+        self.entry("tailscale_core", "322", "update", "0")
+        self.assertEqual(os.readlink(self.data / "current"), self.new)
+        # A's update applies A's choice; B's later save stays saved.
+        self.assertFalse((self.data / self.old / "tailscale.combined").exists())
+        self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], "1")
+
     def test_failed_update_without_retention_keeps_the_working_core(self):
         (self.mock / "fail-start-target").write_text(self.new)
         self.stub_lifecycle()
@@ -449,6 +481,49 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_action"})
                 self.assertFalse((self.web / "tailscale3_307.json").exists())
                 self.assertNotIn("tailscale_core_keep_previous", self.read("config.json"))
+        self.assert_untouched()
+
+    def test_retention_choice_is_saved_at_once_without_a_task(self):
+        # An unfinished transaction is left for the next core operation to recover.
+        self.journal("switching")
+        for value, expected in (("0", False), ("1", True)):
+            with self.subTest(value=value):
+                self.entry("tailscale_core", "309", "keep", value)
+                self.assertEqual(self.read("reply.json"), {"accepted": True, "keep_previous": expected})
+                self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], value)
+                self.assertFalse((self.web / "tailscale3_309.json").exists())
+        self.assertTrue((self.data / "update.txn").exists())
+        self.assertEqual(os.readlink(self.data / "current"), self.old)
+        self.assertEqual(self.lifecycle(), [])
+
+    def test_retention_choice_is_saved_while_another_operation_runs(self):
+        # One dbus write needs no operation lock: a running update keeps the
+        # choice it started with, and this one applies to the next update.
+        source = '. "$TSKS_ROOT/scripts/tailscale_lib.sh"; ts_init; ts_lock; echo locked; read done'
+        proc = subprocess.Popen([backend.SHELL, "-c", source], env=self.env, text=True,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "locked")
+            self.entry("tailscale_core", "310", "keep", "0")
+            self.assertEqual(self.read("reply.json"), {"accepted": True, "keep_previous": False})
+            self.assertEqual(self.read("config.json")["tailscale_core_keep_previous"], "0")
+        finally:
+            proc.communicate("done\n", timeout=5)
+
+    def test_unsaved_or_invalid_retention_choice_is_reported(self):
+        env = dict(self.env, DBUS_FAIL_ONCE_KEY="tailscale_core_keep_previous")
+        result = subprocess.run([backend.SHELL, str(self.ks / "scripts/tailscale_core"), "311", "keep", "0"],
+                                env=env, text=True, capture_output=True, timeout=40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "save_failed"})
+        self.assertNotIn("tailscale_core_keep_previous", self.read("config.json"))
+        for args in (("keep",), ("keep", "2"), ("keep", ""), ("keep", "yes"), ("keep", "1", "1")):
+            with self.subTest(args=args):
+                result = self.entry("tailscale_core", "312", *args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read("reply.json"), {"accepted": False, "error": "invalid_action"})
+                self.assertNotIn("tailscale_core_keep_previous", self.read("config.json"))
+        self.assertFalse((self.web / "tailscale3_311.json").exists())
         self.assert_untouched()
 
     def test_manual_cleanup_keeps_only_the_active_core(self):
@@ -691,6 +766,24 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("private-auth-token", content)
             self.assertNotIn("original-identity-and-current-preferences", content)
         self.assertTrue((self.run / "diagnostics.json").exists())
+
+    def test_diagnostic_summary_shows_plugin_events_and_policy_rules(self):
+        (self.base / "proc/uptime").write_text("12345.01 123.0\n")
+        (self.run / "events.log").write_text("2026-11-18T10:00:00Z 应用连接器：定期学习的查询被访问控制拒绝，30 分钟后重试\n")
+        self.write("ip-rules.json", {"-4": [["pref", "5210", "fwmark", "0x80000/0xff0000", "lookup", "main"],
+                                            ["pref", "5270", "lookup", "52"], ["pref", "32766", "lookup", "main"]], "-6": []})
+        self.entry("tailscale_diagnostics", "114")
+        log = (self.web / "tailscale3_114.log").read_text()
+        # Notices of the minute task reach no page log of their own.
+        self.assertIn("2026-11-18T10:00:00Z 应用连接器：定期学习的查询被访问控制拒绝", log)
+        self.assertIn("策略路由规则（IPv4，优先级 5200–5299）", log)
+        self.assertIn("5270:\tfrom all lookup 52", log)
+        self.assertNotIn("32766", log)
+        self.assertIn("策略路由规则（IPv6，优先级 5200–5299）", log)
+        # The summary itself is no event.
+        self.assertNotIn("诊断摘要", (self.run / "events.log").read_text())
+        self.entry("tailscale_diagnostics", "115")
+        self.assertEqual((self.web / "tailscale3_115.log").read_text().count("Tailscale 诊断摘要"), 1)
 
 
 if __name__ == "__main__":
